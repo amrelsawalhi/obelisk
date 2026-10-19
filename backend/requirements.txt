@@ -1,0 +1,58 @@
+# ==============================================================================
+# Obelisk Control Plane & Data Platform Dependencies
+# Python 3.11+ / 3.12+
+# ==============================================================================
+
+# Core Web Framework & Async Server
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.28.0,<1.0.0
+pydantic>=2.6.0,<3.0.0
+pydantic-settings>=2.2.0,<3.0.0
+httpx>=0.27.0,<1.0.0
+python-multipart>=0.0.9
+
+# Internal Brain & Database ORM (SQLite / aiosqlite WAL)
+sqlalchemy[asyncio]>=2.0.28,<3.0.0
+aiosqlite>=0.20.0
+greenlet>=3.0.3
+
+# In-Process OLAP & Zero-Copy Arrow / Polars
+duckdb>=0.10.0
+polars>=0.20.15
+pyarrow>=15.0.0
+
+# Zero-Knowledge Cryptography Vault (AES-256 Fernet)
+cryptography>=42.0.5
+
+# Host Telemetry & Hardware Resource Advisor
+psutil>=5.9.8
+docker>=7.0.0
+
+# Ingestion Engine & Database Connectors
+dlt>=0.4.5
+psycopg2-binary>=2.9.9
+asyncpg>=0.29.0
+pymongo>=4.6.2
+pymysql>=1.1.0
+oracledb>=2.1.0
+
+# Reactive Notebook Engine & Cron Scheduler
+marimo>=0.3.0
+croniter>=2.0.0
+dagster-graphql>=1.6.0
+
+# In-Browser dbt Studio & Adapters
+dbt-core>=1.7.0
+dbt-postgres>=1.7.0
+dbt-duckdb>=1.7.0
+dbt-clickhouse>=1.7.0
+
+# Distributed Data & Compute
+pyspark[connect]>=3.5.0
+
+# Windows PTY Terminal Support (ignored on Linux/macOS)
+pywinpty>=2.0.10; sys_platform == 'win32'
+
+# Testing Suite (Zero-Mocks Verification)
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

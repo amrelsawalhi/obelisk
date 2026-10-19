@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+
+# Obelisk Local Runtime State & Internal Databases
+**/obelisk.db*
+*.db
+*.db-shm
+*.db-wal
+backend/data/
+data/obelisk.db*
+data/*.db*
+!data/
+!data/.gitkeep
+!backend/data/.gitkeep
+
+# Lakehouse Parquet Data & DuckDB files (User/Ingested Lakehouse Data)
+**/lakehouse/**
+!**/lakehouse/.gitkeep
+*.parquet
+*.duckdb
+
+# Marimo Notebook Runtime & Session Cache
+**/__marimo__/
+*.py.json
+
+# Ad-hoc / Generated Exploration Notebooks (Keep Quickstart_Analytics.py)
+git_repo/notebooks/Explore_*.py
+git_repo/notebooks/test_nb_*.py
+
+# Environment & Credentials
+.env
+.env.*
+!.env.example
+
+# Testing, Logs & Cache
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+!frontend/src/lib/
+
+# dbt Artifacts
+git_repo/dbt_project/target/
+git_repo/dbt_project/logs/
+git_repo/dbt_project/dbt_packages/
+git_repo/dbt_project/.user.yml
+
+# Temporary test scripts
+backend/scripts/update_hosts.py
+backend/scripts/run_ingest_test.py
+backend/scripts/test_duckdb_pg.py
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

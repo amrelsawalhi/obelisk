@@ -1,0 +1,3 @@
+# Obelisk Control Plane & Data Platform
+# Root requirements wrapper referencing backend dependencies
+-r backend/requirements.txt

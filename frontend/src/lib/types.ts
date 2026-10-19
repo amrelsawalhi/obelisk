@@ -1,0 +1,613 @@
+// Strict TypeScript interfaces matching FastAPI Pydantic v2 schemas 1:1
+
+export interface HostSpecs {
+  total_ram_bytes: number;
+  total_ram_gb: number;
+  available_ram_gb: number;
+  ram_percent_used: number;
+  cpu_count: number;
+  cpu_percent: number;
+  max_safe_allocation_bytes: number;
+  max_safe_allocation_gb: number;
+}
+
+export interface TelemetryData {
+  cpu_percent: number;
+  cpu_count: number;
+  ram_percent_used: number;
+  total_ram_gb: number;
+  available_ram_gb: number;
+  ram_used_gb: number;
+  max_safe_allocation_gb: number;
+  active_containers_count: number;
+  allocated_ram_gb: number;
+  timestamp?: number;
+}
+
+export interface ServiceRecommendation {
+  service_name: string;
+  recommended_ram_mb: number;
+  recommended_ram_bytes: number;
+  recommended_cpus: number;
+  total_host_ram_gb: number;
+  remaining_safe_gb: number;
+}
+
+export interface ServiceStatus {
+  service_name: string;
+  deployment_type: 'local' | 'remote';
+  status: string; // 'running' | 'stopped' | 'connected' | 'error'
+  host: string;
+  port: number;
+  allocated_memory_mb: number;
+  container_id?: string | null;
+  live_docker_status?: string | null;
+  host_port?: number;
+}
+
+export interface DeployLocalRequest {
+  service_name: string;
+  memory_mb?: number;
+  image?: string;
+}
+
+export interface ConnectRemoteRequest {
+  service_name: string;
+  host: string;
+  port: number;
+  config_json?: Record<string, unknown>;
+}
+
+export interface CatalogTableColumn {
+  name: string;
+  type: string;
+  nullable?: boolean;
+}
+
+export interface CatalogTable {
+  name: string;
+  fqn?: string;
+  columns: CatalogTableColumn[];
+  row_count?: number;
+  size_bytes?: number;
+  format?: string;
+  path?: string;
+  schema_name?: string;
+  schema?: string;
+}
+
+export interface LakehouseDirectory {
+  id: string;
+  name: string;
+  tier: string;
+  path: string;
+  parent_path?: string | null;
+  depth?: number;
+  tables: CatalogTable[];
+}
+
+export interface CatalogNode {
+  id: string;
+  name: string;
+  type: string;
+  storage_uri?: string;
+  host?: string;
+  port?: number;
+  database?: string;
+  tables: CatalogTable[];
+  directories?: LakehouseDirectory[];
+}
+
+export interface Connection {
+  id: string;
+  name: string;
+  source_type: string;
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  options?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface CreateConnectionRequest {
+  name: string;
+  source_type: string;
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  password?: string;
+  options?: Record<string, unknown>;
+}
+
+export interface UpdateConnectionRequest {
+  name?: string;
+  source_type?: string;
+  host?: string;
+  port?: number;
+  database?: string;
+  username?: string;
+  password?: string;
+  options?: Record<string, unknown>;
+}
+
+export interface ConnectionTestResult {
+  status: 'success' | 'error';
+  latency_ms: number;
+  message: string;
+}
+
+export interface TablePreviewResponse {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  row_count: number;
+  duration_ms: number;
+}
+
+export interface IngestTriggerRequest {
+  connection_id: string;
+  entity: string;
+  mode: 'snapshot' | 'incremental';
+  watermark_column?: string;
+  target_name?: string;
+  target_folder?: string;
+  limit?: number;
+  write_strategy?: 'append' | 'upsert';
+  primary_key?: string;
+  schedule?: string;
+  schedule_engine?: 'cron' | 'dagster';
+}
+
+export interface IngestTriggerResponse {
+  success: boolean;
+  run_id: string;
+  asset_name: string;
+  metadata: Record<string, unknown>;
+  logs: string[];
+}
+
+export interface BatchIngestRequest {
+  connection_id: string;
+  schema_name?: string;
+  tables: string[];
+  mode: 'snapshot' | 'incremental';
+  watermark_column?: string;
+  target_folder?: string;
+  limit?: number;
+  write_strategy?: 'append' | 'upsert';
+  primary_key?: string;
+  schedule?: string;
+  schedule_engine?: 'cron' | 'dagster';
+}
+
+export interface BatchIngestResultItem {
+  status: string;
+  entity: string;
+  target: string;
+  target_folder: string;
+  num_rows: number;
+  new_rows_extracted: number;
+  file_path: string;
+  mode: string;
+  write_strategy?: string;
+}
+
+export interface BatchIngestErrorItem {
+  table: string;
+  error: string;
+}
+
+export interface BatchIngestResponse {
+  success: boolean;
+  total_tables: number;
+  succeeded: number;
+  failed: number;
+  results: BatchIngestResultItem[];
+  errors: BatchIngestErrorItem[];
+  logs: string[];
+}
+
+export interface IngestJobInfo {
+  id: string;
+  title: string;
+  job_type: 'single' | 'batch';
+  connection_id: string;
+  source_name: string;
+  source_type: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  mode: string;
+  started_at: string;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  total_tables: number;
+  completed_tables: number;
+  failed_tables: number;
+  current_table?: string | null;
+  current_phase?: string | null;
+  percent: number;
+  total_rows: number;
+  logs: string[];
+  results: BatchIngestResultItem[];
+  errors: BatchIngestErrorItem[];
+  is_cancelled: boolean;
+}
+
+export interface AsyncIngestTriggerResponse {
+  job_id: string;
+  status: string;
+  title: string;
+  source_name: string;
+  total_tables?: number;
+}
+
+export interface QueryTarget {
+  id: string;
+  name: string;
+  engine: string;
+  is_default?: boolean;
+  description?: string;
+  capabilities: string[];
+  status: string;
+  schemas: string[];
+  database?: string;
+  host?: string;
+  port?: number;
+}
+
+export interface QueryExecuteRequest {
+  sql: string;
+  title?: string;
+  timeout_seconds?: number;
+  target?: string;
+  schema_name?: string;
+  postgres_attachments?: Record<string, unknown>[];
+}
+
+export interface QueryExecuteResponse {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  row_count: number;
+  duration_ms: number;
+  status: string;
+  command_tag?: string | null;
+  target_engine?: string;
+  target_name?: string;
+}
+
+export interface QueryHistoryItem {
+  id: string;
+  title?: string | null;
+  sql_text: string;
+  status: string;
+  duration_ms?: number | null;
+  row_count?: number | null;
+  executed_at: string;
+}
+
+export interface Notebook {
+  name: string;
+  filename: string;
+  path: string;
+  size_bytes: number;
+  modified_at: number;
+}
+
+export interface NotebookServerStatus {
+  is_running: boolean;
+  port: number;
+  base_url: string;
+  url: string;
+  pid?: number | null;
+  uptime_seconds: number;
+  notebook_count: number;
+  notebooks_dir: string;
+}
+
+export interface AssetGraphNode {
+  id: string;
+  name: string;
+  layer: 'bronze' | 'silver' | 'gold' | 'custom';
+  type: string;
+  path?: string;
+  sql_code?: string;
+  is_in_pipeline?: boolean;
+  filename?: string;
+  group?: string;
+  deps?: string[];
+  description?: string;
+}
+
+export interface CustomDagItem {
+  filename: string;
+  name: string;
+  path: string;
+  size_bytes: number;
+  modified_at: number;
+}
+
+export interface CreateDagRequest {
+  name: string;
+  template?: 'kpi' | 'notebook' | 'blank';
+  deps?: string[];
+  description?: string;
+  notebook_name?: string;
+}
+
+export interface SaveModelRequest {
+  layer: string;
+  name: string;
+  sql: string;
+}
+
+export interface AssetGraphEdge {
+  source: string;
+  target: string;
+}
+
+export interface AssetGraphResponse {
+  nodes: AssetGraphNode[];
+  edges: AssetGraphEdge[];
+  layers: string[];
+  active_pipeline_selector?: string;
+  active_node_count?: number;
+}
+
+export interface PipelineRun {
+  run_id: string;
+  pipeline_name?: string;
+  selector?: string;
+  status: string;
+  started_at: string;
+  completed_at?: string;
+  dbt_run_duration?: number;
+  dbt_test_duration?: number;
+  logs: string;
+}
+
+export interface PipelineDefinition {
+  id: string;
+  name: string;
+  description?: string;
+  selector: string;
+  schedule?: string | null;
+  created_at?: string | null;
+}
+
+export interface CreatePipelineRequest {
+  name: string;
+  description?: string;
+  selector: string;
+  schedule?: string;
+}
+
+export interface TriggerPipelineRequest {
+  postgres_params?: Record<string, unknown>;
+  table_names?: string[];
+  selector?: string;
+  pipeline_name?: string;
+}
+
+export interface VariableItem {
+  id: string;
+  key: string;
+  value: string;
+  is_secret: boolean;
+  description: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface CreateVariableRequest {
+  key: string;
+  value: string;
+  is_secret: boolean;
+  description?: string;
+}
+
+// ==========================================
+// Orchestration Engines & Obelisk Cron Types
+// ==========================================
+
+export interface OrchestrationEngineInfo {
+  id: 'cron' | 'dagster' | 'airflow' | string;
+  name: string;
+  type: string;
+  category: string;
+  status: 'running' | 'stopped' | 'offline';
+  is_active: boolean;
+  can_deploy_local: boolean;
+  can_connect_remote: boolean;
+  port?: number | null;
+  url?: string | null;
+  web_path?: string | null;
+  docs_url?: string | null;
+  description: string;
+  features: string[];
+}
+
+export interface OrchestrationEnginesResponse {
+  engines: OrchestrationEngineInfo[];
+  default_engine: string;
+}
+
+export interface CronJob {
+  id: string;
+  name: string;
+  description: string;
+  target_type: 'dbt' | 'script' | 'notebook';
+  target: string;
+  cron_expression: string;
+  is_enabled: boolean;
+  last_run_at: string | null;
+  last_status: 'success' | 'failed' | 'running' | null;
+  last_duration_seconds: number | null;
+  last_logs: string | null;
+  next_run_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface CreateCronJobRequest {
+  name: string;
+  description?: string;
+  target_type: 'dbt' | 'script' | 'notebook';
+  target: string;
+  cron_expression: string;
+}
+
+export interface CronTargetsResponse {
+  scripts: Array<{ filename: string; name: string; size_bytes: number }>;
+  notebooks: Array<{ filename: string; name: string; size_bytes: number }>;
+  dbt_selectors: Array<{ label: string; value: string; description: string }>;
+}
+
+export interface RunCronJobResponse {
+  job_id: string;
+  status: 'success' | 'failed';
+  duration_seconds: number;
+  logs: string;
+  next_run_at: string | null;
+}
+
+export interface FileNode {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  extension?: string;
+  size?: number;
+  modified_at?: string | null;
+  children?: FileNode[];
+}
+
+export interface FileTreeResponse {
+  root: string;
+  absolute_path: string;
+  children: FileNode[];
+}
+
+export interface FileContentResponse {
+  path: string;
+  name: string;
+  extension: string;
+  size: number;
+  modified_at: string;
+  content: string;
+}
+
+export interface SaveFileRequest {
+  path: string;
+  content: string;
+}
+
+export interface CreateFileRequest {
+  path: string;
+  type: 'file' | 'directory';
+}
+
+export interface RenameFileRequest {
+  old_path: string;
+  new_path: string;
+}
+
+export interface DeleteFileRequest {
+  path: string;
+}
+
+export interface DbtTreeNode {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  extension?: string;
+  layer?: 'staging' | 'marts' | null;
+  size_bytes?: number;
+  modified_at?: string;
+  children?: DbtTreeNode[];
+}
+
+export interface DbtFileResponse {
+  path: string;
+  name: string;
+  extension: string;
+  content: string;
+  size_bytes: number;
+  modified_at: string;
+}
+
+export interface DbtCompileResponse {
+  model_name: string;
+  target: string;
+  compiled_sql: string;
+  duration_ms: number;
+  logs: string;
+  success: boolean;
+}
+
+export interface DbtPreviewResponse {
+  columns: string[];
+  rows: Record<string, unknown>[];
+  row_count: number;
+  duration_ms: number;
+  status: string;
+  error?: string;
+  command_tag?: string;
+  model_name?: string;
+  target?: string;
+}
+
+export interface DbtExecutionResponse {
+  command: string;
+  selector: string;
+  target: string;
+  success: boolean;
+  exit_code: number;
+  duration_seconds: number;
+  duration_ms: number;
+  output: string;
+  logs: string;
+}
+
+export interface DbtLineageNode {
+  id: string;
+  name: string;
+  type: 'model' | 'source' | 'test';
+  layer: 'bronze' | 'silver' | 'gold' | 'test' | string;
+  is_current?: boolean;
+  materialized?: string;
+  path?: string;
+}
+
+export interface DbtLineageEdge {
+  source: string;
+  target: string;
+}
+
+export interface DbtLineageResponse {
+  model_name: string;
+  nodes: DbtLineageNode[];
+  edges: DbtLineageEdge[];
+  total_nodes: number;
+  total_edges: number;
+}
+
+export interface OpenQueryTabItem {
+  id: string;
+  title: string;
+  sql: string;
+  target_id: string;
+  schema_name?: string | null;
+  tab_order?: number;
+  updated_at?: string;
+}
+
+export interface SaveQueryTabPayload {
+  id: string;
+  title: string;
+  sql: string;
+  target_id?: string;
+  schema_name?: string | null;
+  tab_order?: number;
+}
+
+

@@ -1,0 +1,46 @@
+services:
+  obelisk-core:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: obelisk-core
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "2718:2718"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+      - ./git_repo:/app/git_repo
+    environment:
+      - APP_NAME=Obelisk
+      - ENVIRONMENT=production
+      - STORAGE_URI=${STORAGE_URI:-file:///data/lakehouse}
+      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:////app/data/obelisk.db}
+      - OBELISK_MASTER_KEY=${OBELISK_MASTER_KEY:-dGhpcy1pcy1hLXNhbXBsZS0zMi1ieXRlLWtleS0xMjM0NTY=}
+      - OBELISK_ADMIN_USER=${OBELISK_ADMIN_USER:-admin}
+      - OBELISK_ADMIN_PASSWORD=${OBELISK_ADMIN_PASSWORD:-obelisk2026}
+      - OBELISK_NET=obelisk_net
+    networks:
+      - obelisk_net
+
+  caddy:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: obelisk-gateway
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - obelisk-core
+    networks:
+      - obelisk_net
+
+networks:
+  obelisk_net:
+    name: obelisk_net
+    driver: bridge

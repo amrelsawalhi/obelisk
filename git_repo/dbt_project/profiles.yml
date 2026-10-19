@@ -1,0 +1,32 @@
+obelisk:
+  target: "{{ env_var('DBT_TARGET', 'dev') }}"
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DBT_PG_HOST', 'localhost') }}"
+      port: "{{ env_var('DBT_PG_PORT', '5434') | int }}"
+      user: "{{ env_var('DBT_PG_USER', 'testuser') }}"
+      password: "{{ env_var('DBT_PG_PASSWORD', 'testpass') }}"
+      dbname: "{{ env_var('DBT_PG_DBNAME', 'sourcedb') }}"
+      schema: silver
+      sslmode: "{{ env_var('DBT_PG_SSLMODE', 'disable') }}"
+      threads: 2
+      connect_timeout: 10
+      keepalives_idle: 0
+    postgres:
+      type: postgres
+      host: "{{ env_var('DBT_PG_HOST', 'localhost') }}"
+      port: "{{ env_var('DBT_PG_PORT', '5434') | int }}"
+      user: "{{ env_var('DBT_PG_USER', 'testuser') }}"
+      password: "{{ env_var('DBT_PG_PASSWORD', 'testpass') }}"
+      dbname: "{{ env_var('DBT_PG_DBNAME', 'sourcedb') }}"
+      schema: silver
+      sslmode: "{{ env_var('DBT_PG_SSLMODE', 'disable') }}"
+      threads: 2
+      connect_timeout: 10
+      keepalives_idle: 0
+    duckdb:
+      type: duckdb
+      path: "{{ env_var('DBT_DUCKDB_PATH', 'data/lakehouse/obelisk.duckdb') }}"
+      schema: silver
+      threads: 2

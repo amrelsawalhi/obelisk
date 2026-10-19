@@ -1,0 +1,29 @@
+# ==============================================================================
+# Obelisk Gateway & Frontend Builder
+# Multi-stage build compiling React 18 SPA and serving via Caddy Reverse Proxy
+# ==============================================================================
+
+# Stage 1: Build React 18 Frontend SPA
+FROM node:20-alpine AS frontend-builder
+WORKDIR /app
+
+# Install dependencies
+COPY frontend/package*.json ./
+RUN npm ci --prefer-offline || npm install
+
+# Build static production bundle
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 2: Caddy Reverse Proxy & Static Server
+FROM caddy:2-alpine
+
+# Copy built frontend assets to web root
+COPY --from=frontend-builder /app/dist /srv/dist
+
+# Copy reverse proxy routing rules
+COPY Caddyfile /etc/caddy/Caddyfile
+
+EXPOSE 80 443
+
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile"]

@@ -1,0 +1,40 @@
+services:
+  source_postgres:
+    image: postgres:16-alpine
+    container_name: obelisk_source_postgres
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: sourcedb
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d sourcedb"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - obelisk_net
+
+  source_mongodb:
+    image: mongo:7.0
+    container_name: obelisk_source_mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongoadmin
+      MONGO_INITDB_ROOT_PASSWORD: mongopass
+    ports:
+      - "27018:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - obelisk_net
+
+networks:
+  obelisk_net:
+    name: obelisk_net
+    external: true

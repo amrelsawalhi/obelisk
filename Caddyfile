@@ -1,0 +1,38 @@
+{
+    admin off
+    auto_https off
+}
+
+:80 {
+    # Obelisk REST API Backend
+    handle /api/* {
+        reverse_proxy obelisk-core:8000
+    }
+
+    # Apache Superset BI & Dashboards (Configured with SUPERSET_WEBSERVER_BASEURL=/superset/)
+    handle /superset/* {
+        reverse_proxy obelisk-superset:8088
+    }
+
+    # Dagster Orchestration Webserver (Configured with --path-prefix /dagster)
+    handle /dagster/* {
+        reverse_proxy obelisk-dagster:3000
+    }
+
+    # Reactive Marimo Notebook Server (Configured with --base-url /notebooks)
+    handle /notebooks/* {
+        reverse_proxy obelisk-core:2718
+    }
+
+    # Air-Gapped Gitea Git Repository
+    handle /gitea/* {
+        reverse_proxy obelisk-gitea:3001
+    }
+
+    # React 18 Frontend SPA
+    handle {
+        root * /srv/dist
+        try_files {path} /index.html
+        file_server
+    }
+}
