@@ -20,6 +20,8 @@ greenlet>=3.0.3
 duckdb>=0.10.0
 polars>=0.20.15
 pyarrow>=15.0.0
+fsspec>=2024.2.0
+s3fs>=2024.2.0
 
 # Zero-Knowledge Cryptography Vault (AES-256 Fernet)
 cryptography>=42.0.5

@@ -481,6 +481,9 @@ async def rename_lakehouse_table(
 
     table_dir = settings.lakehouse_root_path / clean_folder
     old_file = table_dir / f"{old_name}.parquet"
+    if not old_file.exists() and clean_folder in ("root", "main"):
+        old_file = settings.lakehouse_root_path / f"{old_name}.parquet"
+        table_dir = settings.lakehouse_root_path
     new_file = table_dir / f"{new_name}.parquet"
 
     if not old_file.exists():
@@ -518,6 +521,8 @@ async def delete_lakehouse_table(
     clean_folder = _clean_lakehouse_path(folder)
     clean_name = name.strip()
     table_file = settings.lakehouse_root_path / clean_folder / f"{clean_name}.parquet"
+    if not table_file.exists() and clean_folder in ("root", "main"):
+        table_file = settings.lakehouse_root_path / f"{clean_name}.parquet"
 
     if table_file.exists():
         table_file.unlink()
@@ -756,14 +761,26 @@ async def get_table_preview(
     lakehouse_root = settings.lakehouse_root_path
     clean_tier = source_id.split(":", 1)[1] if source_id.startswith("lakehouse:") else source_id
 
-    if source_id == "bronze" or source_id == "lakehouse" or source_id.startswith("lakehouse:") or (lakehouse_root / clean_tier).is_dir():
+    if (
+        source_id == "bronze"
+        or source_id == "lakehouse"
+        or source_id.startswith("lakehouse:")
+        or clean_tier in ("root", "main", "")
+        or (lakehouse_root / clean_tier).is_dir()
+    ):
         parquet_file = None
 
-        if source_id.startswith("lakehouse:") or (lakehouse_root / clean_tier).is_dir():
+        if clean_tier in ("root", "main", ""):
+            candidate = lakehouse_root / f"{table_name}.parquet"
+            if candidate.exists():
+                parquet_file = candidate
+
+        if not parquet_file and (source_id.startswith("lakehouse:") or (lakehouse_root / clean_tier).is_dir()):
             candidate = lakehouse_root / clean_tier / f"{table_name}.parquet"
             if candidate.exists():
                 parquet_file = candidate
-        elif source_id == "bronze":
+
+        if not parquet_file and source_id == "bronze":
             candidate = lakehouse_root / "bronze" / f"{table_name}.parquet"
             if candidate.exists():
                 parquet_file = candidate
@@ -771,12 +788,17 @@ async def get_table_preview(
                 candidate2 = Path(settings.duckdb_storage_path) / f"{table_name}.parquet"
                 if candidate2.exists():
                     parquet_file = candidate2
-        elif source_id == "lakehouse":
-            # Search all lakehouse subdirectories recursively for table_name
-            for candidate in lakehouse_root.rglob(f"{table_name}.parquet"):
-                if candidate.is_file():
-                    parquet_file = candidate
-                    break
+
+        # Fallbacks: check directly in lakehouse root or search all subdirectories
+        if not parquet_file or not parquet_file.exists():
+            flat = lakehouse_root / f"{table_name}.parquet"
+            if flat.exists():
+                parquet_file = flat
+            else:
+                for candidate in lakehouse_root.rglob(f"{table_name}.parquet"):
+                    if candidate.is_file():
+                        parquet_file = candidate
+                        break
 
         if not parquet_file or not parquet_file.exists():
             raise HTTPException(

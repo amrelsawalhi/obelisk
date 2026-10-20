@@ -95,7 +95,8 @@ models:
         tests:
           - not_null
           - accepted_values:
-              values: ['Standard', 'Silver', 'Gold', 'Platinum']
+              arguments:
+                values: ['Standard', 'Silver', 'Gold', 'Platinum']
 
   - name: stg_enterprise_orders
     description: "Silver cleaned enterprise orders with net amount calculations"

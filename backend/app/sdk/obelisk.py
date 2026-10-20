@@ -52,7 +52,10 @@ class TableWrapper:
         if self.file_path and self.file_path.exists():
             return pq.read_table(str(self.file_path))
         try:
-            return query_arrow(f"SELECT * FROM {self.full_identifier}")
+            res = query_arrow(f"SELECT * FROM {self.full_identifier}")
+            if hasattr(res, "read_all"):
+                return res.read_all()
+            return res
         except Exception as e:
             raise FileNotFoundError(
                 f"Dataset '{self.full_identifier}' not found at {self.file_path} or attached external sources: {e}"
@@ -71,7 +74,10 @@ class TableWrapper:
 
     def to_df(self) -> Any:
         """Reads dataset into a Pandas DataFrame."""
-        return self.to_arrow().to_pandas()
+        arrow_obj = self.to_arrow()
+        if hasattr(arrow_obj, "read_all"):
+            arrow_obj = arrow_obj.read_all()
+        return arrow_obj.to_pandas()
 
     def to_duckdb(self, conn=None):
         """Returns a DuckDB relation referencing the dataset."""
@@ -302,7 +308,10 @@ def query_arrow(sql: str) -> pa.Table:
         rel = conn.sql(exec_sql)
         if rel is None:
             return pa.Table.from_arrays([], names=[])
-        return rel.arrow()
+        res = rel.arrow()
+        if hasattr(res, "read_all"):
+            return res.read_all()
+        return res
     finally:
         conn.close()
 

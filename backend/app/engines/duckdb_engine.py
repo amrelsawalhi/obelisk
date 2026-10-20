@@ -47,6 +47,18 @@ class DuckDBEngine:
         except Exception:
             pass
 
+        # Enforce secure HTTPS for DuckDB extension downloads (prevents ISP HTTP 307 interception)
+        try:
+            conn.execute("SET custom_extension_repository = 'https://extensions.duckdb.org';")
+        except Exception:
+            pass
+
+        # Load httpfs extension for remote HTTPS and S3 queries
+        try:
+            conn.execute("LOAD httpfs;")
+        except Exception:
+            pass
+
         return conn
 
     def attach_postgres(

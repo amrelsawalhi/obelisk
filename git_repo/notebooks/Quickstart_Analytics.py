@@ -8,17 +8,16 @@ app = marimo.App(width="medium")
 def _():
     import marimo as mo
     import obelisk
-    return (mo, obelisk)
+
+    return mo, obelisk
 
 
 @app.cell
 def _(mo):
-    mo.md(
-        r"""
-        # 🚀 Obelisk Lakehouse & SDK Quickstart
-        Interactive exploratory workspace querying Obelisk Parquet Lakehouse and external databases.
-        """
-    )
+    mo.md(r"""
+    # 🚀 Obelisk Lakehouse & SDK Quickstart
+    Interactive exploratory workspace querying Obelisk Parquet Lakehouse and external databases.
+    """)
     return
 
 
@@ -32,7 +31,9 @@ def _(obelisk):
 
 @app.cell
 def _(df, mo):
-    mo.md(f"Status check: Loaded **{len(df)}** rows with Obelisk SDK.")
+    mo.md(f"""
+    Status check: Loaded **{len(df)}** rows with Obelisk SDK.
+    """)
     return
 
 
