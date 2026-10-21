@@ -4,6 +4,8 @@ Pipelines API Routes: Exposes Medallion lineage graph, pipeline run triggers, an
 
 import os
 import json
+import asyncio
+import logging
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -15,6 +17,8 @@ from app.core.vault import vault
 from app.engines.dbt_runner import dbt_runner
 
 router = APIRouter(prefix="/api/pipelines", tags=["Pipelines"])
+
+logger = logging.getLogger(__name__)
 
 
 class TriggerPipelineRequest(BaseModel):
@@ -45,45 +49,11 @@ class CreatePipelineRequest(BaseModel):
 
 @router.get("")
 async def list_pipelines():
-    """Returns all registered pipeline definitions. Seeds default enterprise pipelines if none exist."""
+    """Returns all registered pipeline definitions (read-only). Default pipelines are seeded once at startup via app.database.seed_defaults."""
     async with AsyncSessionLocal() as session:
         stmt = select(PipelineDefinition).order_by(PipelineDefinition.created_at.asc())
         res = await session.execute(stmt)
         pipelines = res.scalars().all()
-        if not pipelines:
-            default_seeds = [
-                PipelineDefinition(
-                    name="All Medallion Assets",
-                    description="Full end-to-end Medallion pipeline from Bronze raw Parquet through Silver staging to Gold marts",
-                    selector="*",
-                ),
-                PipelineDefinition(
-                    name="Orders & Revenue Flow",
-                    description="Processes transactional orders from Bronze staging to financial and enriched fact marts",
-                    selector="stg_orders+",
-                ),
-                PipelineDefinition(
-                    name="Customer 360 Analytics",
-                    description="Cleans customer dimensions and updates lifetime value & metric marts",
-                    selector="stg_customers+",
-                ),
-                PipelineDefinition(
-                    name="Staging Tier Only",
-                    description="Rapid materialization and validation of Silver staging models without gold aggregations",
-                    selector="models/staging",
-                ),
-                PipelineDefinition(
-                    name="Gold Marts Only",
-                    description="Refreshes analytical business marts and metrics from materialized silver staging models",
-                    selector="models/marts",
-                ),
-            ]
-            for p in default_seeds:
-                session.add(p)
-            await session.commit()
-            stmt = select(PipelineDefinition).order_by(PipelineDefinition.created_at.asc())
-            res = await session.execute(stmt)
-            pipelines = res.scalars().all()
 
         return [
             {
@@ -168,18 +138,31 @@ async def trigger_pipeline_run(req: Optional[TriggerPipelineRequest] = None):
                 res = await session.execute(stmt)
                 active_conn = res.scalars().first()
                 if active_conn:
-                    creds_json = vault.decrypt(active_conn.encrypted_credentials)
-                    creds = json.loads(creds_json) if creds_json else {}
+                    # Credentials are stored as an encrypted plaintext password string
+                    # (vault.encrypt(password)) everywhere else in Obelisk, but tolerate
+                    # a JSON dict payload for forward compatibility.
+                    raw_decrypted = vault.decrypt(active_conn.encrypted_credentials)
+                    password = ""
+                    if isinstance(raw_decrypted, str) and raw_decrypted:
+                        try:
+                            parsed = json.loads(raw_decrypted)
+                            if isinstance(parsed, dict):
+                                password = str(parsed.get("password", ""))
+                            else:
+                                password = str(parsed)
+                        except (json.JSONDecodeError, TypeError):
+                            password = raw_decrypted
+
                     pg_params = {
                         "host": active_conn.host,
                         "port": active_conn.port,
                         "username": active_conn.username,
-                        "password": creds.get("password", ""),
+                        "password": password,
                         "database": active_conn.database,
                         "sslmode": "disable",
                     }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Pipeline run: failed to auto-resolve registered PostgreSQL connection: %s", e)
 
     # Fallback to environment variables or local host defaults if not found
     if not pg_params:
@@ -193,7 +176,10 @@ async def trigger_pipeline_run(req: Optional[TriggerPipelineRequest] = None):
         }
 
     try:
-        res = dbt_runner.run_medallion_pipeline(
+        # dbt run/test are long blocking subprocess invocations — execute in a worker
+        # thread so the event loop (UI, terminal, telemetry) stays responsive.
+        res = await asyncio.to_thread(
+            dbt_runner.run_medallion_pipeline,
             postgres_params=pg_params,
             table_names=table_names,
             selector=selector,

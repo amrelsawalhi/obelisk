@@ -32,11 +32,11 @@ class DagsterClient:
     ) -> Dict[str, Any]:
         """
         Triggers a Dagster asset materialization run for the given source and entity.
-        Materializes asset into Snappy Parquet in Bronze layer.
+        Materializes asset into Snappy Parquet in the lakehouse.
         """
         clean_stem = (target_name or (entity.split(".", 1)[-1] if "." in entity else entity))
         clean_stem = clean_stem.replace(".", "_").replace("/", "_").replace("\\", "_")
-        asset_name = f"bronze_{clean_stem}"
+        asset_name = clean_stem
 
         ingest_asset = create_ingest_asset(
             asset_name=asset_name,

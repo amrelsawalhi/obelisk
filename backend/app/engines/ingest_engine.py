@@ -2,6 +2,7 @@ import os
 import uuid
 import json
 import sqlite3
+import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ from app.config import settings
 from app.engines.duckdb_engine import duckdb_engine
 from app.core.host_resolver import resolve_connection_host
 
+logger = logging.getLogger(__name__)
+
 class IngestEngine:
     """
     Universal Ingestion Engine:
@@ -28,15 +31,19 @@ class IngestEngine:
     - Zero-copy PyArrow Compute (pc.max) for watermark detection.
     - Safe incremental schema merging via pa.concat_tables(promote_options="default").
     - Atomic file swapping via temporary files and os.replace() to prevent Windows file locks / partial writes.
-    - Automatic Bronze Asset registration in data/obelisk.db metadata catalog.
+    - Automatic Lakehouse asset registration in data/obelisk.db metadata catalog.
     """
 
-    def _ensure_bronze_dir(self) -> Path:
-        storage_path = settings.duckdb_storage_path
+    def _ensure_storage_dir(self, target_folder: Optional[str] = None) -> Path:
+        base_path = Path(settings.duckdb_storage_path)
+        if target_folder:
+            resolved = base_path / target_folder.strip("/\\")
+        else:
+            resolved = base_path
         # Guard local directory creation against remote cloud URIs (s3://, gs://, abfss://)
         if not settings.STORAGE_URI.startswith(("s3://", "gs://", "abfss://")):
-            Path(storage_path).mkdir(parents=True, exist_ok=True)
-        return Path(storage_path)
+            resolved.mkdir(parents=True, exist_ok=True)
+        return resolved
 
     def _record_asset_in_db(
         self,
@@ -46,7 +53,7 @@ class IngestEngine:
         record_count: int,
         schema_metadata: Dict[str, Any],
     ) -> None:
-        """Records or updates the Bronze asset metadata in SQLite brain."""
+        """Records or updates the lakehouse asset metadata in SQLite brain."""
         db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
         now_iso = datetime.now(timezone.utc).isoformat()
         metadata_json = json.dumps(schema_metadata)
@@ -88,6 +95,9 @@ class IngestEngine:
             return table
         try:
             dconn = duckdb.connect()
+        except Exception:
+            return table
+        try:
             dconn.register("raw_batch", table)
             order_sql = f'ORDER BY "{watermark_column}" DESC' if watermark_column and watermark_column in table.column_names else ""
             dedup_sql = f'''
@@ -95,10 +105,15 @@ class IngestEngine:
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY "{primary_key}" {order_sql}) = 1
             '''
             deduped = dconn.execute(dedup_sql).arrow().read_all()
-            dconn.close()
             return deduped
-        except Exception:
+        except Exception as e:
+            logger.warning("Upsert deduplication failed, falling back to raw batch: %s", e)
             return table
+        finally:
+            # Always close: a lingering DuckDB connection retains OS-level file
+            # locks on Parquet files and triggers [WinError 32] on Windows when
+            # ingestion later swaps files via os.replace().
+            dconn.close()
 
     def ingest_entity(
         self,
@@ -114,7 +129,7 @@ class IngestEngine:
         primary_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Executes ingestion and writes a Snappy Parquet file atomically to Bronze storage.
+        Executes ingestion and writes a Snappy Parquet file atomically to lakehouse storage.
         Returns execution statistics and registers asset in Obelisk catalog.
         """
         clean_folder = target_folder.strip("/\\").replace("..", "") if target_folder else ""

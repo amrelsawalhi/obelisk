@@ -31,11 +31,28 @@ class ResourceAdvisor:
             "max_safe_allocation_gb": round(total_ram_gb * 0.85, 2),
         }
 
+    def get_disk_info(self, path: str = ".") -> Dict[str, Any]:
+        """Returns free disk space for deploy pre-flight checks."""
+        usage = psutil.disk_usage(path)
+        return {
+            "free_gb": round(usage.free / (1024 ** 3), 2),
+            "total_gb": round(usage.total / (1024 ** 3), 2),
+            "percent_used": usage.percent,
+        }
+
     def get_active_container_allocations(self) -> Dict[str, Any]:
         """Probes active Docker container memory allocations managed by Obelisk."""
         total_allocated_bytes = 0
         containers_info = []
 
+        if self._docker_client is None:
+            # Lazy link to the live Docker manager: container allocations are probed
+            # from the real engine instead of always reporting zero.
+            try:
+                from app.core.docker_manager import docker_mgr
+                self._docker_client = docker_mgr.client
+            except Exception:
+                pass
         if self._docker_client is not None:
             try:
                 for c in self._docker_client.containers.list():

@@ -603,16 +603,16 @@ class Introspector:
         if path.is_file() and path.suffix == ".parquet":
             files = [path]
             if not inferred_schema:
-                if path.parent.name in ("bronze", "silver", "gold"):
-                    inferred_schema = path.parent.name
-                else:
-                    inferred_schema = "bronze"
+                # Tier is inherited from the parent folder name (bronze, silver, raw,
+                # landing, ...) — no hardcoded medallion enforcement.
+                parent_name = path.parent.name
+                inferred_schema = parent_name if parent_name and parent_name != "lakehouse" else "main"
         elif path.is_dir():
             files = list(path.glob("*.parquet"))
             if not inferred_schema:
-                inferred_schema = path.name if path.name != "lakehouse" else "bronze"
+                inferred_schema = path.name if path.name != "lakehouse" else "main"
 
-        final_schema = inferred_schema or "bronze"
+        final_schema = inferred_schema or "main"
 
         for f in files:
             try:

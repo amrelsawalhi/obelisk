@@ -40,6 +40,76 @@ AsyncSessionLocal = async_sessionmaker(
     autoflush=False,
 )
 
+async def seed_defaults(session: AsyncSession) -> None:
+    """
+    Idempotently seeds default system variables and pipeline definitions on startup.
+
+    This used to live inside GET /api/variables and GET /api/pipelines handlers,
+    which raced under concurrent page-load requests (both saw empty tables, both
+    committed seeds) causing SQLite UNIQUE constraint / locking errors. Seeding
+    now happens exactly once, here, during the startup lifespan.
+    """
+    from sqlalchemy import select
+    from app.models.variable import Variable
+    from app.models.pipeline_definition import PipelineDefinition
+
+    # Seed default variables if table is empty
+    v_res = await session.execute(select(Variable.id).limit(1))
+    if not v_res.scalars().first():
+        session.add_all([
+            Variable(
+                key="ENV",
+                value="development",
+                is_secret=False,
+                description="Active runtime environment mode (development / staging / production)",
+            ),
+            Variable(
+                key="DEFAULT_CURRENCY",
+                value="USD",
+                is_secret=False,
+                description="Base currency for analytical financial data marts",
+            ),
+            Variable(
+                key="BATCH_SIZE",
+                value="1000",
+                is_secret=False,
+                description="Default batch chunk size for pipeline data extraction",
+            ),
+        ])
+
+    # Seed default pipeline definitions if table is empty
+    p_res = await session.execute(select(PipelineDefinition.id).limit(1))
+    if not p_res.scalars().first():
+        session.add_all([
+            PipelineDefinition(
+                name="All Medallion Assets",
+                description="Full end-to-end Medallion pipeline from Bronze raw Parquet through Silver staging to Gold marts",
+                selector="*",
+            ),
+            PipelineDefinition(
+                name="Orders & Revenue Flow",
+                description="Processes transactional orders from Bronze staging to financial and enriched fact marts",
+                selector="stg_orders+",
+            ),
+            PipelineDefinition(
+                name="Customer 360 Analytics",
+                description="Cleans customer dimensions and updates lifetime value & metric marts",
+                selector="stg_customers+",
+            ),
+            PipelineDefinition(
+                name="Staging Tier Only",
+                description="Rapid materialization and validation of Silver staging models without gold aggregations",
+                selector="models/staging",
+            ),
+            PipelineDefinition(
+                name="Gold Marts Only",
+                description="Refreshes analytical business marts and metrics from materialized silver staging models",
+                selector="models/marts",
+            ),
+        ])
+
+    await session.commit()
+
 async def init_db() -> None:
     """Initialize database tables and enforce WAL mode."""
     # Ensure directory exists
@@ -54,6 +124,10 @@ async def init_db() -> None:
             __import__("sqlalchemy").text("PRAGMA journal_mode=WAL;")
         ))
         await conn.run_sync(Base.metadata.create_all)
+
+    # Seed default system data exactly once at startup (idempotent).
+    async with AsyncSessionLocal() as session:
+        await seed_defaults(session)
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency for obtaining an async database session."""

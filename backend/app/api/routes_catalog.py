@@ -224,7 +224,9 @@ def _execute_live_test(
 @router.post("/connections/test")
 async def test_connection_params(req: CreateConnectionRequest):
     """Tests live connectivity using provided parameters without saving to database."""
-    return _execute_live_test(
+    # Live probes (psycopg2/pymongo/pymysql/httpx) are blocking — keep the event loop free.
+    return await asyncio.to_thread(
+        _execute_live_test,
         source_type=req.source_type,
         host=req.host,
         port=req.port,

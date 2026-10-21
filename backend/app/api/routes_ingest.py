@@ -100,37 +100,50 @@ async def trigger_ingestion(
 
         if req.schedule_engine == "dagster":
             # Generate Dagster DAG file in git_repo/dags/
+            # SECURITY: Only the connection ID is persisted. Credentials are decrypted
+            # at runtime from the Obelisk Vault — plaintext secrets never touch disk.
             dags_dir = Path(__file__).resolve().parent.parent.parent.parent / "git_repo" / "dags"
             dags_dir.mkdir(parents=True, exist_ok=True)
             dag_file = dags_dir / f"ingest_{clean_target}.py"
+            asset_identifier = f"ingest_{clean_target}"
+
             dag_code = f'''# Auto-generated Dagster Ingestion Asset & Schedule
 import dagster as dg
 from dagster_workspace.repository import create_ingest_asset
 
-connection_params = {json.dumps(connection_params, indent=4)}
+# Reference connection securely by ID rather than embedding secrets
+CONNECTION_ID = {json.dumps(req.connection_id)}
+ENTITY = {json.dumps(req.entity)}
+MODE = {json.dumps(req.mode)}
+WRITE_STRATEGY = {json.dumps(req.write_strategy or 'append')}
+PRIMARY_KEY = {json.dumps(req.primary_key)}
+WATERMARK_COL = {json.dumps(req.watermark_column)}
+TARGET_NAME = {json.dumps(req.target_name)}
+TARGET_FOLDER = {json.dumps(req.target_folder)}
+LIMIT = {json.dumps(req.limit)}
 
-ingest_{clean_target}_asset = create_ingest_asset(
-    asset_name="bronze_{clean_target}",
-    source_type="{conn.source_type}",
-    connection_params=connection_params,
-    entity="{req.entity}",
-    mode="{req.mode}",
-    watermark_column={json.dumps(req.watermark_column)},
-    target_name={json.dumps(req.target_name)},
-    target_folder={json.dumps(req.target_folder)},
-    limit={json.dumps(req.limit)},
-    write_strategy="{req.write_strategy or 'append'}",
-    primary_key={json.dumps(req.primary_key)},
+{asset_identifier}_asset = create_ingest_asset(
+    asset_name={json.dumps(clean_target)},
+    connection_id=CONNECTION_ID,
+    source_type={json.dumps(conn.source_type)},
+    entity=ENTITY,
+    mode=MODE,
+    watermark_column=WATERMARK_COL,
+    target_name=TARGET_NAME,
+    target_folder=TARGET_FOLDER,
+    limit=LIMIT,
+    write_strategy=WRITE_STRATEGY,
+    primary_key=PRIMARY_KEY,
 )
 
-ingest_{clean_target}_job = dg.define_asset_job(
-    name="ingest_{clean_target}_job",
-    selection=[ingest_{clean_target}_asset],
+{asset_identifier}_job = dg.define_asset_job(
+    name="{asset_identifier}_job",
+    selection=[{asset_identifier}_asset],
 )
 
-ingest_{clean_target}_schedule = dg.ScheduleDefinition(
-    job=ingest_{clean_target}_job,
-    cron_schedule="{cron_expr}",
+{asset_identifier}_schedule = dg.ScheduleDefinition(
+    job={asset_identifier}_job,
+    cron_schedule={json.dumps(cron_expr)},
 )
 '''
             dag_file.write_text(dag_code, encoding="utf-8")
@@ -252,6 +265,8 @@ async def trigger_batch_ingestion(
 
         if req.schedule_engine == "dagster":
             # Generate Dagster DAG in git_repo/dags/
+            # SECURITY: Only the connection ID is persisted. Credentials are decrypted
+            # at runtime from the Obelisk Vault — plaintext secrets never touch disk.
             clean_db = conn.name.lower().replace(" ", "_").replace("-", "_")
             dags_dir = Path(__file__).resolve().parent.parent.parent.parent / "git_repo" / "dags"
             dags_dir.mkdir(parents=True, exist_ok=True)
@@ -265,23 +280,21 @@ async def trigger_batch_ingestion(
                 asset_names.append(var_name)
                 asset_defs.append(f"""
 {var_name} = create_ingest_asset(
-    asset_name="bronze_{clean_t}",
-    source_type="{conn.source_type}",
-    connection_params=connection_params,
-    entity="{tbl}",
-    mode="{req.mode}",
+    asset_name={json.dumps(clean_t)},
+    connection_id={json.dumps(req.connection_id)},
+    source_type={json.dumps(conn.source_type)},
+    entity={json.dumps(tbl)},
+    mode={json.dumps(req.mode)},
     watermark_column={json.dumps(req.watermark_column)},
     target_folder={json.dumps(req.target_folder)},
     limit={json.dumps(req.limit)},
-    write_strategy="{req.write_strategy}",
+    write_strategy={json.dumps(req.write_strategy)},
     primary_key={json.dumps(req.primary_key)},
 )
 """)
             dag_code = f"""# Auto-generated Dagster Batch Ingestion Asset Group & Schedule
 import dagster as dg
 from dagster_workspace.repository import create_ingest_asset
-
-connection_params = {json.dumps(connection_params, indent=4)}
 
 {''.join(asset_defs)}
 
@@ -292,7 +305,7 @@ batch_job = dg.define_asset_job(
 
 batch_schedule = dg.ScheduleDefinition(
     job=batch_job,
-    cron_schedule="{cron_expr}",
+    cron_schedule={json.dumps(cron_expr)},
 )
 """
             dag_file.write_text(dag_code, encoding="utf-8")

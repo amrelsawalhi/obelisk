@@ -369,7 +369,9 @@ def test_sqlite_asset_catalog_registration(source_postgres_params):
         assert row is not None, f"Asset '{target_name}' was not recorded in SQLite assets table!"
         name, layer, storage_uri, count, schema_json = row
         assert name == target_name
-        assert layer == "bronze"
+        # Layer is inherited from the target folder (medallion decoupled):
+        # no target_folder means the file lands in the lakehouse root ('main').
+        assert layer == "main"
         assert count == 2
         assert "parquet" in storage_uri
 

@@ -45,10 +45,58 @@ export interface ServiceStatus {
   host_port?: number;
 }
 
+export interface DeployedCredentials {
+  username?: string | null;
+  password?: string | null;
+  database?: string | null;
+  host?: string | null;
+  port?: number | null;
+}
+
+export interface DeployLocalResponse extends ServiceStatus {
+  ready: boolean;
+  message?: string | null;
+  credentials?: DeployedCredentials | null;
+  registered_connection?: string | null;
+}
+
+export interface ServiceCatalogEntry {
+  name: string;
+  display_name: string;
+  description: string;
+  image: string;
+  deployable: boolean;
+  reason_not_deployable?: string | null;
+  default_host_port: number;
+  port_map: Record<string, number>;
+  volume_name?: string | null;
+  probe_timeout_seconds: number;
+  recommended_min_disk_gb: number;
+  needs_credentials: boolean;
+  register_connection: boolean;
+  web_ui: boolean;
+}
+
+export interface ServiceEngineStatus {
+  docker: { available: boolean; error?: string | null };
+  disk: { free_gb: number; total_gb: number; percent_used: number };
+}
+
+export interface DeployProgressResponse {
+  service_name: string;
+  phase: string; // idle | pre-flight | pulling | creating | initializing | probing | ready | starting | failed
+  detail: string;
+  pull_percent: number;
+  logs: string[];
+  active: boolean;
+  error?: string | null;
+}
+
 export interface DeployLocalRequest {
   service_name: string;
   memory_mb?: number;
   image?: string;
+  host_port?: number;
 }
 
 export interface ConnectRemoteRequest {

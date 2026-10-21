@@ -31,42 +31,14 @@ class UpdateVariableRequest(BaseModel):
 @router.get("")
 async def list_variables():
     """
-    Returns all registered variables.
+    Returns all registered variables (read-only).
     Secret variables have their values masked as '••••••••••••' for security.
-    Auto-seeds default enterprise variables if empty.
+    Default variables are seeded once at startup via app.database.seed_defaults.
     """
     async with AsyncSessionLocal() as session:
         stmt = select(Variable).order_by(Variable.key.asc())
         res = await session.execute(stmt)
         vars_list = res.scalars().all()
-
-        if not vars_list:
-            default_seeds = [
-                Variable(
-                    key="ENV",
-                    value="development",
-                    is_secret=False,
-                    description="Active runtime environment mode (development / staging / production)",
-                ),
-                Variable(
-                    key="DEFAULT_CURRENCY",
-                    value="USD",
-                    is_secret=False,
-                    description="Base currency for analytical financial data marts",
-                ),
-                Variable(
-                    key="BATCH_SIZE",
-                    value="1000",
-                    is_secret=False,
-                    description="Default batch chunk size for pipeline data extraction",
-                ),
-            ]
-            for v in default_seeds:
-                session.add(v)
-            await session.commit()
-            stmt = select(Variable).order_by(Variable.key.asc())
-            res = await session.execute(stmt)
-            vars_list = res.scalars().all()
 
         return [
             {

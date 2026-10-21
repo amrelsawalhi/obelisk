@@ -37,6 +37,10 @@ import type {
   DbtPreviewResponse,
   DbtExecutionResponse,
   DbtLineageResponse,
+  DeployLocalResponse,
+  ServiceCatalogEntry,
+  ServiceEngineStatus,
+  DeployProgressResponse,
 } from './types';
 
 export const apiClient = axios.create({
@@ -65,8 +69,30 @@ export const api = {
     const res = await apiClient.get<ServiceStatus[]>('/services/status');
     return res.data;
   },
-  deployLocalService: async (req: DeployLocalRequest): Promise<ServiceStatus> => {
-    const res = await apiClient.post<ServiceStatus>('/services/deploy-local', req);
+  deployLocalService: async (req: DeployLocalRequest): Promise<DeployLocalResponse> => {
+    const res = await apiClient.post<DeployLocalResponse>('/services/deploy-local', req);
+    return res.data;
+  },
+  getServicesEngine: async (): Promise<ServiceEngineStatus> => {
+    const res = await apiClient.get<ServiceEngineStatus>('/services/engine');
+    return res.data;
+  },
+  getServiceDeployProgress: async (serviceName: string): Promise<DeployProgressResponse> => {
+    const res = await apiClient.get<DeployProgressResponse>(`/services/${serviceName}/deploy-progress`);
+    return res.data;
+  },
+  getServiceCatalog: async (): Promise<ServiceCatalogEntry[]> => {
+    const res = await apiClient.get<ServiceCatalogEntry[]>('/services/catalog');
+    return res.data;
+  },
+  getServiceLogs: async (serviceName: string, tail: number = 200): Promise<{ service_name: string; logs: string }> => {
+    const res = await apiClient.get<{ service_name: string; logs: string }>(`/services/${serviceName}/logs`, {
+      params: { tail },
+    });
+    return res.data;
+  },
+  destroyService: async (serviceName: string): Promise<{ service_name: string; status: string; data_removed: boolean }> => {
+    const res = await apiClient.post<{ service_name: string; status: string; data_removed: boolean }>(`/services/${serviceName}/destroy`);
     return res.data;
   },
   connectRemoteService: async (req: ConnectRemoteRequest): Promise<ServiceStatus> => {

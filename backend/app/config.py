@@ -69,13 +69,16 @@ class Settings(BaseSettings):
             else:
                 raw_path = stripped
 
-            clean_raw = raw_path.rstrip("/\\")
+            clean_raw = raw_path.rstrip("/\\").replace("\\", "/")
+            project_root = Path(__file__).resolve().parent.parent.parent
             if clean_raw in ("/data/lakehouse", "data/lakehouse") or clean_raw.endswith("data/lakehouse"):
-                project_root = Path(__file__).resolve().parent.parent.parent
                 target_dir = project_root / "data" / "lakehouse"
-            elif clean_raw.endswith("data/lakehouse/bronze"):
-                project_root = Path(__file__).resolve().parent.parent.parent
-                target_dir = project_root / "data" / "lakehouse"
+            elif "data/lakehouse/" in clean_raw:
+                # Retain whatever sub-tier directory was configured under data/lakehouse
+                # (e.g. bronze, silver, raw, landing, analytics, ...) instead of forcing
+                # a hardcoded medallion structure.
+                sub_tier = clean_raw.split("data/lakehouse/")[-1]
+                target_dir = project_root / "data" / "lakehouse" / sub_tier
             else:
                 target_dir = Path(raw_path)
 

@@ -1,4 +1,8 @@
 import asyncio
+import secrets
+import socket
+import time
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -7,8 +11,14 @@ from sqlalchemy import select
 
 from app.database import get_db
 from app.models.service_config import ServiceConfig
+from app.models.connection import Connection
 from app.core.resource_advisor import advisor
 from app.core.docker_manager import docker_mgr
+from app.core.service_blueprints import get_blueprint, blueprint_catalog_entries
+from app.core.deploy_tracker import deploy_tracker
+from app.core.vault import encrypt, decrypt
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 router = APIRouter(prefix="/api/services", tags=["services"])
 
@@ -25,7 +35,8 @@ SUPPORTED_SERVICES = [
 class DeployLocalRequest(BaseModel):
     service_name: str = Field(..., description="Service identifier, e.g. postgres, dagster")
     memory_mb: Optional[int] = Field(None, description="Optional explicit memory limit in MB")
-    image: Optional[str] = Field(None, description="Optional custom image override")
+    image: Optional[str] = Field(None, description="Optional custom image override (blueprint pins are used by default)")
+    host_port: Optional[int] = Field(None, description="Optional host port override for the primary port")
 
 class ConnectRemoteRequest(BaseModel):
     service_name: str = Field(..., description="Service identifier, e.g. postgres, clickhouse")
@@ -42,6 +53,21 @@ class ServiceStatusResponse(BaseModel):
     allocated_memory_mb: int
     container_id: Optional[str] = None
     live_docker_status: Optional[str] = None
+
+class DeployedCredentials(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    database: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+
+
+class DeployLocalResponse(ServiceStatusResponse):
+    ready: bool = False
+    message: Optional[str] = None
+    credentials: Optional[DeployedCredentials] = None
+    registered_connection: Optional[str] = None
+
 
 class HostSpecsResponse(BaseModel):
     total_ram_bytes: int
@@ -102,6 +128,16 @@ def get_service_host_port(svc_name: str, live_container: Any = None, default_por
         except Exception:
             pass
     return default
+
+def _is_host_port_free(host_port: int) -> bool:
+    """Binds the port to check availability (deploy pre-flight)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("0.0.0.0", host_port))
+            return True
+    except OSError:
+        return False
+
 
 @router.get("/status", response_model=List[ServiceStatusResponse])
 async def list_service_statuses(db: AsyncSession = Depends(get_db)):
@@ -165,76 +201,190 @@ async def list_service_statuses(db: AsyncSession = Depends(get_db)):
 
     return statuses
 
-@router.post("/deploy", response_model=ServiceStatusResponse)
-@router.post("/deploy-local", response_model=ServiceStatusResponse)
+@router.post("/deploy", response_model=DeployLocalResponse)
+@router.post("/deploy-local", response_model=DeployLocalResponse)
 async def deploy_local_service(
-    req: DeployLocalRequest, 
+    req: DeployLocalRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """1-Click Local Deploy on localhost Docker with dynamic hardware sizing."""
-    svc_name = req.service_name.lower()
-    if svc_name not in SUPPORTED_SERVICES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported service '{svc_name}'."
-        )
+    """
+    1-Click Local Deploy (Services 2.0):
+    pre-flight checks -> blueprint-driven deploy (pinned image, named data volume)
+    -> per-deploy vaulted credentials -> readiness probing -> Connection auto-register.
 
+    The request stays synchronous (callers await the final result), but every phase
+    is recorded in DeployTracker so the UI can poll GET /{name}/deploy-progress:
+    pre-flight -> pulling (layer %) -> creating -> initializing -> probing -> ready.
+    """
+    svc_name = req.service_name.lower()
+    bp = get_blueprint(svc_name)
+    deploy_tracker.start(svc_name)
     try:
-        # Fast async hygiene: Docker container creation in background thread
+        if svc_name not in SUPPORTED_SERVICES or bp is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported service '{req.service_name}'. Supported: {SUPPORTED_SERVICES}")
+        if not bp.deployable:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{bp.display_name} cannot be deployed locally: {bp.reason_not_deployable}")
+
+        # Pre-flight 1: Docker engine reachable
+        deploy_tracker.update(svc_name, phase="pre-flight", detail="checking Docker engine")
+        engine = await asyncio.to_thread(docker_mgr.engine_status)
+        if not engine["available"]:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Docker engine is not reachable: {engine['error']}. Start Docker Desktop (or set DOCKER_HOST) and try again.")
+
+        # Pre-flight 2: host port availability (skipped when our own container holds it)
+        host_port = req.host_port or bp.primary_host_port
+        own_container = await asyncio.to_thread(docker_mgr.get_service_container, svc_name)
+        if not own_container and not _is_host_port_free(host_port):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                detail=f"Host port {host_port} is already in use by another process. Choose a different host_port.")
+
+        # Pre-flight 3: disk space for the image pull
+        disk = await asyncio.to_thread(advisor.get_disk_info, str(_PROJECT_ROOT))
+        if disk["free_gb"] < bp.image_size_gb:
+            raise HTTPException(status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+                detail=f"Not enough disk space: {disk['free_gb']} GB free, image '{bp.image}' needs ~{bp.image_size_gb} GB.")
+
+        # Load persisted config: redeploy reuses credentials so connections keep working
+        stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
+        svc_record = (await db.execute(stmt)).scalar_one_or_none()
+        config_json: Dict[str, Any] = dict(svc_record.config_json or {}) if svc_record else {}
+
+        # Credentials: generated once per service, vaulted, injected via env
+        env_override: Dict[str, str] = {}
+        credentials = None
+        username = config_json.get("username") or bp.credential_username or "postgres"
+        database = config_json.get("database") or bp.credential_database or "postgres"
+        if "__GENERATED__" in bp.env.values():
+            if config_json.get("encrypted_password"):
+                password = decrypt(config_json["encrypted_password"])
+            else:
+                password = secrets.token_urlsafe(18)
+                config_json["encrypted_password"] = encrypt(password)
+            config_json["username"] = username
+            config_json["database"] = database
+            for env_key, env_val in bp.env.items():
+                if env_val == "__GENERATED__":
+                    env_override[env_key] = password
+            credentials = DeployedCredentials(username=username, password=password,
+                                              database=database, host="localhost", port=host_port)
+        ports_override = None
+        if req.host_port and req.host_port != bp.primary_host_port:
+            ports_override = {bp.primary_container_port: ("0.0.0.0", host_port)}
+
+        # Deploy with live pull progress (layer % streamed to the tracker)
+        deploy_tracker.update(svc_name, phase="pulling", detail=f"pulling {req.image or bp.image}")
+        layer_totals: Dict[str, int] = {}
+        layer_currents: Dict[str, int] = {}
+
+        def _on_pull(layer: str, pull_status: str, current: int, total: int) -> None:
+            if total > 0:
+                layer_totals[layer] = total
+                layer_currents[layer] = current
+                t_total = sum(layer_totals.values())
+                t_current = sum(layer_currents.values())
+                if t_total > 0:
+                    deploy_tracker.update(svc_name, phase="pulling",
+                                          pull_percent=(t_current / t_total) * 100.0)
+
+        deploy_tracker.update(svc_name, phase="creating", detail="creating container")
         container = await asyncio.to_thread(
             docker_mgr.deploy_service,
             service_name=svc_name,
             image=req.image,
-            memory_mb=req.memory_mb
+            memory_mb=req.memory_mb,
+            environment=env_override,
+            ports=ports_override,
+            pull_progress_cb=_on_pull,
         )
+
+        # Post-start initialization (e.g. superset db upgrade / admin creation)
+        if bp.post_start_commands:
+            deploy_tracker.update(svc_name, phase="initializing",
+                                  detail=f"running {len(bp.post_start_commands)} init commands")
+
+            def _on_cmd(cmd: str, output: str) -> None:
+                deploy_tracker.update(svc_name, log=f"$ {cmd}\n{output}")
+
+            await asyncio.to_thread(
+                docker_mgr.run_post_start_commands, svc_name, bp.post_start_commands, _on_cmd,
+            )
+
+        # Readiness probing: "ready" only when the service actually answers
+        deploy_tracker.update(svc_name, phase="probing", detail="waiting for readiness probe")
+        ready = False
+        probe_detail = "no probe configured"
+        deadline = time.time() + bp.probe_timeout_seconds
+        while time.time() < deadline:
+            probe = await asyncio.to_thread(docker_mgr.probe_readiness, svc_name, host_port)
+            ready = probe["ready"]
+            probe_detail = probe["detail"]
+            if ready:
+                break
+            await asyncio.sleep(2.0)
+        status_value = "ready" if ready else "starting"
+        deploy_tracker.finish(svc_name, status_value, probe_detail)
+        config_json.update({"image": req.image or bp.image, "host_port": host_port, "volume_name": bp.volume_name})
+        if not svc_record:
+            svc_record = ServiceConfig(
+                service_name=svc_name, deployment_type="local", status=status_value,
+                container_id=container.id, host="localhost", port=host_port,
+                allocated_memory_mb=0, config_json=config_json,
+            )
+            db.add(svc_record)
+        else:
+            svc_record.deployment_type = "local"
+            svc_record.status = status_value
+            svc_record.container_id = container.id
+            svc_record.host = "localhost"
+            svc_record.port = host_port
+            svc_record.config_json = config_json
+
+        # Auto-register as a catalog Connection so Query Studio / pipelines can use it immediately
+        registered_name = None
+        if ready and bp.register_connection and bp.connection_type and credentials:
+            conn_name = f"Obelisk {bp.display_name} (local)"
+            existing_conn = (await db.execute(
+                select(Connection).where(Connection.name == conn_name))).scalar_one_or_none()
+            enc_pw = encrypt(credentials.password or "")
+            if existing_conn:
+                existing_conn.host = "localhost"
+                existing_conn.port = host_port
+                existing_conn.database = credentials.database or ""
+                existing_conn.username = credentials.username or ""
+                existing_conn.encrypted_credentials = enc_pw
+            else:
+                db.add(Connection(name=conn_name, source_type=bp.connection_type, host="localhost",
+                                  port=host_port, database=credentials.database or "",
+                                  username=credentials.username or "", encrypted_credentials=enc_pw))
+            registered_name = conn_name
+
+        await db.commit()
+        await db.refresh(svc_record)
+
+        mem_bytes = container.attrs.get("HostConfig", {}).get("Memory", 0)
+        mem_mb = mem_bytes // (1024 * 1024) if mem_bytes > 0 else (req.memory_mb or 1024)
+
+        message = None
+        if not ready:
+            message = (f"Container started but the service is not ready yet (probe: {probe_detail}). "
+                       f"It may still be initializing — check logs at /api/services/{svc_name}/logs.")
+
+        return DeployLocalResponse(
+            service_name=svc_name, deployment_type="local", status=status_value,
+            host=svc_record.host, port=svc_record.port, allocated_memory_mb=mem_mb,
+            container_id=container.id, live_docker_status=container.status,
+            ready=ready, message=message, credentials=credentials, registered_connection=registered_name,
+        )
+    except HTTPException as he:
+        deploy_tracker.fail(svc_name, str(he.detail))
+        raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to deploy container on localhost Docker: {str(e)}"
-        )
+        deploy_tracker.fail(svc_name, str(e))
+        raise
 
-    # Calculate allocated memory
-    mem_bytes = container.attrs.get("HostConfig", {}).get("Memory", 0)
-    mem_mb = mem_bytes // (1024 * 1024) if mem_bytes > 0 else (req.memory_mb or 1024)
-
-    # Persist in SQLite
-    stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
-    result = await db.execute(stmt)
-    svc_record = result.scalar_one_or_none()
-
-    svc_port = get_service_host_port(svc_name, container, DEFAULT_SERVICE_PORTS.get(svc_name, 8000))
-
-    if not svc_record:
-        svc_record = ServiceConfig(
-            service_name=svc_name,
-            deployment_type="local",
-            status=container.status,
-            container_id=container.id,
-            host="localhost",
-            port=svc_port,
-            allocated_memory_mb=mem_mb,
-        )
-        db.add(svc_record)
-    else:
-        svc_record.deployment_type = "local"
-        svc_record.status = container.status
-        svc_record.container_id = container.id
-        svc_record.port = svc_port
-        svc_record.allocated_memory_mb = mem_mb
-
-    await db.commit()
-    await db.refresh(svc_record)
-
-    return ServiceStatusResponse(
-        service_name=svc_name,
-        deployment_type="local",
-        status=container.status,
-        host=svc_record.host,
-        port=svc_record.port,
-        allocated_memory_mb=mem_mb,
-        container_id=container.id,
-        live_docker_status=container.status,
-    )
 
 @router.post("/connect", response_model=ServiceStatusResponse)
 async def connect_remote_service(
@@ -299,7 +449,7 @@ async def stop_service(
     service_name: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Stops and removes local container managed by Obelisk."""
+    """Stops and removes the local container managed by Obelisk. Data volumes are PRESERVED (use /destroy to remove data)."""
     svc_name = service_name.lower()
     try:
         await asyncio.to_thread(docker_mgr.stop_service, svc_name)
@@ -318,3 +468,80 @@ async def stop_service(
         await db.commit()
 
     return {"service_name": svc_name, "status": "stopped"}
+
+
+@router.get("/engine")
+async def docker_engine_status():
+    """Live Docker engine reachability + disk space (drives the UI engine-offline state)."""
+    engine = await asyncio.to_thread(docker_mgr.engine_status)
+    disk = await asyncio.to_thread(advisor.get_disk_info, str(_PROJECT_ROOT))
+    return {"docker": engine, "disk": disk}
+
+
+@router.get("/catalog")
+async def service_catalog():
+    """Blueprint-driven deployable service metadata for the pre-deploy configuration form."""
+    return blueprint_catalog_entries()
+
+
+@router.get("/{service_name}/deploy-progress")
+async def get_deploy_progress(service_name: str):
+    """Live deploy progress (polled by the UI while POST /deploy is in flight)."""
+    svc_name = service_name.lower()
+    job = deploy_tracker.get(svc_name)
+    if job is None:
+        return {"service_name": svc_name, "phase": "idle", "active": False,
+                "detail": "", "pull_percent": 0.0, "logs": [], "error": None}
+    return job.to_dict()
+
+
+@router.get("/{service_name}/logs")
+async def get_service_logs(service_name: str, tail: int = 200):
+    """Returns the last log lines of a managed local container."""
+    svc_name = service_name.lower()
+    if svc_name not in SUPPORTED_SERVICES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown service '{service_name}'.")
+    try:
+        logs = await asyncio.to_thread(docker_mgr.get_container_logs, svc_name, tail)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to fetch logs: {e}")
+    return {"service_name": svc_name, "logs": logs}
+
+
+@router.post("/{service_name}/destroy")
+async def destroy_service(service_name: str, db: AsyncSession = Depends(get_db)):
+    """
+    Stops the managed container AND permanently deletes its data volume.
+    This destroys all persisted service data — the frontend must confirm explicitly.
+    """
+    svc_name = service_name.lower()
+    if svc_name not in SUPPORTED_SERVICES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown service '{service_name}'.")
+    # Destroy is also the cleanup path for orphaned volumes (after stop or a crash),
+    # so a running container is not required — but *something* must exist to destroy.
+    container = await asyncio.to_thread(docker_mgr.get_service_container, svc_name)
+    bp = get_blueprint(svc_name)
+    has_volume = False
+    if bp and bp.volume_name and docker_mgr.client:
+        try:
+            docker_mgr.client.volumes.get(bp.volume_name)
+            has_volume = True
+        except Exception:
+            pass
+    if not container and not has_volume:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No managed local container or data volume for '{svc_name}'.")
+    try:
+        await asyncio.to_thread(docker_mgr.destroy_service, svc_name)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to destroy '{svc_name}': {e}")
+
+    stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
+    svc_record = (await db.execute(stmt)).scalar_one_or_none()
+    if svc_record:
+        svc_record.status = "stopped"
+        svc_record.container_id = None
+        await db.commit()
+
+    return {"service_name": svc_name, "status": "destroyed", "data_removed": True}

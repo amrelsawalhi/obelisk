@@ -8,11 +8,18 @@ import {
   AlertTriangle,
   ExternalLink,
   Unlink,
+  Terminal,
+  Trash2,
 } from 'lucide-react';
 import { api } from '../../lib/api';
+import { DeployModal } from './DeployModal';
 import type {
   ServiceStatus,
   ServiceRecommendation,
+  ServiceCatalogEntry,
+  ServiceEngineStatus,
+  DeployLocalResponse,
+  DeployProgressResponse,
 } from '../../lib/types';
 
 interface ServiceMeta {
@@ -79,6 +86,19 @@ const SERVICE_CATALOG_META: ServiceMeta[] = [
   },
 ];
 
+const extractErrorMessage = (e: unknown, fallback: string): string => {
+  if (e && typeof e === 'object' && 'response' in e) {
+    const resp = (e as { response?: { data?: { detail?: string } } }).response;
+    if (resp?.data?.detail) {
+      return resp.data.detail;
+    }
+  }
+  if (e instanceof Error) {
+    return e.message;
+  }
+  return fallback;
+};
+
 export const ServicesView: React.FC = () => {
   const [services, setServices] = useState<Record<string, ServiceStatus>>({});
   const [recommendations, setRecommendations] = useState<Record<string, ServiceRecommendation>>({});
@@ -99,6 +119,17 @@ export const ServicesView: React.FC = () => {
   const [remoteHosts, setRemoteHosts] = useState<Record<string, string>>({});
   const [remotePorts, setRemotePorts] = useState<Record<string, number>>({});
   const [operatingService, setOperatingService] = useState<string | null>(null);
+  const [engineStatus, setEngineStatus] = useState<ServiceEngineStatus | null>(null);
+  const [catalog, setCatalog] = useState<Record<string, ServiceCatalogEntry>>({});
+  const [deployResult, setDeployResult] = useState<DeployLocalResponse | null>(null);
+  const [logsFor, setLogsFor] = useState<string | null>(null);
+  const [logsText, setLogsText] = useState('');
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [customPorts, setCustomPorts] = useState<Record<string, number>>({});
+  const [deployProgress, setDeployProgress] = useState<DeployProgressResponse | null>(null);
+  const [customImages, setCustomImages] = useState<Record<string, string>>({});
+  const [deployModalSvc, setDeployModalSvc] = useState<string | null>(null);
+  const [deployError, setDeployError] = useState<string | null>(null);
 
   const loadData = async (silent = false) => {
     try {
@@ -107,6 +138,15 @@ export const ServicesView: React.FC = () => {
       setError(null);
 
       const servicesData = await api.listServices();
+
+      const [engineData, catalogData] = await Promise.all([
+        api.getServicesEngine().catch(() => null),
+        api.getServiceCatalog().catch(() => [] as ServiceCatalogEntry[]),
+      ]);
+      setEngineStatus(engineData);
+      const cMap: Record<string, ServiceCatalogEntry> = {};
+      for (const entry of catalogData) cMap[entry.name] = entry;
+      setCatalog(cMap);
 
       const sMap: Record<string, ServiceStatus> = {};
       const newModes: Record<string, 'local' | 'remote'> = {};
@@ -143,7 +183,7 @@ export const ServicesView: React.FC = () => {
       );
       setRecommendations(recs);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Failed to fetch services data';
+      const msg = extractErrorMessage(e, 'Failed to fetch services data');
       setError(msg);
     } finally {
       setLoading(false);
@@ -156,18 +196,82 @@ export const ServicesView: React.FC = () => {
   }, []);
 
   const handleDeployLocal = async (svcId: string) => {
+    setDeployModalSvc(svcId);
+    setDeployError(null);
+    setOperatingService(svcId);
+    setError(null);
+    setDeployResult(null);
+    setDeployProgress({
+      service_name: svcId,
+      phase: 'pre-flight',
+      detail: 'Initializing pre-flight checks...',
+      pull_percent: 0,
+      logs: [],
+      active: true,
+      error: null,
+    });
+    let timer: ReturnType<typeof setInterval> | null = null;
+    try {
+      timer = setInterval(async () => {
+        try {
+          const p = await api.getServiceDeployProgress(svcId);
+          setDeployProgress(p);
+        } catch { /* polling is best-effort */ }
+      }, 1000);
+      const rec = recommendations[svcId];
+      const memMb = customMem[svcId] || (rec ? rec.recommended_ram_mb : 1024);
+      const res = await api.deployLocalService({
+        service_name: svcId,
+        memory_mb: memMb,
+        host_port: customPorts[svcId] || undefined,
+        image: customImages[svcId] || undefined,
+      });
+      setDeployResult(res);
+      await loadData(true);
+    } catch (e: unknown) {
+      const msg = extractErrorMessage(e, `Failed to deploy ${svcId}`);
+      setDeployError(msg);
+      setDeployProgress((prev) => ({
+        service_name: svcId,
+        phase: 'failed',
+        detail: msg,
+        pull_percent: prev?.pull_percent || 0,
+        logs: prev?.logs || [],
+        active: false,
+        error: msg,
+      }));
+    } finally {
+      if (timer) clearInterval(timer);
+      setOperatingService(null);
+    }
+  };
+
+  const handleShowLogs = async (svcId: string) => {
+    setLogsFor(svcId);
+    setLogsLoading(true);
+    try {
+      const res = await api.getServiceLogs(svcId, 200);
+      setLogsText(res.logs || '(no logs yet)');
+    } catch (e: unknown) {
+      setLogsText(extractErrorMessage(e, 'Failed to fetch logs'));
+    } finally {
+      setLogsLoading(false);
+    }
+  };
+
+  const handleDestroyService = async (svcId: string) => {
+    const confirmed = window.confirm(
+      `Destroy ${svcId}? This permanently deletes the container AND its data volume — all persisted data will be lost.`
+    );
+    if (!confirmed) return;
     setOperatingService(svcId);
     setError(null);
     try {
-      const rec = recommendations[svcId];
-      const memMb = customMem[svcId] || (rec ? rec.recommended_ram_mb : 1024);
-      await api.deployLocalService({
-        service_name: svcId,
-        memory_mb: memMb,
-      });
+      await api.destroyService(svcId);
+      setDeployResult(null);
       await loadData(true);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : `Failed to deploy ${svcId}`;
+      const msg = extractErrorMessage(e, `Failed to destroy ${svcId}`);
       setError(msg);
     } finally {
       setOperatingService(null);
@@ -187,7 +291,7 @@ export const ServicesView: React.FC = () => {
       });
       await loadData(true);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : `Failed to connect remote ${svcId}`;
+      const msg = extractErrorMessage(e, `Failed to connect remote ${svcId}`);
       setError(msg);
     } finally {
       setOperatingService(null);
@@ -201,7 +305,7 @@ export const ServicesView: React.FC = () => {
       await api.stopService(svcId);
       await loadData(true);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : `Failed to stop ${svcId}`;
+      const msg = extractErrorMessage(e, `Failed to stop ${svcId}`);
       setError(msg);
     } finally {
       setOperatingService(null);
@@ -225,6 +329,38 @@ export const ServicesView: React.FC = () => {
           <AlertTriangle className="w-4 h-4 text-red-500 shrink-0" />
           <span>{error}</span>
         </div>
+      )}
+
+      {engineStatus && !engineStatus.docker.available && (
+        <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-2.5 text-xs text-amber-800 animate-in fade-in">
+          <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+          <span>
+            <strong>Docker engine is not reachable.</strong> Start Docker Desktop (or set DOCKER_HOST) to enable 1-click local deploys.
+            {engineStatus.docker.error ? (
+              <span className="block font-mono text-[10px] text-amber-700 mt-0.5">{engineStatus.docker.error}</span>
+            ) : null}
+          </span>
+        </div>
+      )}
+
+      {/* 1-Click Deployment Progress & Lifecycle Modal */}
+      {deployModalSvc && (
+        <DeployModal
+          isOpen={!!deployModalSvc}
+          onClose={() => {
+            setDeployModalSvc(null);
+            setDeployError(null);
+            setDeployProgress(null);
+          }}
+          serviceId={deployModalSvc}
+          serviceMeta={SERVICE_CATALOG_META.find((m) => m.id === deployModalSvc)}
+          catalogEntry={catalog[deployModalSvc]}
+          progress={deployProgress}
+          deployResult={deployResult}
+          error={deployError}
+          isOperating={operatingService === deployModalSvc}
+          onRetry={() => handleDeployLocal(deployModalSvc)}
+        />
       )}
 
       {/* 6-Service Catalog (Deploy Local vs Connect Remote) */}
@@ -260,6 +396,9 @@ export const ServicesView: React.FC = () => {
             const rec = recommendations[meta.id];
             const mode = deployModes[meta.id] || (isRemoteConnected ? 'remote' : 'local');
             const isBusy = operatingService === meta.id;
+            const entry = catalog[meta.id];
+            const canDeploy = entry ? entry.deployable : true;
+            const engineDown = engineStatus ? !engineStatus.docker.available : false;
 
             return (
               <div
@@ -390,6 +529,42 @@ export const ServicesView: React.FC = () => {
                           />
                         </div>
 
+                        <div className="w-32">
+                          <label className="text-[11px] font-medium text-slate-500 block mb-1">
+                            Host Port
+                          </label>
+                          <input
+                            type="number"
+                            placeholder={String(entry?.default_host_port || meta.defaultPort)}
+                            value={customPorts[meta.id] || ''}
+                            onChange={(e) =>
+                              setCustomPorts((prev) => ({
+                                ...prev,
+                                [meta.id]: parseInt(e.target.value) || 0,
+                              }))
+                            }
+                            className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500"
+                          />
+                        </div>
+
+                        <div className="w-40">
+                          <label className="text-[11px] font-medium text-slate-500 block mb-1">
+                            Image Tag (optional)
+                          </label>
+                          <input
+                            type="text"
+                            placeholder={entry?.image || 'blueprint default'}
+                            value={customImages[meta.id] || ''}
+                            onChange={(e) =>
+                              setCustomImages((prev) => ({
+                                ...prev,
+                                [meta.id]: e.target.value,
+                              }))
+                            }
+                            className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500"
+                          />
+                        </div>
+
                         <div className="pt-5">
                           {isLocalRunning ? (
                             <button
@@ -403,7 +578,7 @@ export const ServicesView: React.FC = () => {
                           ) : (
                             <button
                               onClick={() => handleDeployLocal(meta.id)}
-                              disabled={isBusy}
+                              disabled={isBusy || engineDown || !canDeploy}
                               className="px-3.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-all disabled:opacity-50"
                             >
                               <Zap className="w-3.5 h-3.5" />
@@ -412,6 +587,40 @@ export const ServicesView: React.FC = () => {
                           )}
                         </div>
                       </div>
+
+                      {entry && (
+                        <div className="text-[10px] font-mono text-slate-400 break-all">
+                          Image: {entry.image}
+                          {entry.volume_name ? ` · persistent volume: ${entry.volume_name}` : ''}
+                        </div>
+                      )}
+
+                      {!canDeploy && (
+                        <div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded-md px-3 py-2 leading-relaxed">
+                          Local deploy unavailable: {entry?.reason_not_deployable}
+                        </div>
+                      )}
+
+                      {isLocalRunning && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => handleShowLogs(meta.id)}
+                            className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-semibold flex items-center gap-1.5 transition-all"
+                            title="View container logs"
+                          >
+                            <Terminal className="w-3.5 h-3.5" />
+                            <span>Logs</span>
+                          </button>
+                          <button
+                            onClick={() => handleDestroyService(meta.id)}
+                            className="px-2.5 py-1.5 rounded-lg border border-red-200 bg-white hover:bg-red-50 text-red-600 text-xs font-semibold flex items-center gap-1.5 transition-all"
+                            title="Stop container and permanently delete its data volume"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Destroy Data</span>
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ) : (
                     /* Connect Remote Form */
@@ -483,6 +692,43 @@ export const ServicesView: React.FC = () => {
           })}
         </div>
       </section>
+
+      {/* Container Logs Modal */}
+      {logsFor && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-8"
+          onClick={() => setLogsFor(null)}
+        >
+          <div
+            className="bg-slate-950 rounded-xl border border-slate-700 w-full max-w-4xl h-[70vh] flex flex-col overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-700 bg-slate-900">
+              <div className="flex items-center gap-2 text-xs font-mono text-slate-200">
+                <Terminal className="w-4 h-4 text-emerald-400" />
+                Container logs — {logsFor} (last 200 lines)
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleShowLogs(logsFor)}
+                  className="px-2 py-1 rounded text-[11px] text-slate-300 hover:text-white hover:bg-slate-700"
+                >
+                  Refresh
+                </button>
+                <button
+                  onClick={() => setLogsFor(null)}
+                  className="px-2 py-1 rounded text-[11px] text-slate-300 hover:text-white hover:bg-slate-700"
+                >
+                  Close ✕
+                </button>
+              </div>
+            </div>
+            <pre className="flex-1 overflow-auto p-4 text-[11px] leading-relaxed font-mono text-emerald-300 whitespace-pre-wrap">
+              {logsLoading ? 'Loading logs...' : logsText}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

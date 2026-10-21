@@ -17,7 +17,6 @@ import {
   XCircle,
   Edit2,
   AlertTriangle,
-  Terminal,
   Code2,
 } from 'lucide-react';
 import { api } from '../../lib/api';

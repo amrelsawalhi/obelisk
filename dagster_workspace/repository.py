@@ -1,13 +1,58 @@
 import os
+import json
+import sqlite3
 from pathlib import Path
 from typing import Dict, Any, Optional
 import dagster as dg
 from app.config import settings
 
+
+def resolve_connection_params_by_id(connection_id: str) -> Dict[str, Any]:
+    """
+    Fetches a registered connection from the Obelisk SQLite brain and decrypts its
+    credentials at runtime via the Fernet vault. This lets auto-generated Dagster
+    DAG files persist only the connection ID — secrets never touch disk.
+    """
+    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+    con = sqlite3.connect(db_path, timeout=10.0)
+    try:
+        row = con.execute(
+            """
+            SELECT source_type, host, port, database, username, encrypted_credentials, options
+            FROM connections WHERE id = ?
+            """,
+            (connection_id,),
+        ).fetchone()
+    finally:
+        con.close()
+
+    if not row:
+        raise RuntimeError(f"Connection '{connection_id}' not found in Obelisk registry")
+
+    source_type, host, port, database, username, encrypted_credentials, options = row
+    from app.core.vault import decrypt
+    password = decrypt(encrypted_credentials) or ""
+
+    params: Dict[str, Any] = {
+        "host": host,
+        "port": port,
+        "database": database,
+        "username": username,
+        "password": password,
+    }
+    if options:
+        try:
+            opts = json.loads(options) if isinstance(options, str) else options
+            if isinstance(opts, dict):
+                params.update(opts)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return params
+
+
 def create_ingest_asset(
     asset_name: str,
     source_type: str,
-    connection_params: Dict[str, Any],
     entity: str,
     mode: str = "snapshot",
     watermark_column: Optional[str] = None,
@@ -16,18 +61,35 @@ def create_ingest_asset(
     limit: Optional[int] = None,
     write_strategy: str = "append",
     primary_key: Optional[str] = None,
+    connection_params: Optional[Dict[str, Any]] = None,
+    connection_id: Optional[str] = None,
 ):
     """
     Asset factory for DuckDB and dlt ingestion assets streaming raw Parquet to STORAGE_URI.
+
+    Credentials are never embedded in generated DAG files: pass `connection_id` and
+    the plaintext password is decrypted at runtime from the Obelisk Vault.
+    `connection_params` (containing a plaintext password) is still accepted for
+    direct API-triggered materializations that are never persisted to disk.
     """
-    @dg.asset(name=asset_name, group_name="bronze_ingestion")
+    @dg.asset(name=asset_name, group_name="ingestion")
     def _asset(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
         from app.engines.ingest_engine import ingest_engine
+
+        params = connection_params
+        if params is None and connection_id:
+            params = resolve_connection_params_by_id(connection_id)
+        if not params:
+            raise RuntimeError(
+                f"Ingestion asset '{asset_name}' has no connection parameters "
+                f"(connection_id={connection_id!r})."
+            )
+
         context.log.info(f"Starting Dagster ingestion for entity '{entity}' from '{source_type}' (mode={mode})")
 
         res = ingest_engine.ingest_entity(
             source_type=source_type,
-            connection_params=connection_params,
+            connection_params=params,
             entity=entity,
             mode=mode,
             watermark_column=watermark_column,

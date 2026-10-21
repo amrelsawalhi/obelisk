@@ -2,12 +2,20 @@ import os
 import re
 import time
 import asyncio
+import logging
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 import duckdb
 import polars as pl
 from app.config import settings
 from app.core.resource_advisor import advisor
+
+logger = logging.getLogger(__name__)
+
+# TTL cache for recursive lakehouse Parquet scans: avoids re-scanning the entire
+# lakehouse directory tree (rglob) on every single SQL query.
+_PARQUET_FILE_CACHE: Dict[str, Tuple[float, List[Path]]] = {}
+_CACHE_TTL_SECS = 5.0
 
 class DuckDBEngine:
     """
@@ -37,27 +45,27 @@ class DuckDBEngine:
         mem_limit = advisor.get_duckdb_memory_limit()
         try:
             conn.execute(f"SET memory_limit = '{mem_limit}';")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("DuckDB memory_limit setting failed: %s", e)
 
         # Set duckdb storage directory setting for convenience
         storage_path = self._ensure_storage()
         try:
             conn.execute(f"SET storage_directory = '{storage_path}';")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("DuckDB storage_directory setting failed: %s", e)
 
         # Enforce secure HTTPS for DuckDB extension downloads (prevents ISP HTTP 307 interception)
         try:
             conn.execute("SET custom_extension_repository = 'https://extensions.duckdb.org';")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("DuckDB custom_extension_repository setting failed: %s", e)
 
         # Load httpfs extension for remote HTTPS and S3 queries
         try:
             conn.execute("LOAD httpfs;")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("DuckDB httpfs extension load failed: %s", e)
 
         return conn
 
@@ -80,8 +88,8 @@ class DuckDBEngine:
         """
         try:
             conn.execute("INSTALL postgres; LOAD postgres;")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("DuckDB postgres extension load failed: %s", e)
 
         from app.core.host_resolver import resolve_connection_host
         host = resolve_connection_host(host, port)
@@ -90,6 +98,21 @@ class DuckDBEngine:
             conn.execute(f"ATTACH '{dsn}' AS {alias} (TYPE POSTGRES, SCHEMA '{schema}');")
         else:
             conn.execute(f"ATTACH '{dsn}' AS {alias} (TYPE POSTGRES);")
+
+    def _get_lakehouse_files(self, lakehouse_root: Path) -> List[Path]:
+        """Returns all visible Parquet files under lakehouse_root, TTL-cached for 5 seconds."""
+        now = time.time()
+        cache_key = str(lakehouse_root)
+        cached = _PARQUET_FILE_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _CACHE_TTL_SECS:
+            return cached[1]
+
+        found = [
+            p for p in lakehouse_root.rglob("*.parquet")
+            if not any(part.startswith(".") for part in p.relative_to(lakehouse_root).parts)
+        ]
+        _PARQUET_FILE_CACHE[cache_key] = (now, found)
+        return found
 
     def _prepare_sql_and_views(self, conn: duckdb.DuckDBPyConnection, sql: str, storage_path: str) -> str:
         """Registers schemas and views on-demand for Lakehouse Parquet directories referenced in the query."""
@@ -101,8 +124,8 @@ class DuckDBEngine:
         # Unconditionally attach in-memory 'lakehouse' catalog for 3-tier FQN support
         try:
             conn.execute("ATTACH ':memory:' AS lakehouse;")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to attach in-memory lakehouse catalog: %s", e)
 
         if lakehouse_root.exists() and lakehouse_root.is_dir():
             matched_files = []
@@ -118,12 +141,10 @@ class DuckDBEngine:
                             if sub_cand.is_file():
                                 matched_files.append(sub_cand)
 
-            # If no direct candidates found or tokens empty, scan directory
+            # If no direct candidates found or tokens empty, scan directory (TTL-cached
+            # to avoid a recursive disk traversal on every single query)
             if not matched_files:
-                for parquet_file in lakehouse_root.rglob("*.parquet"):
-                    rel_parts = parquet_file.relative_to(lakehouse_root).parts
-                    if any(p.startswith(".") for p in rel_parts):
-                        continue
+                for parquet_file in self._get_lakehouse_files(lakehouse_root):
                     if not tokens or parquet_file.stem.lower() in tokens:
                         matched_files.append(parquet_file)
 
@@ -143,8 +164,8 @@ class DuckDBEngine:
                         conn.execute(
                             f"CREATE OR REPLACE VIEW lakehouse.{clean_tier}.{table_name} AS SELECT * FROM read_parquet('{escaped_path}');"
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to create 3-tier view for %s: %s", parquet_file.name, e)
 
                     # 2. 2-tier folder view: <folder>.<table_name>
                     try:
@@ -152,24 +173,24 @@ class DuckDBEngine:
                         conn.execute(
                             f"CREATE OR REPLACE VIEW {tier_name}.{table_name} AS SELECT * FROM read_parquet('{escaped_path}');"
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to create 2-tier view for %s: %s", parquet_file.name, e)
                 else:
                     # Flat file in lakehouse root: lakehouse.<table_name>
                     try:
                         conn.execute(
                             f"CREATE OR REPLACE VIEW lakehouse.{table_name} AS SELECT * FROM read_parquet('{escaped_path}');"
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to create flat view for %s: %s", parquet_file.name, e)
 
                 # 3. 1-tier bare table view: <table_name>
                 try:
                     conn.execute(
                         f"CREATE OR REPLACE VIEW {table_name} AS SELECT * FROM read_parquet('{escaped_path}');"
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to create bare view for %s: %s", parquet_file.name, e)
 
         # Normalize relative parquet paths (e.g. data/lakehouse/silver/customers.parquet -> absolute path)
         lakehouse_root_posix = lakehouse_root.resolve().as_posix()

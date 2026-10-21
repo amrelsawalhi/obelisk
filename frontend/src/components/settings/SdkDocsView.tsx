@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import {
-  Code2,
   Copy,
   Check,
   BookOpen,
