@@ -55,6 +55,16 @@ data/logs/
 git_repo/notebooks/Explore_*.py
 git_repo/notebooks/test_nb_*.py
 
+# Local Gitea workspace content. DAGs, notebooks and scripts under git_repo/
+# are authored inside the running platform and live in the local Gitea repo,
+# so they are user data rather than deployable code. Only the notebook SDK
+# shim stays tracked, since every notebook imports it; the Dagster workspace
+# and the dbt project stay tracked because a deployment needs them.
+git_repo/dags/*.py
+git_repo/scripts/*.py
+git_repo/notebooks/*.py
+!git_repo/notebooks/obelisk.py
+
 # Environment & Credentials
 .env
 .env.*
