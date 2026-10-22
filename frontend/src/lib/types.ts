@@ -64,6 +64,7 @@ export interface ServiceCatalogEntry {
   name: string;
   display_name: string;
   description: string;
+  category: string;
   image: string;
   deployable: boolean;
   reason_not_deployable?: string | null;
@@ -73,8 +74,11 @@ export interface ServiceCatalogEntry {
   probe_timeout_seconds: number;
   recommended_min_disk_gb: number;
   needs_credentials: boolean;
+  default_username?: string | null;
+  default_database?: string | null;
   register_connection: boolean;
   web_ui: boolean;
+  web_ui_path?: string | null;
   run_mode: string;
 }
 
@@ -98,6 +102,11 @@ export interface DeployLocalRequest {
   memory_mb?: number;
   image?: string;
   host_port?: number;
+  public_url?: string;
+  username?: string;
+  password?: string;
+  database?: string;
+  env_vars?: Record<string, string>;
 }
 
 export interface ConnectRemoteRequest {
@@ -105,6 +114,10 @@ export interface ConnectRemoteRequest {
   host: string;
   port: number;
   config_json?: Record<string, unknown>;
+  username?: string;
+  password?: string;
+  database?: string;
+  sslmode?: string;
 }
 
 export interface CatalogTableColumn {
@@ -459,27 +472,22 @@ export interface CreateVariableRequest {
 // Orchestration Engines & Obelisk Cron Types
 // ==========================================
 
+// Mirrors OrchestrationEngineInfo in backend/app/engines/orchestration_hub.py.
 export interface OrchestrationEngineInfo {
   id: 'cron' | 'dagster' | 'airflow' | string;
   name: string;
-  type: string;
-  category: string;
-  status: 'running' | 'stopped' | 'offline';
-  is_active: boolean;
-  can_deploy_local: boolean;
-  can_connect_remote: boolean;
-  port?: number | null;
-  url?: string | null;
+  icon?: string;
+  status: 'running' | 'stopped' | 'offline' | string;
   web_url?: string | null;
-  web_path?: string | null;
-  docs_url?: string | null;
   description: string;
-  features: string[];
+  is_builtin?: boolean;
+  can_deploy_local?: boolean;
+  active_jobs_count?: number;
 }
 
 export interface OrchestrationEnginesResponse {
   engines: OrchestrationEngineInfo[];
-  default_engine: string;
+  default_engine?: string;
 }
 
 export interface CronJob {

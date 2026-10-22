@@ -1,6 +1,7 @@
 import React from 'react';
 import { Search, HardDrive, Cpu, Activity } from 'lucide-react';
 import { useTelemetry } from '../../lib/useTelemetry';
+import { MOD_KEY } from '../../lib/platform';
 import type { NavigationTab } from './Sidebar';
 
 interface HeaderProps {
@@ -81,7 +82,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand }) => {
           <Search className="w-3.5 h-3.5 text-slate-400" />
           <span>Search catalog & actions...</span>
           <kbd className="font-mono text-[10px] bg-white border border-slate-300 rounded px-1.5 py-0.5 text-slate-600 shadow-2xs">
-            ⌘K
+            {MOD_KEY}K
           </kbd>
         </button>
 

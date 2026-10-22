@@ -130,7 +130,7 @@ const EngineStrip: React.FC<{
           className="p-1 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded transition-colors">
           <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
         </button>
-        <a href={webUrl || 'http://localhost:3000'} target="_blank" rel="noreferrer"
+        <a href={webUrl || '/dagster'} target="_blank" rel="noreferrer"
           title="Open in Dagster"
           className="p-1 text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 rounded transition-colors">
           <ExternalLink className="w-3.5 h-3.5" />
@@ -190,7 +190,7 @@ const SchedulesSection: React.FC<{
           </div>
           <div><Pill label={s.state} kind="SCHEDULE" /></div>
           <div className="text-right">
-            <a href={`${(webUrl || 'http://localhost:3000').replace(/\/$/, '')}/automation/schedules`}
+            <a href={`${(webUrl || '/dagster').replace(/\/$/, '')}/automation/schedules`}
               target="_blank" rel="noreferrer"
               className="inline-flex p-1 rounded text-indigo-600 hover:bg-indigo-50 hover:text-indigo-800 transition-colors"
               title="Open schedules in Dagster">

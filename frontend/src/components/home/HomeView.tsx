@@ -24,6 +24,7 @@ import type {
   AssetGraphNode,
   CronJob,
   OrchestrationEngineInfo,
+  ServiceCatalogEntry,
 } from '../../lib/types';
 import type { NavigationTab } from '../layout/Sidebar';
 
@@ -31,18 +32,12 @@ interface HomeViewProps {
   onNavigate: (tab: NavigationTab) => void;
 }
 
-const SERVICE_META: Record<string, { name: string; category: string; port: number; webUi?: boolean }> = {
-  postgres: { name: 'PostgreSQL 16', category: 'Warehouse', port: 5432 },
-  dagster: { name: 'Dagster Engine', category: 'Orchestration', port: 3000, webUi: true },
-  superset: { name: 'Apache Superset', category: 'BI & Analytics', port: 8088, webUi: true },
-  clickhouse: { name: 'ClickHouse OLAP', category: 'Analytics', port: 8123 },
-  redpanda: { name: 'Redpanda Streaming', category: 'Streaming', port: 9092 },
-  gitea: { name: 'Gitea Git Server', category: 'Git Server', port: 3001, webUi: true },
-};
+// Service catalog cards render from GET /api/services/catalog (backend blueprints).
 
 export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const { telemetry } = useTelemetry();
   const [services, setServices] = useState<ServiceStatus[]>([]);
+  const [serviceCatalog, setServiceCatalog] = useState<ServiceCatalogEntry[]>([]);
   const [catalogNodes, setCatalogNodes] = useState<CatalogNode[]>([]);
   const [connections, setConnections] = useState<Connection[]>([]);
   const [notebooks, setNotebooks] = useState<Notebook[]>([]);
@@ -56,6 +51,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
     try {
       const [
         svcData,
+        svcCatalogData,
         catData,
         connsData,
         nbData,
@@ -65,6 +61,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         enginesData,
       ] = await Promise.all([
         api.listServices().catch(() => []),
+        api.getServiceCatalog().catch(() => []),
         api.getCatalogTree().catch(() => []),
         api.listConnections().catch(() => []),
         api.listNotebooks().catch(() => ({ notebooks: [], total: 0 })),
@@ -74,6 +71,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         api.getOrchestrationEngines().catch(() => ({ engines: [] })),
       ]);
       setServices(svcData);
+      setServiceCatalog(svcCatalogData);
       setCatalogNodes(catData);
       setConnections(connsData);
       setNotebooks(nbData.notebooks || []);
@@ -423,10 +421,11 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {Object.entries(SERVICE_META).map(([key, meta]) => {
+          {serviceCatalog.map((entry) => {
+            const key = entry.name;
             const status = services.find((s) => s.service_name.toLowerCase() === key);
             const isRunning = status && (status.status === 'running' || status.status === 'connected');
-            const port = status?.port || meta.port;
+            const port = status?.port || entry.default_host_port;
 
             return (
               <div
@@ -436,10 +435,10 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                 <div className="flex items-start justify-between">
                   <div>
                     <div className="font-bold text-slate-900 text-sm leading-tight">
-                      {meta.name}
+                      {entry.display_name}
                     </div>
                     <div className="text-[11px] text-slate-400 font-mono mt-0.5">
-                      {meta.category} • Port :{port}
+                      {entry.category} • Port :{port}
                     </div>
                   </div>
 
@@ -470,9 +469,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                   )}
 
                   <div className="flex items-center gap-1.5">
-                    {isRunning && meta.webUi && (
+                    {isRunning && entry.web_ui && (
                       <a
-                        href={`http://localhost:${port}`}
+                        href={entry.web_ui_path || `http://localhost:${port}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-50 text-sky-700 hover:bg-sky-100 font-semibold text-xs border border-sky-200 transition-colors"

@@ -28,6 +28,19 @@ export default defineConfig({
         target: 'http://127.0.0.1:8088',
         changeOrigin: true,
       },
+      '/dagster': {
+        target: 'http://127.0.0.1:3000',
+        changeOrigin: true,
+        ws: true,
+      },
+      '/gitea': {
+        target: 'http://127.0.0.1:3001',
+        changeOrigin: true,
+        // Gitea mounts every route at "/" and only prefixes the links it
+        // generates with ROOT_URL's subpath, so strip /gitea before forwarding.
+        // Bare "/gitea" (what the UI links to) becomes "/".
+        rewrite: (path) => path.replace(/^\/gitea/, '') || '/',
+      },
     },
   },
 })

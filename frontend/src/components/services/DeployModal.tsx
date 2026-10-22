@@ -18,21 +18,10 @@ import type {
   ServiceCatalogEntry,
 } from '../../lib/types';
 
-interface ServiceMeta {
-  id: string;
-  displayName: string;
-  category: string;
-  description: string;
-  defaultPort: number;
-  badge: string;
-  webUi?: boolean;
-}
-
 interface DeployModalProps {
   isOpen: boolean;
   onClose: () => void;
   serviceId: string;
-  serviceMeta?: ServiceMeta;
   catalogEntry?: ServiceCatalogEntry;
   progress: DeployProgressResponse | null;
   deployResult: DeployLocalResponse | null;
@@ -59,7 +48,6 @@ export const DeployModal: React.FC<DeployModalProps> = ({
   isOpen,
   onClose,
   serviceId,
-  serviceMeta,
   catalogEntry,
   progress,
   deployResult,
@@ -114,8 +102,8 @@ export const DeployModal: React.FC<DeployModalProps> = ({
     setTimeout(() => setCopiedKey(null), 2000);
   };
 
-  const displayName = serviceMeta?.displayName || catalogEntry?.display_name || serviceId;
-  const hostPort = deployResult?.port || catalogEntry?.default_host_port || serviceMeta?.defaultPort || 3000;
+  const displayName = catalogEntry?.display_name || serviceId;
+  const hostPort = deployResult?.port || catalogEntry?.default_host_port || 3000;
   const webUiUrl = `http://localhost:${hostPort}`;
 
   return (
@@ -156,7 +144,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({
                 </span>
               </div>
               <p className="text-xs text-slate-500 font-mono mt-0.5">
-                Localhost Engine · Container: <span className="text-slate-700 font-semibold">obelisk_{serviceId}</span>
+                Localhost Engine · {catalogEntry?.run_mode === 'process' ? 'Process' : 'Container'}: <span className="text-slate-700 font-semibold">obelisk_{serviceId}</span>
               </p>
             </div>
           </div>
@@ -400,7 +388,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({
                     </div>
                   ))
                 ) : !progress?.detail ? (
-                  <div className="text-slate-500 italic">Connecting to Docker engine...</div>
+                  <div className="text-slate-500 italic">Connecting to engine...</div>
                 ) : null}
 
                 {isCompleted && (
@@ -425,7 +413,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({
             {isOperating && (
               <div className="flex items-center gap-2 text-xs text-slate-500">
                 <RefreshCw className="w-3.5 h-3.5 text-sky-600 animate-spin" />
-                <span>Deploying container in background...</span>
+                <span>Deploying engine in background...</span>
               </div>
             )}
           </div>
@@ -442,7 +430,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({
               </button>
             )}
 
-            {isCompleted && serviceMeta?.webUi && (
+            {isCompleted && catalogEntry?.web_ui && (
               <a
                 href={webUiUrl}
                 target="_blank"

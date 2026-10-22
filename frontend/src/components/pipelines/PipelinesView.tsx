@@ -19,7 +19,6 @@ import {
   Sparkles,
   Maximize2,
   Minimize2,
-  ChevronRight,
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import type {
@@ -386,9 +385,9 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
               >
                 {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
               </button>
-              {selectedEngine?.url && (
+              {selectedEngine?.web_url && (
                 <a
-                  href={selectedEngine.url}
+                  href={selectedEngine.web_url}
                   target="_blank"
                   rel="noreferrer"
                   className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-700 hover:text-indigo-600 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors"
@@ -689,7 +688,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
             <div className="flex-1 flex flex-col relative bg-white">
               <iframe
                 key={iframeKey}
-                src={selectedEngine.web_path || selectedEngine.url || '/dagster'}
+                src={selectedEngine.web_url || '/dagster'}
                 title={selectedEngine.name}
                 className="w-full flex-1 border-0"
               />
@@ -716,20 +715,6 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
                 <p className="text-xs text-slate-600 leading-relaxed mb-6">
                   {selectedEngine?.description}
                 </p>
-
-                <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 text-left mb-6">
-                  <h4 className="text-xs font-bold text-slate-700 uppercase font-mono mb-2">
-                    Key Engine Capabilities
-                  </h4>
-                  <ul className="text-xs text-slate-600 space-y-1.5">
-                    {selectedEngine?.features?.map((feat, idx) => (
-                      <li key={idx} className="flex items-center gap-2">
-                        <ChevronRight className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
-                        <span>{feat}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
 
                 <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
                   {selectedEngine?.can_deploy_local && (

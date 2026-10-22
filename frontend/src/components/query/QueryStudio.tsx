@@ -622,7 +622,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
       localStorage.setItem('obelisk_popout_sql', activeTab.sql);
       localStorage.setItem('obelisk_popout_title', activeTab.title);
     } catch {}
-    window.open('/query?popout=true', '_blank', 'noopener,noreferrer');
+    window.open('/query/popout', '_blank', 'noopener,noreferrer');
   };
 
   // Draggable Schema Explorer Width Handler
