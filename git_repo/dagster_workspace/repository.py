@@ -25,7 +25,7 @@ def resolve_connection_params_by_id(connection_id: str) -> Dict[str, Any]:
     credentials at runtime via the Fernet vault. This lets auto-generated Dagster
     DAG files persist only the connection ID — secrets never touch disk.
     """
-    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+    db_path = settings.sqlite_db_path
     con = sqlite3.connect(db_path, timeout=10.0)
     try:
         row = con.execute(

@@ -6,4 +6,4 @@ set -m
 mkdir -p "${DAGSTER_HOME}"
 cd /opt/obelisk/git_repo/dagster_workspace
 dagster-daemon run -w workspace.yaml &
-exec dagster-webserver -h 0.0.0.0 -p 3000 -w workspace.yaml
+exec dagster-webserver -h 0.0.0.0 -p 3000 --path-prefix /dagster -w workspace.yaml

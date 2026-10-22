@@ -11,12 +11,12 @@
 
     # Apache Superset BI & Dashboards (Configured with SUPERSET_WEBSERVER_BASEURL=/superset/)
     handle /superset/* {
-        reverse_proxy obelisk-superset:8088
+        reverse_proxy obelisk_superset:8088
     }
 
     # Dagster Orchestration Webserver (Configured with --path-prefix /dagster)
     handle /dagster/* {
-        reverse_proxy obelisk-dagster:3000
+        reverse_proxy obelisk_dagster:3000
     }
 
     # Reactive Marimo Notebook Server (Configured with --base-url /notebooks)
@@ -25,8 +25,13 @@
     }
 
     # Air-Gapped Gitea Git Repository
-    handle /gitea/* {
-        reverse_proxy obelisk-gitea:3001
+    # Gitea mounts every route at "/" (routers/init.go: r.Mount("/", ...)); the
+    # subpath in ROOT_URL only prefixes the links Gitea *generates*. The proxy
+    # must therefore strip /gitea before forwarding. Bare /gitea is normalized to
+    # /gitea/ so the prefix matcher below applies (the UI links to "/gitea").
+    redir /gitea /gitea/ 308
+    handle_path /gitea/* {
+        reverse_proxy obelisk_gitea:3000
     }
 
     # React 18 Frontend SPA
