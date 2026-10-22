@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from httpx import AsyncClient, ASGITransport
 from app.main import app
@@ -118,3 +120,74 @@ async def test_cron_job_lifecycle_and_execution():
             # Verify deleted from list
             list_after = await client.get("/api/pipelines/cron/jobs")
             assert not any(j["id"] == job_id for j in list_after.json())
+
+
+@pytest.mark.asyncio
+async def test_cron_notebook_job_executes_and_exits():
+    """
+    Regression guard for scheduled Marimo notebooks.
+
+    `marimo run <notebook>` starts an app server that serves until killed, so
+    awaiting communicate() blocked forever: the job stayed "running" (and the poll
+    loop permanently skips "running" jobs, so it never ran again) and every
+    execution orphaned a process holding the notebook port. Notebook jobs must
+    execute-and-exit like script jobs do.
+    """
+    from app.engines.cron_engine import cron_engine
+
+    # Underscore prefix keeps the probe out of list_available_targets().
+    probe_path = cron_engine.notebooks_dir / "_cron_notebook_probe.py"
+    probe_path.write_text(
+        "import marimo\n"
+        "\n"
+        "app = marimo.App()\n"
+        "\n"
+        "\n"
+        "@app.cell\n"
+        "def _():\n"
+        '    print("CRON_NOTEBOOK_PROBE_OUTPUT")\n'
+        "    return\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    app.run()\n",
+        encoding="utf-8",
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        create_res = await client.post(
+            "/api/pipelines/cron/jobs",
+            json={
+                "name": "Unit Test Notebook Cron",
+                "description": "Verifies notebook jobs execute and exit",
+                "target_type": "notebook",
+                "target": "_cron_notebook_probe.py",
+                "cron_expression": "0 4 * * *",
+            },
+        )
+        assert create_res.status_code == 200, create_res.text
+        job_id = create_res.json()["id"]
+
+        try:
+            # A regression would hang here forever; fail fast instead of stalling
+            # the whole suite.
+            run_res = await asyncio.wait_for(
+                client.post(f"/api/pipelines/cron/jobs/{job_id}/run"), timeout=120
+            )
+            assert run_res.status_code == 200, run_res.text
+            result = run_res.json()
+
+            assert result["status"] == "success", result["logs"]
+            assert "CRON_NOTEBOOK_PROBE_OUTPUT" in result["logs"]
+            assert result["next_run_at"] is not None
+            # The child must have exited, not been left behind as an orphan.
+            assert cron_engine._active_procs == set()
+
+            verify_res = await client.get("/api/pipelines/cron/jobs")
+            updated_job = next(j for j in verify_res.json() if j["id"] == job_id)
+            assert updated_job["last_status"] == "success"
+            assert updated_job["last_duration_seconds"] is not None
+        finally:
+            await client.delete(f"/api/pipelines/cron/jobs/{job_id}")
+            probe_path.unlink(missing_ok=True)
