@@ -1,0 +1,4 @@
+# The Dagster service image installs dependencies only — all code is supplied
+# via bind mounts at container runtime. Keep the build context minimal.
+*
+!Dockerfile.dagster

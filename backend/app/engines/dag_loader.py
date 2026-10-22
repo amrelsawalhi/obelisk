@@ -108,6 +108,43 @@ class DagLoader:
 
         return assets
 
+    def load_dagster_definitions(self) -> Dict[str, List[Any]]:
+        """
+        Dynamically imports all modules in git_repo/dags/ and collects assets,
+        jobs (incl. unresolved asset jobs), and schedules so Definitions can
+        register them (load_dagster_assets alone drops jobs/schedules).
+        """
+        result: Dict[str, List[Any]] = {"assets": [], "jobs": [], "schedules": []}
+        if dg is None:
+            return result
+
+        for file_info in self.list_dag_files():
+            file_path = Path(file_info["path"])
+            module_name = f"obelisk_dags_{file_path.stem}"
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, file_path)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+
+                for attr_name in dir(module):
+                    attr_val = getattr(module, attr_name)
+                    tname = type(attr_val).__name__
+                    if isinstance(attr_val, dg.AssetsDefinition):
+                        result["assets"].append(attr_val)
+                    elif tname in ("JobDefinition", "UnresolvedAssetJobDefinition"):
+                        # name-based: UnresolvedAssetJobDefinition is not exported
+                        # at the dagster top level in all versions (absent in 1.13)
+                        result["jobs"].append(attr_val)
+                    elif tname == "ScheduleDefinition":
+                        result["schedules"].append(attr_val)
+            except Exception as e:
+                print(f"[DagLoader] Warning: Failed to import DAG module {file_path.name}: {e}")
+
+        return result
+
     def introspect_dag_nodes(self) -> List[Dict[str, Any]]:
         """
         Inspects all DAG files and extracts asset metadata (name, deps, group, description, code)

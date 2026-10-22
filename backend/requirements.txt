@@ -42,6 +42,7 @@ oracledb>=2.1.0
 marimo>=0.3.0
 croniter>=2.0.0
 dagster-graphql>=1.6.0
+dagster-webserver==1.13.26  # host-process Dagster service (pinned to installed dagster)
 
 # In-Browser dbt Studio & Adapters
 dbt-core>=1.7.0

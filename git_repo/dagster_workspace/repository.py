@@ -4,6 +4,18 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, Any, Optional
 import dagster as dg
+
+import sys
+
+# Bootstrap sys.path: ensure `git_repo/` is on sys.path so generated DAG
+# files (which do `from dagster_workspace.repository import create_ingest_asset`)
+# can resolve this package, regardless of how Dagster`s `python_file:` loader
+# sets up sys.path.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_GIT_REPO_DIR = os.path.dirname(_THIS_DIR)
+if _GIT_REPO_DIR and _GIT_REPO_DIR not in sys.path:
+    sys.path.insert(0, _GIT_REPO_DIR)
+
 from app.config import settings
 
 
@@ -114,10 +126,13 @@ def create_ingest_asset(
 
 from app.engines.dag_loader import dag_loader
 
-# Auto-discover all custom Dagster assets defined in git_repo/dags/*.py
-custom_dag_assets = dag_loader.load_dagster_assets()
+# Auto-discover all custom Dagster assets, jobs, and schedules in git_repo/dags/*.py
+_custom_dags = dag_loader.load_dagster_definitions()
+custom_dag_assets = _custom_dags["assets"]
 
 # Repository definitions containing auto-discovered DAGs
 defs = dg.Definitions(
     assets=[*custom_dag_assets],
+    jobs=[*_custom_dags["jobs"]],
+    schedules=[*_custom_dags["schedules"]],
 )

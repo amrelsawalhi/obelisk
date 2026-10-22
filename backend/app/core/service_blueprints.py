@@ -51,6 +51,12 @@ class ServiceBlueprint:
     post_start_commands: List[str] = field(default_factory=list)  # exec'd after container start (init flows)
     credential_username: Optional[str] = None     # username shown/registered for generated credentials
     credential_database: Optional[str] = None     # database shown/registered for generated credentials
+    build_dockerfile: Optional[str] = None       # local image build instead of registry pull
+    bind_mounts: Dict[str, Dict[str, str]] = field(default_factory=dict)  # host rel path -> {"bind": container_path, "mode": ...}
+    pass_env: List[str] = field(default_factory=list)  # settings attributes injected as env at deploy
+    run_mode: str = "container"                  # "container" | "process" (host-managed processes, e.g. Dagster)
+    process_commands: List[List[str]] = field(default_factory=list)  # argv lists started by core/process_manager
+    process_cwd: Optional[str] = None            # working dir for process commands (defaults to project root)
 
 
 _BLUEPRINTS: List[ServiceBlueprint] = [
@@ -120,15 +126,29 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
     ServiceBlueprint(
         name="dagster",
         display_name="Dagster Engine",
-        description="Asset orchestrator. Local deployment is pending Workstream 5 (workspace mount wiring); connect an existing remote Dagster instance meanwhile.",
-        image="dagster/dagster-k8s:latest",
+        description="Asset orchestrator: webserver + daemon running Obelisk's real workspace on the host (process mode — no image build, logs in data/logs/). Scheduled ingest DAGs fire via the daemon.",
+        image="obelisk-dagster:local",
+        build_dockerfile="Dockerfile.dagster",
+        run_mode="process",
+        process_commands=[
+            ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "{dagster_home}/workspace.yaml"],
+            ["dagster-daemon", "run", "-w", "{dagster_home}/workspace.yaml"],
+        ],
         ports={"3000/tcp": 3000},
         primary_container_port="3000/tcp",
         primary_host_port=3000,
-        deployable=False,
-        reason_not_deployable="Local deployment pending Workstream 5: the container needs a workspace/DAG mount to serve anything useful.",
-        command="dagster-webserver -h 0.0.0.0 -p 3000 --path-prefix /dagster",
-        readiness=ReadinessProbe(kind="http", host_port=3000, path="/", expected_status=200),
+        volume_name="obelisk_dagster_home",
+        volume_path="/opt/obelisk/dagster_home",
+        bind_mounts={
+            "backend": {"bind": "/opt/obelisk/backend", "mode": "ro"},
+            "git_repo": {"bind": "/opt/obelisk/git_repo", "mode": "ro"},
+            "data": {"bind": "/opt/obelisk/data", "mode": "rw"},
+        },
+        env={"PYTHONPATH": "/opt/obelisk/backend"},
+        pass_env=["OBELISK_MASTER_KEY", "DATABASE_URL", "STORAGE_URI"],
+        readiness=ReadinessProbe(kind="http", host_port=3000, path="/server_info", expected_status=200),
+        probe_timeout_seconds=60,
+        image_size_gb=3.0,
         web_ui=True,
     ),
     ServiceBlueprint(
@@ -185,6 +205,7 @@ def blueprint_catalog_entries() -> List[Dict[str, Any]]:
             "register_connection": bp.register_connection,
             "web_ui": bp.web_ui,
             "post_start": bool(bp.post_start_commands),
+            "run_mode": bp.run_mode,
         }
         for bp in SERVICE_BLUEPRINTS.values()
     ]

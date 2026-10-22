@@ -27,6 +27,7 @@ from app.api.routes_variables import router as variables_router
 from app.api.routes_files import router as files_router
 from app.api.routes_terminal import router as terminal_router
 from app.api.routes_dbt import router as dbt_router
+from app.api.routes_orchestration import router as orchestration_router
 from app.core.resource_advisor import advisor
 from app.core.docker_manager import docker_mgr
 
@@ -67,6 +68,7 @@ app.include_router(variables_router)
 app.include_router(files_router)
 app.include_router(terminal_router)
 app.include_router(dbt_router)
+app.include_router(orchestration_router)
 
 
 @app.get("/health")

@@ -1,5 +1,7 @@
 import os
+import re
 import subprocess
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 import docker
 from docker.models.containers import Container
@@ -7,6 +9,8 @@ from docker.errors import NotFound, DockerException
 from app.config import settings
 from app.core.resource_advisor import advisor
 from app.core.service_blueprints import get_blueprint
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 MANAGED_LABEL = "managed_by"
 OBELISK_TAG = "obelisk"
@@ -46,6 +50,7 @@ class DockerManager:
     """
     def __init__(self, client: Optional[docker.DockerClient] = None):
         self._client = client
+        self._daemon_is_wsl: Optional[bool] = None
 
     @property
     def client(self) -> Optional[docker.DockerClient]:
@@ -161,8 +166,24 @@ class DockerManager:
                 # Named volume = persistence: survives stop & redeploy; removed only
                 # by destroy_service(). docker auto-creates named volumes on first run.
                 vol_map[bp.volume_name] = {"bind": bp.volume_path, "mode": "rw"}
+            for host_rel, mount in (bp.bind_mounts or {}).items():
+                host_path = str(_PROJECT_ROOT / host_rel)
+                vol_map[self._to_daemon_path(host_path)] = dict(mount)
             if volumes:
                 vol_map.update(volumes)
+
+            if bp.build_dockerfile:
+                # Local image: build from the project Dockerfile instead of pulling.
+                # Skipped when the image already exists locally — code is bind-mounted,
+                # so only Dockerfile/dependency changes need a rebuild (a rebuild can
+                # take 10-30 min on slow networks; force one by deleting the image).
+                try:
+                    self.client.images.get(bp.image)
+                    image_exists = True
+                except Exception:
+                    image_exists = False
+                if not image_exists:
+                    self.build_image_with_progress(bp.build_dockerfile, bp.image, pull_progress_cb)
         else:
             # Generic fallback (e.g. test services): bare container, no data volume
             img = image or "alpine:latest"
@@ -179,14 +200,17 @@ class DockerManager:
         # Pull explicitly: failures (auth, network, unknown tag) raise here with a
         # clear error instead of a silent multi-minute hang inside containers.run.
         # With a progress callback, layer-by-layer pull progress is streamed to it.
-        try:
-            if pull_progress_cb is not None:
-                self.pull_image_with_progress(img, pull_progress_cb)
-            else:
-                self.client.images.pull(img)
-        except Exception:
-            # Image may already exist locally (air-gapped hosts) — let containers.run try.
-            pass
+        # Locally-built images (bp.build_dockerfile) skip the registry pull.
+        already_built = bp is not None and bool(bp.build_dockerfile)
+        if not already_built:
+            try:
+                if pull_progress_cb is not None:
+                    self.pull_image_with_progress(img, pull_progress_cb)
+                else:
+                    self.client.images.pull(img)
+            except Exception:
+                # Image may already exist locally (air-gapped hosts) — let containers.run try.
+                pass
 
         # Create and run container
         container = self.client.containers.run(
@@ -290,6 +314,44 @@ class DockerManager:
                 on_log(cmd, text)
             if exit_code not in (0, None) and on_log:
                 on_log(cmd, f"(exit code {exit_code} — tolerated for redeploy idempotency)")
+
+    def _to_daemon_path(self, host_path: str) -> str:
+        """
+        Translates Windows host paths to WSL paths when the Docker daemon runs inside
+        WSL (tcp:// endpoint): a raw WSL dockerd expects /mnt/<drive>/... mount specs,
+        unlike Docker Desktop (named pipe) which accepts Windows paths natively.
+        """
+        if self._daemon_is_wsl is None:
+            try:
+                base_url = getattr(getattr(self.client, "api", None), "base_url", "") or ""
+                self._daemon_is_wsl = os.name == "nt" and base_url.startswith(("tcp://", "http://"))
+            except Exception:
+                self._daemon_is_wsl = False
+        if self._daemon_is_wsl and re.match(r"^[A-Za-z]:[\\/]", host_path):
+            drive = host_path[0].lower()
+            rest = host_path[3:].replace("\\", "/")
+            return f"/mnt/{drive}/{rest}"
+        return host_path
+
+    def build_image_with_progress(self, dockerfile: str, tag: str, on_event: Any = None) -> None:
+        """
+        Builds a local image from the project root (e.g. Dockerfile.dagster),
+        streaming build log lines to on_event(line). Raises on build failure.
+        """
+        last_err: Optional[Exception] = None
+        try:
+            for chunk in self.client.api.build(
+                path=str(_PROJECT_ROOT), dockerfile=dockerfile, tag=tag, decode=True, rm=True,
+            ):
+                line = str(chunk.get("stream") or chunk.get("status") or chunk.get("error") or "").strip()
+                if line and on_event:
+                    on_event(line)
+                if chunk.get("error"):
+                    last_err = RuntimeError(chunk["error"])
+        except Exception as e:
+            last_err = e
+        if last_err is not None:
+            raise RuntimeError(f"Image build failed for {dockerfile}: {last_err}")
 
     def probe_readiness(self, service_name: str, host_port: Optional[int] = None) -> Dict[str, Any]:
         """

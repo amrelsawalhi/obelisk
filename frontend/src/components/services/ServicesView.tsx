@@ -578,7 +578,7 @@ export const ServicesView: React.FC = () => {
                           ) : (
                             <button
                               onClick={() => handleDeployLocal(meta.id)}
-                              disabled={isBusy || engineDown || !canDeploy}
+                              disabled={isBusy || !canDeploy || (engineDown && entry?.run_mode !== 'process')}
                               className="px-3.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-all disabled:opacity-50"
                             >
                               <Zap className="w-3.5 h-3.5" />
@@ -590,8 +590,9 @@ export const ServicesView: React.FC = () => {
 
                       {entry && (
                         <div className="text-[10px] font-mono text-slate-400 break-all">
-                          Image: {entry.image}
-                          {entry.volume_name ? ` · persistent volume: ${entry.volume_name}` : ''}
+                          {entry.run_mode === 'process'
+                            ? 'Runs as local processes (no container) · logs in data/logs/'
+                            : `Image: ${entry.image}${entry.volume_name ? ` · persistent volume: ${entry.volume_name}` : ''}`}
                         </div>
                       )}
 

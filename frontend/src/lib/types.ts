@@ -75,6 +75,7 @@ export interface ServiceCatalogEntry {
   needs_credentials: boolean;
   register_connection: boolean;
   web_ui: boolean;
+  run_mode: string;
 }
 
 export interface ServiceEngineStatus {
@@ -469,6 +470,7 @@ export interface OrchestrationEngineInfo {
   can_connect_remote: boolean;
   port?: number | null;
   url?: string | null;
+  web_url?: string | null;
   web_path?: string | null;
   docs_url?: string | null;
   description: string;
@@ -656,6 +658,38 @@ export interface SaveQueryTabPayload {
   target_id?: string;
   schema_name?: string | null;
   tab_order?: number;
+}
+
+// ==========================================
+// Dagster Native Panel (fabric over Dagster)
+// ==========================================
+
+export interface DagsterJob {
+  name: string;
+  description?: string;
+}
+
+export interface DagsterSchedule {
+  id: string;
+  name: string;
+  cron: string;
+  timezone?: string;
+  state: string; // "RUNNING" | "STOPPED" | "PAUSED"
+  description?: string;
+}
+
+export interface DagsterRun {
+  id: string;
+  job: string;
+  status: string; // "SUCCESS" | "FAILURE" | "CANCELED" | "STARTED" | "QUEUED" | etc
+  started_at?: string | null;
+  ended_at?: string | null;
+  duration_seconds?: number | null;
+  dagster_url: string;
+}
+
+export interface DagsterLaunchResponse {
+  run_id: string;
 }
 
 

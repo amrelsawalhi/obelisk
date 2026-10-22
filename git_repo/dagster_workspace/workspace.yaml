@@ -1,0 +1,7 @@
+# Dagster code location: loads Obelisk's real workspace (generated ingest dags +
+# custom assets in git_repo/dags) via git_repo/dagster_workspace/repository.py.
+# The container mounts backend/, git_repo/, and data/.  (dagster_workspace is a sub-path of git_repo)
+load_from:
+  - python_file:
+      relative_path: repository.py
+      working_directory: /opt/obelisk/git_repo/dagster_workspace

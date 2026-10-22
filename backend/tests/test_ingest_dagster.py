@@ -248,8 +248,16 @@ def test_dagster_ingest_mongodb(source_mongo_params):
 
 
 @pytest.mark.asyncio
-async def test_ingest_api_trigger(source_postgres_params):
-    """Tests the POST /api/ingest/trigger endpoint with registered Connection."""
+async def test_ingest_api_trigger(source_postgres_params, monkeypatch):
+    """Tests the POST /api/ingest/trigger endpoint with registered Connection.
+
+    Forces the in-process Dagster fallback: a locally deployed Dagster service
+    runs with the developer's own DATABASE_URL, so routing through it would make
+    this test depend on ambient services instead of the test database.
+    """
+    from app.engines import dagster_client as dc_module
+    monkeypatch.setattr(dc_module, "service_status", lambda: {"available": False, "info": {}})
+
     p = source_postgres_params
     rand_suffix = uuid.uuid4().hex[:6]
     table_name = f"api_orders_{rand_suffix}"
@@ -313,6 +321,9 @@ async def test_ingest_api_trigger(source_postgres_params):
         with conn.cursor() as cur:
             cur.execute(f'DROP TABLE IF EXISTS "{table_name}";')
         conn.close()
+        # Remove the generated Dagster DAG so test runs do not pollute the workspace
+        dag_file = Path(__file__).resolve().parent.parent.parent / "git_repo" / "dags" / f"ingest_{target_name}.py"
+        dag_file.unlink(missing_ok=True)
 
 
 def test_sqlite_asset_catalog_registration(source_postgres_params):

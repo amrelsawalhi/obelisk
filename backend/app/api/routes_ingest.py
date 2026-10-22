@@ -15,6 +15,7 @@ from app.engines.dagster_client import dagster_client
 router = APIRouter(prefix="/api/ingest", tags=["ingest"])
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from app.models.cron_job import CronJob
@@ -62,6 +63,133 @@ class BatchIngestResponse(BaseModel):
     errors: List[Dict[str, str]]
     logs: List[str]
 
+def _write_ingest_dag_file(conn, req, cron_expr: Optional[str]) -> tuple:
+    """
+    Generates the secret-free Dagster asset+job file for an ingest request
+    (shared by ad-hoc triggers and Dagster-scheduled ingests).
+    SECURITY: only the connection ID is persisted; credentials decrypt at runtime
+    from the Obelisk Vault via dagster_workspace.repository.
+    Returns (job_name, dag_file_path).
+    """
+    clean_target = (req.target_name or (req.entity.split(".", 1)[-1] if "." in req.entity else req.entity)).replace(".", "_")
+    asset_identifier = f"ingest_{clean_target}"
+    dags_dir = Path(__file__).resolve().parent.parent.parent.parent / "git_repo" / "dags"
+    dags_dir.mkdir(parents=True, exist_ok=True)
+    dag_file = dags_dir / f"ingest_{clean_target}.py"
+
+    # Preserve an existing Dagster schedule when the file is regenerated for an
+    # ad-hoc run (otherwise a manual trigger would silently drop the schedule).
+    if cron_expr is None and dag_file.exists():
+        try:
+            m = re.search(r"cron_schedule=(['\"])(.+?)\1", dag_file.read_text(encoding="utf-8"))
+            if m:
+                cron_expr = m.group(2)
+        except Exception:
+            pass
+
+    schedule_block = ""
+    if cron_expr:
+        schedule_block = f"""
+{asset_identifier}_schedule = dg.ScheduleDefinition(
+    job={asset_identifier}_job,
+    cron_schedule={repr(cron_expr)},
+    default_status=dg.DefaultScheduleStatus.RUNNING,
+)
+"""
+
+    dag_code = f"""# Auto-generated Dagster Ingestion Asset & Schedule
+import dagster as dg
+from dagster_workspace.repository import create_ingest_asset
+
+# Reference connection securely by ID rather than embedding secrets
+CONNECTION_ID = {repr(req.connection_id)}
+ENTITY = {repr(req.entity)}
+MODE = {repr(req.mode)}
+WRITE_STRATEGY = {repr(req.write_strategy or 'append')}
+PRIMARY_KEY = {repr(req.primary_key)}
+WATERMARK_COL = {repr(req.watermark_column)}
+TARGET_NAME = {repr(req.target_name)}
+TARGET_FOLDER = {repr(req.target_folder)}
+LIMIT = {repr(req.limit)}
+
+{asset_identifier}_asset = create_ingest_asset(
+    asset_name={repr(clean_target)},
+    connection_id=CONNECTION_ID,
+    source_type={repr(conn.source_type)},
+    entity=ENTITY,
+    mode=MODE,
+    watermark_column=WATERMARK_COL,
+    target_name=TARGET_NAME,
+    target_folder=TARGET_FOLDER,
+    limit=LIMIT,
+    write_strategy=WRITE_STRATEGY,
+    primary_key=PRIMARY_KEY,
+)
+
+{asset_identifier}_job = dg.define_asset_job(
+    name="{asset_identifier}_job",
+    selection=[{asset_identifier}_asset],
+){schedule_block}
+"""
+    dag_file.write_text(dag_code, encoding="utf-8")
+    return f"{asset_identifier}_job", dag_file
+
+
+def _write_batch_ingest_dag_file(conn, req, cron_expr: str) -> Path:
+    """
+    Generates the secret-free Dagster asset-group + job + schedule file for a batch
+    ingest request (shared by the sync /batch and async /batch/async handlers).
+    SECURITY: only the connection ID is persisted; credentials decrypt at runtime
+    from the Obelisk Vault via dagster_workspace.repository.
+    Returns the written dag file path.
+    """
+    clean_db = conn.name.lower().replace(" ", "_").replace("-", "_")
+    dags_dir = Path(__file__).resolve().parent.parent.parent.parent / "git_repo" / "dags"
+    dags_dir.mkdir(parents=True, exist_ok=True)
+    dag_file = dags_dir / f"batch_ingest_{clean_db}.py"
+
+    asset_defs = []
+    asset_names = []
+    for tbl in req.tables:
+        clean_t = tbl.replace(".", "_")
+        var_name = f"asset_{clean_t}"
+        asset_names.append(var_name)
+        asset_defs.append(f"""
+{var_name} = create_ingest_asset(
+    asset_name={repr(clean_t)},
+    connection_id={repr(req.connection_id)},
+    source_type={repr(conn.source_type)},
+    entity={repr(tbl)},
+    mode={repr(req.mode)},
+    watermark_column={repr(req.watermark_column)},
+    target_folder={repr(req.target_folder)},
+    limit={repr(req.limit)},
+    write_strategy={repr(req.write_strategy)},
+    primary_key={repr(req.primary_key)},
+)
+""")
+
+    dag_code = f"""# Auto-generated Dagster Batch Ingestion Asset Group & Schedule
+import dagster as dg
+from dagster_workspace.repository import create_ingest_asset
+
+{''.join(asset_defs)}
+
+batch_job = dg.define_asset_job(
+    name="batch_ingest_{clean_db}_job",
+    selection=[{', '.join(asset_names)}],
+)
+
+batch_schedule = dg.ScheduleDefinition(
+    job=batch_job,
+    cron_schedule={repr(cron_expr)},
+    default_status=dg.DefaultScheduleStatus.RUNNING,
+)
+"""
+    dag_file.write_text(dag_code, encoding="utf-8")
+    return dag_file
+
+
 @router.post("/trigger", response_model=IngestTriggerResponse)
 async def trigger_ingestion(
     req: IngestTriggerRequest,
@@ -99,54 +227,8 @@ async def trigger_ingestion(
         job_name = f"Ingest: {conn.name}.{req.entity}"
 
         if req.schedule_engine == "dagster":
-            # Generate Dagster DAG file in git_repo/dags/
-            # SECURITY: Only the connection ID is persisted. Credentials are decrypted
-            # at runtime from the Obelisk Vault — plaintext secrets never touch disk.
-            dags_dir = Path(__file__).resolve().parent.parent.parent.parent / "git_repo" / "dags"
-            dags_dir.mkdir(parents=True, exist_ok=True)
-            dag_file = dags_dir / f"ingest_{clean_target}.py"
-            asset_identifier = f"ingest_{clean_target}"
-
-            dag_code = f'''# Auto-generated Dagster Ingestion Asset & Schedule
-import dagster as dg
-from dagster_workspace.repository import create_ingest_asset
-
-# Reference connection securely by ID rather than embedding secrets
-CONNECTION_ID = {json.dumps(req.connection_id)}
-ENTITY = {json.dumps(req.entity)}
-MODE = {json.dumps(req.mode)}
-WRITE_STRATEGY = {json.dumps(req.write_strategy or 'append')}
-PRIMARY_KEY = {json.dumps(req.primary_key)}
-WATERMARK_COL = {json.dumps(req.watermark_column)}
-TARGET_NAME = {json.dumps(req.target_name)}
-TARGET_FOLDER = {json.dumps(req.target_folder)}
-LIMIT = {json.dumps(req.limit)}
-
-{asset_identifier}_asset = create_ingest_asset(
-    asset_name={json.dumps(clean_target)},
-    connection_id=CONNECTION_ID,
-    source_type={json.dumps(conn.source_type)},
-    entity=ENTITY,
-    mode=MODE,
-    watermark_column=WATERMARK_COL,
-    target_name=TARGET_NAME,
-    target_folder=TARGET_FOLDER,
-    limit=LIMIT,
-    write_strategy=WRITE_STRATEGY,
-    primary_key=PRIMARY_KEY,
-)
-
-{asset_identifier}_job = dg.define_asset_job(
-    name="{asset_identifier}_job",
-    selection=[{asset_identifier}_asset],
-)
-
-{asset_identifier}_schedule = dg.ScheduleDefinition(
-    job={asset_identifier}_job,
-    cron_schedule={json.dumps(cron_expr)},
-)
-'''
-            dag_file.write_text(dag_code, encoding="utf-8")
+            # Generate the secret-free dag file (asset + job + schedule) via the shared helper
+            _sched_job_name, dag_file = _write_ingest_dag_file(conn, req, cron_expr)
             schedule_log = f"Registered Dagster schedule '{cron_expr}' in git_repo/dags/{dag_file.name}"
         else:
             # Register in Obelisk Built-in Cron
@@ -185,8 +267,21 @@ LIMIT = {json.dumps(req.limit)}
             await db.commit()
             schedule_log = f"Registered Obelisk Cron schedule '{cron_expr}' (Next run: {next_run.strftime('%Y-%m-%d %H:%M:%S UTC') if next_run else 'N/A'})"
 
+    # Ensure the ingest dag file exists so ad-hoc triggers can run as Dagster jobs
+    # (service up) instead of in-process materialization (service down -> fallback).
+    job_name = None
     try:
-        # Offload synchronous Dagster materialization to worker thread
+        job_name, _dag_file = _write_ingest_dag_file(conn, req, None)
+    except Exception:
+        job_name = None  # codegen failed -> in-process fallback
+    if job_name:
+        try:
+            await asyncio.to_thread(dagster_client.reload_workspace)
+        except Exception:
+            pass  # launch_job retries reloads; hard failures fall back in trigger_ingest
+
+    try:
+        # Submit via the Dagster service when reachable; else in-process fallback
         run_res = await asyncio.to_thread(
             dagster_client.trigger_ingest,
             source_type=conn.source_type,
@@ -199,6 +294,7 @@ LIMIT = {json.dumps(req.limit)}
             limit=req.limit,
             write_strategy=req.write_strategy or "append",
             primary_key=req.primary_key,
+            job_name=job_name,
         )
 
         logs = run_res["logs"]
@@ -264,51 +360,10 @@ async def trigger_batch_ingestion(
         job_name = f"Batch Ingest: {conn.name} ({len(req.tables)} tables)"
 
         if req.schedule_engine == "dagster":
-            # Generate Dagster DAG in git_repo/dags/
+            # Generate Dagster DAG in git_repo/dags/ via the shared helper
             # SECURITY: Only the connection ID is persisted. Credentials are decrypted
             # at runtime from the Obelisk Vault — plaintext secrets never touch disk.
-            clean_db = conn.name.lower().replace(" ", "_").replace("-", "_")
-            dags_dir = Path(__file__).resolve().parent.parent.parent.parent / "git_repo" / "dags"
-            dags_dir.mkdir(parents=True, exist_ok=True)
-            dag_file = dags_dir / f"batch_ingest_{clean_db}.py"
-
-            asset_defs = []
-            asset_names = []
-            for tbl in req.tables:
-                clean_t = tbl.replace(".", "_")
-                var_name = f"asset_{clean_t}"
-                asset_names.append(var_name)
-                asset_defs.append(f"""
-{var_name} = create_ingest_asset(
-    asset_name={json.dumps(clean_t)},
-    connection_id={json.dumps(req.connection_id)},
-    source_type={json.dumps(conn.source_type)},
-    entity={json.dumps(tbl)},
-    mode={json.dumps(req.mode)},
-    watermark_column={json.dumps(req.watermark_column)},
-    target_folder={json.dumps(req.target_folder)},
-    limit={json.dumps(req.limit)},
-    write_strategy={json.dumps(req.write_strategy)},
-    primary_key={json.dumps(req.primary_key)},
-)
-""")
-            dag_code = f"""# Auto-generated Dagster Batch Ingestion Asset Group & Schedule
-import dagster as dg
-from dagster_workspace.repository import create_ingest_asset
-
-{''.join(asset_defs)}
-
-batch_job = dg.define_asset_job(
-    name="batch_ingest_{clean_db}_job",
-    selection=[{', '.join(asset_names)}],
-)
-
-batch_schedule = dg.ScheduleDefinition(
-    job=batch_job,
-    cron_schedule={json.dumps(cron_expr)},
-)
-"""
-            dag_file.write_text(dag_code, encoding="utf-8")
+            dag_file = _write_batch_ingest_dag_file(conn, req, cron_expr)
             logs.append(f"[SCHEDULE] Registered Dagster batch schedule '{cron_expr}' in git_repo/dags/{dag_file.name}")
         else:
             # Register in Obelisk Built-in Cron
@@ -426,6 +481,60 @@ async def trigger_ingest_async(
         total_tables=1,
     )
 
+    # Register a recurring schedule if requested (mirrors the sync /trigger path)
+    if req.schedule and req.schedule.strip():
+        cron_expr = req.schedule.strip()
+        schedule_job_name = f"Ingest: {conn.name}.{req.entity}"
+
+        if req.schedule_engine == "dagster":
+            _sched_job_name, dag_file = _write_ingest_dag_file(conn, req, cron_expr)
+            try:
+                await asyncio.to_thread(dagster_client.reload_workspace)
+            except Exception:
+                pass  # daemon picks it up on its next reload interval
+            ingest_job_manager.set_schedule_log(
+                job.id,
+                f"Registered Dagster schedule '{cron_expr}' in git_repo/dags/{dag_file.name}",
+            )
+        else:
+            target_payload = json.dumps({
+                "connection_id": req.connection_id,
+                "entity": req.entity,
+                "mode": req.mode,
+                "watermark_column": req.watermark_column,
+                "target_name": req.target_name,
+                "target_folder": req.target_folder,
+                "limit": req.limit,
+                "write_strategy": req.write_strategy or "append",
+                "primary_key": req.primary_key,
+            })
+            next_run = cron_engine.compute_next_run(cron_expr)
+
+            stmt_existing = select(CronJob).where(CronJob.name == schedule_job_name)
+            existing_job = (await db.execute(stmt_existing)).scalar_one_or_none()
+            if existing_job:
+                existing_job.cron_expression = cron_expr
+                existing_job.target = target_payload
+                existing_job.next_run_at = next_run
+                existing_job.is_enabled = True
+            else:
+                new_job = CronJob(
+                    id=str(uuid.uuid4()),
+                    name=schedule_job_name,
+                    description=f"Automated recurring ingestion for {conn.name}.{req.entity} to Lakehouse Parquet",
+                    target_type="ingest",
+                    target=target_payload,
+                    cron_expression=cron_expr,
+                    next_run_at=next_run,
+                    is_enabled=True,
+                )
+                db.add(new_job)
+            await db.commit()
+            ingest_job_manager.set_schedule_log(
+                job.id,
+                f"Registered Obelisk Cron schedule '{cron_expr}' (Next run: {next_run.strftime('%Y-%m-%d %H:%M:%S UTC') if next_run else 'N/A'})",
+            )
+
     # Spawn independent background worker task
     asyncio.create_task(
         ingest_job_manager.execute_single_job_async(
@@ -496,6 +605,59 @@ async def trigger_batch_ingest_async(
         mode=req.mode,
         total_tables=len(req.tables),
     )
+
+    # Register a recurring batch schedule if requested (mirrors the sync /batch path)
+    if req.schedule and req.schedule.strip():
+        cron_expr = req.schedule.strip()
+        schedule_job_name = f"Batch Ingest: {conn.name} ({len(req.tables)} tables)"
+
+        if req.schedule_engine == "dagster":
+            dag_file = _write_batch_ingest_dag_file(conn, req, cron_expr)
+            try:
+                await asyncio.to_thread(dagster_client.reload_workspace)
+            except Exception:
+                pass
+            ingest_job_manager.set_schedule_log(
+                job.id,
+                f"Registered Dagster batch schedule '{cron_expr}' in git_repo/dags/{dag_file.name}",
+            )
+        else:
+            target_payload = json.dumps({
+                "connection_id": req.connection_id,
+                "tables": req.tables,
+                "mode": req.mode,
+                "watermark_column": req.watermark_column,
+                "write_strategy": req.write_strategy,
+                "primary_key": req.primary_key,
+                "target_folder": req.target_folder,
+                "limit": req.limit,
+            })
+            next_run = cron_engine.compute_next_run(cron_expr)
+
+            stmt_existing = select(CronJob).where(CronJob.name == schedule_job_name)
+            existing_job = (await db.execute(stmt_existing)).scalar_one_or_none()
+            if existing_job:
+                existing_job.cron_expression = cron_expr
+                existing_job.target = target_payload
+                existing_job.next_run_at = next_run
+                existing_job.is_enabled = True
+            else:
+                new_job = CronJob(
+                    id=str(uuid.uuid4()),
+                    name=schedule_job_name,
+                    description=f"Batch ingestion of {len(req.tables)} tables from {conn.name}",
+                    target_type="batch_ingest",
+                    target=target_payload,
+                    cron_expression=cron_expr,
+                    next_run_at=next_run,
+                    is_enabled=True,
+                )
+                db.add(new_job)
+            await db.commit()
+            ingest_job_manager.set_schedule_log(
+                job.id,
+                f"Registered Obelisk Cron batch schedule '{cron_expr}'",
+            )
 
     # Spawn independent background worker task
     asyncio.create_task(

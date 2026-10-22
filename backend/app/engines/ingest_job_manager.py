@@ -114,6 +114,10 @@ class IngestJobManager:
             except Exception:
                 pass
 
+    def set_schedule_log(self, job_id: str, message: str):
+        """Append a schedule-registration log line, prefixed with [SCHEDULE]."""
+        self.append_log(job_id, f"[SCHEDULE] {message}")
+
     def update_progress(
         self,
         job_id: str,

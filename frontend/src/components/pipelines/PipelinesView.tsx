@@ -28,6 +28,7 @@ import type {
   CreateCronJobRequest,
   CronTargetsResponse,
 } from '../../lib/types';
+import { DagsterNativePanel } from './DagsterNativePanel';
 
 interface PipelinesViewProps {
   onOpenInQuery?: (sql: string) => void;
@@ -682,7 +683,9 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
       {/* VIEW: DAGSTER OR AIRFLOW (EMBEDDED OR OFFLINE SERVICE CARD) */}
       {selectedEngineId !== 'cron' && (
         <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
-          {selectedEngine?.status === 'running' ? (
+          {selectedEngine?.status === 'running' && selectedEngineId === 'dagster' ? (
+            <DagsterNativePanel webUrl={selectedEngine?.web_url} />
+          ) : selectedEngine?.status === 'running' ? (
             <div className="flex-1 flex flex-col relative bg-white">
               <iframe
                 key={iframeKey}

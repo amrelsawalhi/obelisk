@@ -36,6 +36,11 @@ data/*.db*
 !data/.gitkeep
 !backend/data/.gitkeep
 
+# Dagster host-process service state (process mode)
+data/dagster_home/
+data/run/
+data/logs/
+
 # Lakehouse Parquet Data & DuckDB files (User/Ingested Lakehouse Data)
 **/lakehouse/**
 !**/lakehouse/.gitkeep

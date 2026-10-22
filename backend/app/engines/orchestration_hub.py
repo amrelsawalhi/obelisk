@@ -9,6 +9,8 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from app.database import AsyncSessionLocal
 from app.models.service_config import ServiceConfig
+import asyncio
+from app.core.service_blueprints import get_blueprint
 
 
 class OrchestrationEngineInfo(BaseModel):
@@ -19,6 +21,7 @@ class OrchestrationEngineInfo(BaseModel):
     web_url: Optional[str] = None
     description: str
     is_builtin: bool = False
+    can_deploy_local: bool = False
     active_jobs_count: int = 0
 
 
@@ -63,14 +66,20 @@ class OrchestrationHub:
         except Exception:
             pass
 
-        # 3. Dagster Orchestrator
+        # 3. Dagster Orchestrator (local: live GraphQL probe; remote: DB status)
+        from app.engines.dagster_client import dagster_client as dagster_service
+        dagster_bp = get_blueprint("dagster")
         dagster_svc = services_map.get("dagster")
         dagster_status = "offline"
-        dagster_url = "/dagster"
+        dagster_url = None
         if dagster_svc:
-            dagster_status = dagster_svc.status.lower()
-            if dagster_svc.deployment_mode == "remote" and dagster_svc.remote_host:
-                dagster_url = f"http://{dagster_svc.remote_host}:{dagster_svc.remote_port or 3000}"
+            if dagster_svc.deployment_type == "remote":
+                dagster_status = (dagster_svc.status or "connected").lower()
+                dagster_url = f"http://{dagster_svc.host}:{dagster_svc.port or 3000}"
+            else:
+                probe = await asyncio.to_thread(dagster_service.service_status)
+                dagster_status = "running" if probe["available"] else "stopped"
+                dagster_url = f"http://localhost:{dagster_svc.port or (dagster_bp.primary_host_port if dagster_bp else 3000)}"
 
         engines.append(
             OrchestrationEngineInfo(
@@ -79,8 +88,9 @@ class OrchestrationHub:
                 icon="dagster",
                 status=dagster_status,
                 web_url=dagster_url,
-                description="Asset-based orchestrator with automated dagster-dbt lineage graph",
+                description="Asset orchestrator: webserver + daemon running Obelisk's real workspace",
                 is_builtin=False,
+                can_deploy_local=bool(dagster_bp and dagster_bp.deployable),
             )
         )
 
@@ -90,8 +100,8 @@ class OrchestrationHub:
         airflow_url = "/airflow"
         if airflow_svc:
             airflow_status = airflow_svc.status.lower()
-            if airflow_svc.deployment_mode == "remote" and airflow_svc.remote_host:
-                airflow_url = f"http://{airflow_svc.remote_host}:{airflow_svc.remote_port or 8080}"
+            if airflow_svc.deployment_type == "remote":
+                airflow_url = f"http://{airflow_svc.host}:{airflow_svc.port or 8080}"
 
         engines.append(
             OrchestrationEngineInfo(

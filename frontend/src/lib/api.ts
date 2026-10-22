@@ -41,6 +41,8 @@ import type {
   ServiceCatalogEntry,
   ServiceEngineStatus,
   DeployProgressResponse,
+  DagsterSchedule,
+  DagsterRun,
 } from './types';
 
 export const apiClient = axios.create({
@@ -466,6 +468,20 @@ export const api = {
   getDbtLineage: async (model: string): Promise<DbtLineageResponse> => {
     const res = await apiClient.get<DbtLineageResponse>('/dbt/lineage', {
       params: { model },
+    });
+    return res.data;
+  },
+
+  // Dagster Native Panel — fabric-over-Dagster view for the Pipelines tab.
+  // Each call returns [] when Dagster is unreachable; the panel renders an
+  // empty state in that case (no 502 cascade).
+  getDagsterSchedules: async (): Promise<DagsterSchedule[]> => {
+    const res = await apiClient.get<DagsterSchedule[]>('/orchestration/dagster/schedules');
+    return res.data;
+  },
+  getDagsterRuns: async (limit: number = 20): Promise<DagsterRun[]> => {
+    const res = await apiClient.get<DagsterRun[]>('/orchestration/dagster/runs', {
+      params: { limit },
     });
     return res.data;
   },

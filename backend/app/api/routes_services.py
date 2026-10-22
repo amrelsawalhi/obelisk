@@ -1,4 +1,5 @@
 import asyncio
+import os
 import secrets
 import socket
 import time
@@ -16,7 +17,10 @@ from app.core.resource_advisor import advisor
 from app.core.docker_manager import docker_mgr
 from app.core.service_blueprints import get_blueprint, blueprint_catalog_entries
 from app.core.deploy_tracker import deploy_tracker
+from app.core.process_manager import process_manager
 from app.core.vault import encrypt, decrypt
+from app.config import settings
+from app.engines.dagster_client import dagster_client
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -186,6 +190,16 @@ async def list_service_statuses(db: AsyncSession = Depends(get_db)):
                 if mem_bytes > 0:
                     mem_mb = mem_bytes // (1024 * 1024)
 
+        if deployment_type == "local" and live_c is None:
+            _st_bp = get_blueprint(svc_name)
+            if _st_bp is not None and _st_bp.run_mode == "process":
+                proc = process_manager.status(svc_name)
+                if proc["alive_pids"]:
+                    db_status = "running"
+                    live_status = "process"
+                elif proc["pids"]:
+                    db_status = "stopped"
+
         statuses.append(
             ServiceStatusResponse(
                 service_name=svc_name,
@@ -200,6 +214,99 @@ async def list_service_statuses(db: AsyncSession = Depends(get_db)):
         )
 
     return statuses
+
+
+async def _warmup_dagster_workspace(svc_name: str) -> None:
+    """Best-effort pre-warm of the Dagster code-server after a process deploy.
+
+    The first GraphQL query after a cold deploy pays the code-location load
+    cost; running discover_workspace() here amortizes that into the deploy so
+    the first Pipelines panel open is instant. Failures are intentionally
+    silent — the panel already renders an empty state when Dagster is down.
+    """
+    if svc_name != "dagster":
+        return
+    try:
+        await asyncio.to_thread(dagster_client.discover_workspace)
+    except Exception:
+        pass
+
+
+async def _deploy_process_mode(svc_name: str, bp, req, db) -> DeployLocalResponse:
+    """
+    Deploys a run_mode='process' service as host processes (no Docker, no image).
+
+    Used by Dagster: webserver + daemon run from the backend venv, so deploys take
+    seconds, need no registry/disk, and logs land in data/logs/<service>_*.log.
+    """
+    host_port = req.host_port or bp.primary_host_port
+
+    deploy_tracker.update(svc_name, phase="pre-flight", detail="checking host port")
+    current = await asyncio.to_thread(process_manager.status, svc_name)
+    if not current["alive_pids"] and not _is_host_port_free(host_port):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+            detail=f"Host port {host_port} is already in use by another process. Choose a different host_port.")
+
+    deploy_tracker.update(svc_name, phase="starting", detail="starting host processes")
+
+    def _on_log(line: str) -> None:
+        deploy_tracker.update(svc_name, log=line)
+
+    start_info = await asyncio.to_thread(process_manager.start, svc_name, bp, _on_log)
+
+    deploy_tracker.update(svc_name, phase="probing", detail="waiting for readiness probe")
+    ready = False
+    probe_detail = "no probe configured"
+    deadline = time.time() + bp.probe_timeout_seconds
+    while time.time() < deadline:
+        probe = await asyncio.to_thread(docker_mgr.probe_readiness, svc_name, host_port)
+        ready = probe["ready"]
+        probe_detail = probe["detail"]
+        if ready:
+            break
+        await asyncio.sleep(1.0)
+    status_value = "ready" if ready else "starting"
+    deploy_tracker.finish(svc_name, status_value, probe_detail)
+
+    if ready and svc_name == "dagster":
+        # Amortize Dagster's code-location cold load into the deploy, so the
+        # first open of the Pipelines panel doesn't pay it. Fire-and-forget:
+        # the deploy response returns immediately.
+        asyncio.create_task(_warmup_dagster_workspace(svc_name))
+
+    stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
+    svc_record = (await db.execute(stmt)).scalar_one_or_none()
+    config_json: Dict[str, Any] = dict(svc_record.config_json or {}) if svc_record else {}
+    config_json.update({"run_mode": "process", "host_port": host_port,
+                        "pids": start_info["pids"], "log_dir": start_info["log_dir"]})
+    if not svc_record:
+        svc_record = ServiceConfig(
+            service_name=svc_name, deployment_type="local", status=status_value,
+            container_id=None, host="localhost", port=host_port,
+            allocated_memory_mb=0, config_json=config_json,
+        )
+        db.add(svc_record)
+    else:
+        svc_record.deployment_type = "local"
+        svc_record.status = status_value
+        svc_record.container_id = None
+        svc_record.host = "localhost"
+        svc_record.port = host_port
+        svc_record.config_json = config_json
+    await db.commit()
+    await db.refresh(svc_record)
+
+    message = None
+    if not ready:
+        message = (f"Processes started but the service is not ready yet (probe: {probe_detail}). "
+                   f"Check logs at /api/services/{svc_name}/logs.")
+    return DeployLocalResponse(
+        service_name=svc_name, deployment_type="local", status=status_value,
+        host="localhost", port=host_port, allocated_memory_mb=0, container_id=None,
+        live_docker_status="process", ready=ready, message=message,
+        credentials=None, registered_connection=None,
+    )
+
 
 @router.post("/deploy", response_model=DeployLocalResponse)
 @router.post("/deploy-local", response_model=DeployLocalResponse)
@@ -226,6 +333,10 @@ async def deploy_local_service(
         if not bp.deployable:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"{bp.display_name} cannot be deployed locally: {bp.reason_not_deployable}")
+
+        if bp.run_mode == "process":
+            # Host-process service (e.g. Dagster): no Docker engine, image, or disk needed.
+            return await _deploy_process_mode(svc_name, bp, req, db)
 
         # Pre-flight 1: Docker engine reachable
         deploy_tracker.update(svc_name, phase="pre-flight", detail="checking Docker engine")
@@ -270,6 +381,14 @@ async def deploy_local_service(
                     env_override[env_key] = password
             credentials = DeployedCredentials(username=username, password=password,
                                               database=database, host="localhost", port=host_port)
+
+        # pass_env: inject live settings so container code resolves identically to host code
+        for env_key in bp.pass_env:
+            if env_key == "DATABASE_URL":
+                data_mount = bp.bind_mounts.get("data", {}).get("bind", "/opt/obelisk/data")
+                env_override["DATABASE_URL"] = f"sqlite+aiosqlite:///{data_mount}/obelisk.db"
+            else:
+                env_override[env_key] = getattr(settings, env_key, None) or os.environ.get(env_key, "")
         ports_override = None
         if req.host_port and req.host_port != bp.primary_host_port:
             ports_override = {bp.primary_container_port: ("0.0.0.0", host_port)}
@@ -279,15 +398,22 @@ async def deploy_local_service(
         layer_totals: Dict[str, int] = {}
         layer_currents: Dict[str, int] = {}
 
-        def _on_pull(layer: str, pull_status: str, current: int, total: int) -> None:
-            if total > 0:
-                layer_totals[layer] = total
-                layer_currents[layer] = current
-                t_total = sum(layer_totals.values())
-                t_current = sum(layer_currents.values())
-                if t_total > 0:
-                    deploy_tracker.update(svc_name, phase="pulling",
-                                          pull_percent=(t_current / t_total) * 100.0)
+        def _on_pull(*args) -> None:
+            # Dual-purpose progress callback:
+            # - image pull events: (layer, status, current, total) -> aggregate layer %
+            # - image build events: (line,) -> build log lines
+            if len(args) == 4:
+                layer, _pull_status, current, total = args
+                if total > 0:
+                    layer_totals[layer] = total
+                    layer_currents[layer] = current
+                    t_total = sum(layer_totals.values())
+                    t_current = sum(layer_currents.values())
+                    if t_total > 0:
+                        deploy_tracker.update(svc_name, phase="pulling",
+                                              pull_percent=(t_current / t_total) * 100.0)
+            elif args:
+                deploy_tracker.update(svc_name, log=str(args[0]))
 
         deploy_tracker.update(svc_name, phase="creating", detail="creating container")
         container = await asyncio.to_thread(
@@ -451,8 +577,12 @@ async def stop_service(
 ):
     """Stops and removes the local container managed by Obelisk. Data volumes are PRESERVED (use /destroy to remove data)."""
     svc_name = service_name.lower()
+    _bp = get_blueprint(svc_name)
     try:
-        await asyncio.to_thread(docker_mgr.stop_service, svc_name)
+        if _bp is not None and _bp.run_mode == "process":
+            await asyncio.to_thread(process_manager.stop, svc_name)
+        else:
+            await asyncio.to_thread(docker_mgr.stop_service, svc_name)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -501,8 +631,12 @@ async def get_service_logs(service_name: str, tail: int = 200):
     svc_name = service_name.lower()
     if svc_name not in SUPPORTED_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown service '{service_name}'.")
+    _log_bp = get_blueprint(svc_name)
     try:
-        logs = await asyncio.to_thread(docker_mgr.get_container_logs, svc_name, tail)
+        if _log_bp is not None and _log_bp.run_mode == "process":
+            logs = await asyncio.to_thread(process_manager.logs, svc_name, tail)
+        else:
+            logs = await asyncio.to_thread(docker_mgr.get_container_logs, svc_name, tail)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to fetch logs: {e}")
     return {"service_name": svc_name, "logs": logs}
@@ -517,6 +651,27 @@ async def destroy_service(service_name: str, db: AsyncSession = Depends(get_db))
     svc_name = service_name.lower()
     if svc_name not in SUPPORTED_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown service '{service_name}'.")
+
+    _proc_bp = get_blueprint(svc_name)
+    if _proc_bp is not None and _proc_bp.run_mode == "process":
+        status_info = await asyncio.to_thread(process_manager.status, svc_name)
+        home_dir = _PROJECT_ROOT / "data" / f"{svc_name}_home"
+        if not status_info["alive_pids"] and not home_dir.exists():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No managed local process or data for '{svc_name}'.")
+        try:
+            await asyncio.to_thread(process_manager.destroy, svc_name)
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to destroy '{svc_name}': {e}")
+        stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
+        svc_record = (await db.execute(stmt)).scalar_one_or_none()
+        if svc_record:
+            svc_record.status = "stopped"
+            svc_record.container_id = None
+            await db.commit()
+        return {"service_name": svc_name, "status": "destroyed", "data_removed": True}
+
     # Destroy is also the cleanup path for orphaned volumes (after stop or a crash),
     # so a running container is not required — but *something* must exist to destroy.
     container = await asyncio.to_thread(docker_mgr.get_service_container, svc_name)
