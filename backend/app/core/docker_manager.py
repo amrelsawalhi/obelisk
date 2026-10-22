@@ -353,7 +353,13 @@ class DockerManager:
         if last_err is not None:
             raise RuntimeError(f"Image build failed for {dockerfile}: {last_err}")
 
-    def probe_readiness(self, service_name: str, host_port: Optional[int] = None) -> Dict[str, Any]:
+    def probe_readiness(
+        self,
+        service_name: str,
+        host_port: Optional[int] = None,
+        user: Optional[str] = None,
+        db: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Runs the blueprint readiness probe and returns {"ready": bool, "detail": str}.
         A running container is NOT proof the service inside accepts work.
@@ -371,7 +377,7 @@ class DockerManager:
                 container = self.get_service_container(service_name)
                 if not container or container.status != "running":
                     return {"ready": False, "detail": "container not running"}
-                args = ["pg_isready", "-U", probe.user or "postgres", "-d", probe.db or "postgres"]
+                args = ["pg_isready", "-U", user or probe.user or "postgres", "-d", db or probe.db or "postgres"]
                 exit_code, output = container.exec_run(args)
                 detail = output.decode("utf-8", errors="replace").strip()
                 return {"ready": exit_code == 0, "detail": detail}

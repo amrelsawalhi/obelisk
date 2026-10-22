@@ -41,12 +41,21 @@ class DeployLocalRequest(BaseModel):
     memory_mb: Optional[int] = Field(None, description="Optional explicit memory limit in MB")
     image: Optional[str] = Field(None, description="Optional custom image override (blueprint pins are used by default)")
     host_port: Optional[int] = Field(None, description="Optional host port override for the primary port")
+    public_url: Optional[str] = Field(None, description="Browser origin used to reach Obelisk (e.g. http://localhost:5173 or http://server-ip); expands {public_url} in blueprint env")
+    username: Optional[str] = Field(None, description="Custom admin/database username (e.g. for PostgreSQL or Superset)")
+    password: Optional[str] = Field(None, description="Custom password (if omitted, auto-generates a secure token)")
+    database: Optional[str] = Field(None, description="Custom database name (e.g. for PostgreSQL)")
+    env_vars: Optional[Dict[str, str]] = Field(None, description="Additional environment variable overrides")
 
 class ConnectRemoteRequest(BaseModel):
     service_name: str = Field(..., description="Service identifier, e.g. postgres, clickhouse")
     host: str = Field(..., description="Remote host or IP")
     port: int = Field(..., description="Remote port")
     config_json: Optional[Dict[str, Any]] = Field(None, description="Additional connection params")
+    username: Optional[str] = Field(None, description="Remote database username")
+    password: Optional[str] = Field(None, description="Remote database password (stored encrypted)")
+    database: Optional[str] = Field(None, description="Remote database name")
+    sslmode: Optional[str] = Field(None, description="SSL mode, e.g. 'disable' or 'require'")
 
 class ServiceStatusResponse(BaseModel):
     service_name: str
@@ -101,34 +110,39 @@ async def get_recommendation(service_name: str):
     rec = await asyncio.to_thread(advisor.recommend_allocation, service_name)
     return rec
 
-DEFAULT_SERVICE_PORTS: Dict[str, int] = {
-    "postgres": 5432,
-    "dagster": 3000,
-    "superset": 8088,
-    "clickhouse": 8123,
-    "redpanda": 9092,
-    "gitea": 3001,
-}
-
 def get_service_host_port(svc_name: str, live_container: Any = None, default_port: Optional[int] = None) -> int:
-    """Extracts the actual published host port from live container bindings or falls back to catalog defaults."""
-    default = default_port or DEFAULT_SERVICE_PORTS.get(svc_name.lower(), 8000)
+    """Extracts the published host port for the blueprint's primary container port.
+
+    Multi-port services (e.g. Gitea web + SSH) publish several host ports; only the
+    blueprint's primary container port is the canonical web/db port. Fallback order:
+    primary binding -> first binding -> explicit/default port.
+    """
+    bp = get_blueprint(svc_name)
+    default = default_port or (bp.primary_host_port if bp else 8000)
     if live_container:
+        primary_cp = bp.primary_container_port if bp else None
+
+        def _first_host_port(bindings: Dict[str, Any]) -> Optional[int]:
+            if primary_cp and primary_cp in bindings:
+                b = bindings[primary_cp]
+                if b and b[0].get("HostPort"):
+                    return int(b[0]["HostPort"])
+            for c_port, b in bindings.items():
+                if b and b[0].get("HostPort"):
+                    return int(b[0]["HostPort"])
+            return None
+
         try:
             # Check HostConfig PortBindings first
             port_bindings = live_container.attrs.get("HostConfig", {}).get("PortBindings", {}) or {}
-            for c_port, bindings in port_bindings.items():
-                if bindings and len(bindings) > 0:
-                    hp = bindings[0].get("HostPort")
-                    if hp:
-                        return int(hp)
-            # Check NetworkSettings Ports
+            hp = _first_host_port(port_bindings)
+            if hp:
+                return hp
+            # Then NetworkSettings Ports
             net_ports = live_container.attrs.get("NetworkSettings", {}).get("Ports", {}) or {}
-            for c_port, bindings in net_ports.items():
-                if bindings and len(bindings) > 0:
-                    hp = bindings[0].get("HostPort")
-                    if hp:
-                        return int(hp)
+            hp = _first_host_port(net_ports)
+            if hp:
+                return hp
         except Exception:
             pass
     return default
@@ -176,7 +190,7 @@ async def list_service_statuses(db: AsyncSession = Depends(get_db)):
             deployment_type = "local"
             db_status = "stopped"
             host = "localhost"
-            port = get_service_host_port(svc_name, live_c, DEFAULT_SERVICE_PORTS.get(svc_name, 8000))
+            port = get_service_host_port(svc_name, live_c)
             mem_mb = 0
             c_id = None
 
@@ -363,13 +377,27 @@ async def deploy_local_service(
         svc_record = (await db.execute(stmt)).scalar_one_or_none()
         config_json: Dict[str, Any] = dict(svc_record.config_json or {}) if svc_record else {}
 
-        # Credentials: generated once per service, vaulted, injected via env
+        # Credentials: user-supplied values win, otherwise the vaulted ones from a
+        # previous deploy are reused, otherwise a fresh secure token is generated.
         env_override: Dict[str, str] = {}
         credentials = None
-        username = config_json.get("username") or bp.credential_username or "postgres"
-        database = config_json.get("database") or bp.credential_database or "postgres"
+        username = (
+            (req.username.strip() if req.username and req.username.strip() else None)
+            or config_json.get("username")
+            or bp.credential_username
+            or "postgres"
+        )
+        database = (
+            (req.database.strip() if req.database and req.database.strip() else None)
+            or config_json.get("database")
+            or bp.credential_database
+            or "obelisk"
+        )
         if "__GENERATED__" in bp.env.values():
-            if config_json.get("encrypted_password"):
+            if req.password and req.password.strip():
+                password = req.password.strip()
+                config_json["encrypted_password"] = encrypt(password)
+            elif config_json.get("encrypted_password"):
                 password = decrypt(config_json["encrypted_password"])
             else:
                 password = secrets.token_urlsafe(18)
@@ -379,8 +407,27 @@ async def deploy_local_service(
             for env_key, env_val in bp.env.items():
                 if env_val == "__GENERATED__":
                     env_override[env_key] = password
+
+            if svc_name == "postgres":
+                # The image creates its superuser/database from these on first boot
+                env_override["POSTGRES_USER"] = username
+                env_override["POSTGRES_PASSWORD"] = password
+                env_override["POSTGRES_DB"] = database
+            elif svc_name == "superset":
+                # Consumed by the `superset fab create-admin` post-start command
+                env_override["SUPERSET_ADMIN_USER"] = username
+                env_override["SUPERSET_ADMIN_PASSWORD"] = password
+
             credentials = DeployedCredentials(username=username, password=password,
                                               database=database, host="localhost", port=host_port)
+
+        # Expand gateway-relative placeholders (e.g. Gitea ROOT_URL) using the browser
+        # origin that reached Obelisk — correct in local dev (:5173) and behind a
+        # remote gateway alike, so subpath links resolve without hardcoding a host.
+        public_url = (req.public_url or "http://localhost").rstrip("/")
+        for env_key, env_val in bp.env.items():
+            if env_val and "{public_url}" in env_val:
+                env_override[env_key] = env_val.replace("{public_url}", public_url)
 
         # pass_env: inject live settings so container code resolves identically to host code
         for env_key in bp.pass_env:
@@ -389,6 +436,11 @@ async def deploy_local_service(
                 env_override["DATABASE_URL"] = f"sqlite+aiosqlite:///{data_mount}/obelisk.db"
             else:
                 env_override[env_key] = getattr(settings, env_key, None) or os.environ.get(env_key, "")
+
+        # Explicit user-supplied env overrides win over every blueprint default.
+        if req.env_vars:
+            env_override.update({str(k): str(v) for k, v in req.env_vars.items()})
+
         ports_override = None
         if req.host_port and req.host_port != bp.primary_host_port:
             ports_override = {bp.primary_container_port: ("0.0.0.0", host_port)}
@@ -444,7 +496,9 @@ async def deploy_local_service(
         probe_detail = "no probe configured"
         deadline = time.time() + bp.probe_timeout_seconds
         while time.time() < deadline:
-            probe = await asyncio.to_thread(docker_mgr.probe_readiness, svc_name, host_port)
+            probe = await asyncio.to_thread(
+                docker_mgr.probe_readiness, svc_name, host_port, username, database,
+            )
             ready = probe["ready"]
             probe_detail = probe["detail"]
             if ready:
@@ -535,6 +589,19 @@ async def connect_remote_service(
     result = await db.execute(stmt)
     svc_record = result.scalar_one_or_none()
 
+    # Persist the connection parameters so Query Studio, dbt and the SDK all
+    # resolve the same credentials. The password is vaulted, never plaintext.
+    config_json: Dict[str, Any] = dict(svc_record.config_json or {}) if svc_record else {}
+    config_json.update(dict(req.config_json or {}))
+    if req.username and req.username.strip():
+        config_json["username"] = req.username.strip()
+    if req.database and req.database.strip():
+        config_json["database"] = req.database.strip()
+    if req.sslmode and req.sslmode.strip():
+        config_json["sslmode"] = req.sslmode.strip()
+    if req.password and req.password.strip():
+        config_json["encrypted_password"] = encrypt(req.password.strip())
+
     if not svc_record:
         svc_record = ServiceConfig(
             service_name=svc_name,
@@ -544,7 +611,7 @@ async def connect_remote_service(
             host=req.host,
             port=req.port,
             allocated_memory_mb=0,
-            config_json=req.config_json,
+            config_json=config_json,
         )
         db.add(svc_record)
     else:
@@ -554,7 +621,28 @@ async def connect_remote_service(
         svc_record.host = req.host
         svc_record.port = req.port
         svc_record.allocated_memory_mb = 0
-        svc_record.config_json = req.config_json
+        svc_record.config_json = config_json
+
+    # A remote PostgreSQL becomes a first-class catalog Connection so it appears in
+    # the Data Catalog and Query Studio straight away.
+    if svc_name == "postgres" and config_json.get("username") and config_json.get("encrypted_password"):
+        conn_name = "Obelisk PostgreSQL (remote)"
+        remote_conn = (await db.execute(
+            select(Connection).where(Connection.name == conn_name))).scalar_one_or_none()
+        conn_values: Dict[str, Any] = {
+            "source_type": "postgres",
+            "host": req.host,
+            "port": req.port,
+            "database": config_json.get("database") or "",
+            "username": config_json["username"],
+            "encrypted_credentials": config_json["encrypted_password"],
+            "options": {"sslmode": config_json.get("sslmode", "disable")},
+        }
+        if remote_conn:
+            for key, value in conn_values.items():
+                setattr(remote_conn, key, value)
+        else:
+            db.add(Connection(name=conn_name, **conn_values))
 
     await db.commit()
     await db.refresh(svc_record)

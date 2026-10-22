@@ -39,7 +39,34 @@ class Settings(BaseSettings):
     DATABASE_URL: str = Field(
         default_factory=lambda: Settings._default_database_url()
     )
-    
+
+    @property
+    def sqlite_db_path(self) -> str:
+        """Resolves the canonical absolute filesystem path for the SQLite database.
+
+        Subprocesses (dagster workspace, dbt project) run with different working
+        directories, so a relative DATABASE_URL would resolve to different files
+        (split-brain). Always returns an absolute POSIX path, normalized for
+        3-slash relative URIs, 4-slash absolute URIs, and Windows drive letters.
+        """
+        raw = self.DATABASE_URL
+        for prefix in ("sqlite+aiosqlite:///", "sqlite:///"):
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+                break
+        # Normalize the leading double slash of a 4-slash URI (sqlite+aiosqlite:////app/...)
+        if raw.startswith("//") and not raw.startswith("///"):
+            raw = raw[1:]
+        # Normalize a Windows drive letter (/C:/path -> C:/path)
+        if re.match(r"^/[a-zA-Z]:", raw):
+            raw = raw[1:]
+        p = Path(raw)
+        if not p.is_absolute():
+            project_root = Path(__file__).resolve().parent.parent.parent
+            p = (project_root / p).resolve()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p.as_posix()
+
     # Zero-Cost Storage URI Abstraction
     STORAGE_URI: str = Field(
         default_factory=lambda: os.getenv("STORAGE_URI", "file:///data/lakehouse")

@@ -83,7 +83,7 @@ async def test_vault_ciphertext_proof_in_sqlite():
         await session.commit()
 
     # Physical verification via raw SQLite cursor
-    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+    db_path = settings.sqlite_db_path
     assert os.path.exists(db_path), f"Database file {db_path} does not exist"
 
     raw_conn = sqlite3.connect(db_path)
@@ -114,7 +114,7 @@ def test_sqlite_wal_proof():
     Section 5 B SQLite WAL Proof:
     Query PRAGMA journal_mode; directly on data/obelisk.db and assert the result is 'wal'.
     """
-    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+    db_path = settings.sqlite_db_path
     assert os.path.exists(db_path), f"Database file {db_path} does not exist"
 
     raw_conn = sqlite3.connect(db_path)

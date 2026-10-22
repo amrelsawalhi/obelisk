@@ -114,7 +114,7 @@ def _resolve_external_identifier(identifier: str) -> str:
         'venues_old' -> 'supabase.public.venues_old'
     """
     import re
-    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+    db_path = settings.sqlite_db_path
     if not Path(db_path).exists():
         return identifier
 
@@ -232,7 +232,7 @@ def _get_sdk_pg_attachments(sql: str) -> list:
         import re
         from app.core.vault import decrypt
         from app.core.host_resolver import resolve_connection_host
-        db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+        db_path = settings.sqlite_db_path
         if not Path(db_path).exists():
             return attachments
         with sqlite3.connect(db_path, timeout=5.0) as con:
@@ -368,7 +368,7 @@ def save(df: Any, target: str, sync_postgres: bool = True) -> Dict[str, Any]:
     schema_meta = {"num_rows": num_rows, "columns": columns}
 
     # 3. Register in SQLite assets table
-    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+    db_path = settings.sqlite_db_path
     now_iso = datetime.now(timezone.utc).isoformat()
     asset_id = str(uuid.uuid4())
 
@@ -380,7 +380,7 @@ def save(df: Any, target: str, sync_postgres: bool = True) -> Dict[str, Any]:
                 """
                 INSERT INTO assets (id, name, layer, storage_uri, format, record_count, schema_metadata, created_at, last_materialized_at)
                 VALUES (?, ?, ?, ?, 'parquet', ?, ?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
+                ON CONFLICT(layer, name) DO UPDATE SET
                     storage_uri=excluded.storage_uri,
                     record_count=excluded.record_count,
                     schema_metadata=excluded.schema_metadata,
@@ -408,21 +408,21 @@ def save(df: Any, target: str, sync_postgres: bool = True) -> Dict[str, Any]:
 
 def _sync_table_to_postgres(parquet_file: Path, schema: str, table_name: str) -> None:
     """Syncs Parquet file into PostgreSQL warehouse using DuckDB native COPY."""
-    # Read Postgres connection params from environment or active service config
-    pg_host = os.environ.get("DBT_PG_HOST") or os.environ.get("POSTGRES_HOST")
-    pg_port = os.environ.get("DBT_PG_PORT") or os.environ.get("POSTGRES_PORT") or "5432"
-    pg_user = os.environ.get("DBT_PG_USER") or os.environ.get("POSTGRES_USER")
-    pg_pass = os.environ.get("DBT_PG_PASSWORD") or os.environ.get("POSTGRES_PASSWORD")
-    pg_db = os.environ.get("DBT_PG_DBNAME") or os.environ.get("POSTGRES_DB")
-
-    if not (pg_host and pg_user and pg_pass and pg_db):
-        return
+    # Resolve the warehouse the same way Query Studio, dbt and pipelines do.
+    from app.core.warehouse_resolver import resolve_warehouse_postgres_params
+    pg = resolve_warehouse_postgres_params()
+    pg_host = pg["host"]
+    pg_port = pg["port"]
+    pg_user = pg["username"]
+    pg_pass = pg["password"]
+    pg_db = pg["database"]
+    pg_sslmode = pg.get("sslmode") or "disable"
 
     import duckdb
     conn = duckdb.connect(":memory:")
     try:
         conn.execute("INSTALL postgres; LOAD postgres;")
-        conn_str = f"dbname={pg_db} host={pg_host} port={pg_port} user={pg_user} password={pg_pass} sslmode=disable"
+        conn_str = f"dbname={pg_db} host={pg_host} port={pg_port} user={pg_user} password={pg_pass} sslmode={pg_sslmode}"
         alias = "pg_sync_wh"
         conn.execute(f"ATTACH '{conn_str}' AS {alias} (TYPE POSTGRES);")
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{schema};")
@@ -513,7 +513,7 @@ def var(key: str, default: Any = None) -> Any:
         slack_token = obelisk.var("SLACK_WEBHOOK_URL")
     """
     clean_key = key.strip().upper()
-    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+    db_path = settings.sqlite_db_path
     try:
         with sqlite3.connect(db_path, timeout=5.0) as conn:
             cur = conn.cursor()

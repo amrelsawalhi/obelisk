@@ -10,14 +10,24 @@ from sqlalchemy.ext.asyncio import (
 from app.config import settings
 from app.models.base import Base
 
-# Ensure parent directory for database exists
-db_url = settings.DATABASE_URL
-if db_url.startswith("sqlite+aiosqlite:///"):
-    sqlite_path = db_url.replace("sqlite+aiosqlite:///", "")
-    Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
+def _resolve_engine_url() -> str:
+    """Returns the SQLAlchemy URL for the internal brain database.
+
+    For SQLite the URL is rebuilt from ``settings.sqlite_db_path`` so that the
+    engine, the SDK and every subprocess (dagster workspace, dbt project) open
+    the exact same file. A relative DATABASE_URL would otherwise be resolved
+    against each process's own cwd, producing split-brain empty databases.
+    """
+    url = settings.DATABASE_URL
+    if url.startswith("sqlite+aiosqlite:///"):
+        sqlite_path = settings.sqlite_db_path
+        Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
+        return f"sqlite+aiosqlite:///{sqlite_path}"
+    return url
+
 
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    _resolve_engine_url(),
     echo=settings.DEBUG,
     future=True,
 )
@@ -110,11 +120,61 @@ async def seed_defaults(session: AsyncSession) -> None:
 
     await session.commit()
 
+async def _migrate_assets_unique_constraint(conn) -> None:
+    """Rebuild `assets` with UNIQUE(layer, name) when a legacy schema is found.
+
+    `Asset.name` used to be unique on its own, so a table existing in two tiers
+    (e.g. bronze.orders and silver.orders) could not be catalogued twice. SQLite
+    cannot drop an index-backed UNIQUE constraint in place, so the table is
+    rebuilt and its rows copied over. Idempotent: a database that already has the
+    composite key (including every freshly created one) is left untouched.
+    """
+    if not settings.DATABASE_URL.startswith("sqlite+aiosqlite:///"):
+        return
+
+    index_rows = (await conn.exec_driver_sql("PRAGMA index_list('assets')")).fetchall()
+    unique_columns = []
+    for row in index_rows:
+        index_name, is_unique = row[1], row[2]
+        if not is_unique:
+            continue
+        info = (await conn.exec_driver_sql(f"PRAGMA index_info('{index_name}')")).fetchall()
+        unique_columns.append(tuple(col[2] for col in info))
+
+    if ("layer", "name") in unique_columns or ("name", "layer") in unique_columns:
+        return  # already keyed on (layer, name)
+    if ("name",) not in unique_columns:
+        return  # unexpected schema — leave it alone rather than guess
+
+    from sqlalchemy import MetaData
+    from sqlalchemy.dialects import sqlite as sqlite_dialect
+    from sqlalchemy.schema import CreateTable
+    from app.models.asset import Asset
+
+    staging = "assets_uq_migration"
+    await conn.exec_driver_sql(f"DROP TABLE IF EXISTS {staging}")
+    # Build the staging table from the model so a migrated database ends up with
+    # exactly the schema `create_all` produces on a fresh install.
+    staging_table = Asset.__table__.to_metadata(MetaData(), name=staging)
+    await conn.exec_driver_sql(
+        str(CreateTable(staging_table).compile(dialect=sqlite_dialect.dialect()))
+    )
+
+    existing = {row[1] for row in (await conn.exec_driver_sql("PRAGMA table_info('assets')")).fetchall()}
+    columns = ", ".join(c.name for c in Asset.__table__.columns if c.name in existing)
+    await conn.exec_driver_sql(f"INSERT INTO {staging} ({columns}) SELECT {columns} FROM assets")
+    await conn.exec_driver_sql("DROP TABLE assets")
+    await conn.exec_driver_sql(f"ALTER TABLE {staging} RENAME TO assets")
+    # The legacy unique index is dropped with the old table; recreate it as the
+    # plain (non-unique) lookup index the model declares.
+    await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_assets_name ON assets (name)")
+
+
 async def init_db() -> None:
     """Initialize database tables and enforce WAL mode."""
     # Ensure directory exists
     if settings.DATABASE_URL.startswith("sqlite+aiosqlite:///"):
-        path_str = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+        path_str = settings.sqlite_db_path
         Path(path_str).parent.mkdir(parents=True, exist_ok=True)
 
     async with engine.begin() as conn:
@@ -124,6 +184,10 @@ async def init_db() -> None:
             __import__("sqlalchemy").text("PRAGMA journal_mode=WAL;")
         ))
         await conn.run_sync(Base.metadata.create_all)
+        # Workstream 3.1: legacy databases key assets on `name` alone, which
+        # collides across tiers. Runs after create_all so fresh databases (already
+        # correct) short-circuit.
+        await _migrate_assets_unique_constraint(conn)
 
     # Seed default system data exactly once at startup (idempotent).
     async with AsyncSessionLocal() as session:

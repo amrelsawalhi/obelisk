@@ -20,6 +20,7 @@ from typing import Dict, Any, List, Optional
 import duckdb
 from app.config import settings
 from app.core.host_resolver import resolve_connection_host
+from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 
 class DbtRunner:
     def __init__(self, dbt_project_dir: Optional[Path] = None):
@@ -89,12 +90,9 @@ class DbtRunner:
         password = postgres_params["password"]
         sslmode = postgres_params.get("sslmode", "disable")
 
-        storage_path = Path(settings.duckdb_storage_path)
-        if not storage_path.exists():
-            return {"synced_tables": 0, "tables": []}
-
-        # Find parquet files to sync
-        all_parquet = list(storage_path.glob("*.parquet"))
+        # Find parquet files to sync. Bronze tables are discovered whether
+        # STORAGE_URI points at data/lakehouse or data/lakehouse/bronze.
+        all_parquet = self._discover_bronze_parquet()
         if table_names:
             target_files = [f for f in all_parquet if f.stem in table_names]
         else:
@@ -292,17 +290,61 @@ class DbtRunner:
         self._runs_history.append(run_data)
         return run_data
 
-    def _catalog_dbt_models(self) -> None:
-        """Registers discovered dbt Silver & Gold models into SQLite assets table."""
-        db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
-        now_iso = datetime.now(timezone.utc).isoformat()
+    def _discover_bronze_parquet(self) -> List[Path]:
+        """Finds Bronze Parquet files on disk, de-duplicated by table name.
 
-        models = [
-            {"name": "stg_orders", "layer": "silver", "desc": "Cleaned Silver orders"},
-            {"name": "stg_customers", "layer": "silver", "desc": "Cleaned Silver customers"},
-            {"name": "fct_revenue", "layer": "gold", "desc": "Customer tier revenue mart"},
-            {"name": "dim_customers", "layer": "gold", "desc": "Customer dimension mart"},
-        ]
+        STORAGE_URI may point at data/lakehouse (tables live in the bronze/
+        subfolder) or straight at data/lakehouse/bronze, so both locations are
+        scanned. The bronze/ tier wins on a stem collision: it is the canonical
+        medallion location, whereas the storage root only holds the seed
+        fallbacks written by _ensure_core_bronze_tables().
+        """
+        storage_path = Path(settings.duckdb_storage_path)
+        if not storage_path.exists():
+            return []
+
+        found: Dict[str, Path] = {}
+        for tier_dir in (storage_path / "bronze", storage_path):
+            if not tier_dir.is_dir():
+                continue
+            for parquet in sorted(tier_dir.glob("*.parquet")):
+                found.setdefault(parquet.stem, parquet)
+        return list(found.values())
+
+    def _dbt_model_descriptions(self) -> Dict[str, str]:
+        """Reads model descriptions from models/schema.yml (best effort)."""
+        schema_file = self.dbt_project_dir / "models" / "schema.yml"
+        if not schema_file.exists():
+            return {}
+        try:
+            import yaml
+            document = yaml.safe_load(schema_file.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return {}
+        return {
+            entry["name"]: entry.get("description", "")
+            for entry in (document.get("models") or [])
+            if isinstance(entry, dict) and entry.get("name")
+        }
+
+    def _catalog_dbt_models(self) -> None:
+        """Registers every dbt model found on disk into the SQLite assets table.
+
+        Models are discovered dynamically (staging -> silver, marts -> gold) so
+        user-authored .sql files get catalogued too; this used to hardcode 4 of
+        the 9 shipped models.
+        """
+        db_path = settings.sqlite_db_path
+        now_iso = datetime.now(timezone.utc).isoformat()
+        descriptions = self._dbt_model_descriptions()
+
+        models: List[Dict[str, str]] = []
+        for subdir, layer in (("staging", "silver"), ("marts", "gold")):
+            models_dir = self.dbt_project_dir / "models" / subdir
+            if not models_dir.exists():
+                continue
+            for sql_file in sorted(models_dir.glob("*.sql")):
+                models.append({"name": sql_file.stem, "layer": layer})
 
         try:
             with sqlite3.connect(db_path, timeout=10.0) as conn:
@@ -314,10 +356,21 @@ class DbtRunner:
                         """
                         INSERT INTO assets (id, name, layer, storage_uri, format, record_count, schema_metadata, created_at, last_materialized_at)
                         VALUES (?, ?, ?, ?, 'postgres_table', 0, ?, ?, ?)
-                        ON CONFLICT(name) DO UPDATE SET
+                        ON CONFLICT(layer, name) DO UPDATE SET
+                            storage_uri=excluded.storage_uri,
+                            format=excluded.format,
+                            schema_metadata=excluded.schema_metadata,
                             last_materialized_at=excluded.last_materialized_at;
                         """,
-                        (asset_id, m["name"], m["layer"], f"postgresql:///{m['layer']}.{m['name']}", json.dumps({"description": m["desc"]}), now_iso, now_iso),
+                        (
+                            asset_id,
+                            m["name"],
+                            m["layer"],
+                            f"postgresql:///{m['layer']}.{m['name']}",
+                            json.dumps({"description": descriptions.get(m["name"], "")}),
+                            now_iso,
+                            now_iso,
+                        ),
                     )
                 conn.commit()
         except Exception:
@@ -352,17 +405,15 @@ class DbtRunner:
     def get_asset_graph(self, selector: Optional[str] = None) -> Dict[str, Any]:
         """Dynamically parses and returns the full Medallion lineage graph from disk, optionally filtered by pipeline selector."""
         import re
-        storage_path = Path(settings.duckdb_storage_path)
         bronze_nodes = []
-        if storage_path.exists():
-            for f in storage_path.glob("*.parquet"):
-                bronze_nodes.append({
-                    "id": f"bronze.{f.stem}",
-                    "name": f.stem,
-                    "layer": "bronze",
-                    "type": "parquet",
-                    "path": f.as_posix(),
-                })
+        for f in self._discover_bronze_parquet():
+            bronze_nodes.append({
+                "id": f"bronze.{f.stem}",
+                "name": f.stem,
+                "layer": "bronze",
+                "type": "parquet",
+                "path": f.as_posix(),
+            })
 
         silver_nodes = []
         gold_nodes = []
@@ -518,81 +569,7 @@ class DbtRunner:
         }
     def _resolve_postgres_params(self, custom_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Resolves target PostgreSQL warehouse connection parameters."""
-        if custom_params:
-            return custom_params
-
-        # 1. Check data/obelisk.db for an active postgres connection
-        try:
-            db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
-            if Path(db_path).exists():
-                with sqlite3.connect(db_path, timeout=3.0) as con:
-                    row = con.execute(
-                        "SELECT host, port, database, username, encrypted_credentials FROM connections WHERE source_type = 'postgres' ORDER BY created_at DESC LIMIT 1"
-                    ).fetchone()
-                    if row:
-                        from app.core.vault import decrypt
-                        host, port, dbname, user, enc_pw = row
-                        pw = decrypt(enc_pw)
-                        return {
-                            "host": host,
-                            "port": port,
-                            "database": dbname,
-                            "username": user,
-                            "password": pw,
-                            "sslmode": "disable",
-                        }
-        except Exception:
-            pass
-
-        # 2. Check environment variables
-        env_host = os.environ.get("DBT_PG_HOST") or os.environ.get("POSTGRES_HOST")
-        env_port = os.environ.get("DBT_PG_PORT") or os.environ.get("POSTGRES_PORT")
-        env_user = os.environ.get("DBT_PG_USER") or os.environ.get("POSTGRES_USER")
-        env_pw = os.environ.get("DBT_PG_PASSWORD") or os.environ.get("POSTGRES_PASSWORD")
-        env_db = os.environ.get("DBT_PG_DBNAME") or os.environ.get("POSTGRES_DB")
-
-        # 3. Check docker test container on port 5434 / 5433 / 5432
-        test_ports = [5434, 5433, 5432]
-        if env_port:
-            try:
-                p_int = int(env_port)
-                if p_int not in test_ports:
-                    test_ports.insert(0, p_int)
-            except Exception:
-                pass
-
-        for p in test_ports:
-            try:
-                h = resolve_connection_host("127.0.0.1", p)
-                import psycopg2
-                c = psycopg2.connect(
-                    host=h,
-                    port=p,
-                    user=env_user or "testuser",
-                    password=env_pw or "testpass",
-                    dbname=env_db or "sourcedb",
-                    connect_timeout=1,
-                )
-                c.close()
-                return {
-                    "host": h,
-                    "port": p,
-                    "username": env_user or "testuser",
-                    "password": env_pw or "testpass",
-                    "database": env_db or "sourcedb",
-                    "sslmode": "disable",
-                }
-            except Exception:
-                continue
-
-        return {
-            "host": env_host or "127.0.0.1",
-            "port": int(env_port or 5434),
-            "username": env_user or "testuser",
-            "password": env_pw or "testpass",
-            "database": env_db or "sourcedb",
-            "sslmode": "disable",
-        }
+        return resolve_warehouse_postgres_params(custom_params)
 
     def _get_target_env(self, target: str = "postgres") -> Dict[str, str]:
         """Prepares environment variables for dbt execution matching the active target adapter."""

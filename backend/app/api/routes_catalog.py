@@ -363,6 +363,18 @@ def _clean_lakehouse_path(raw_path: str) -> str:
         )
     return "/".join(parts)
 
+
+def _layer_for_folder(folder: str) -> str:
+    """Maps a lakehouse folder to the `Asset.layer` value it is catalogued under.
+
+    Root-level Parquet files are registered with layer "main" (the /tree endpoint
+    labels the flat root tier "main"), while callers may address that folder as
+    "root" — the same alias the file lookups above already accept. Now that
+    (layer, name) is the uniqueness key, this filter must be exact.
+    """
+    return "main" if folder == "root" else folder
+
+
 @router.post("/lakehouse/directories")
 async def create_lakehouse_directory(req: CreateLakehouseDirectoryRequest):
     """Creates a new directory or nested subfolder inside Lakehouse storage."""
@@ -502,7 +514,7 @@ async def rename_lakehouse_table(
     old_file.rename(new_file)
 
     # Update metadata brain
-    stmt = select(Asset).where(Asset.name == old_name)
+    stmt = select(Asset).where(Asset.name == old_name, Asset.layer == _layer_for_folder(clean_folder))
     result = await db.execute(stmt)
     asset = result.scalar_one_or_none()
     if asset:
@@ -530,7 +542,7 @@ async def delete_lakehouse_table(
         table_file.unlink()
 
     # Clean from SQLite
-    stmt = select(Asset).where(Asset.name == clean_name)
+    stmt = select(Asset).where(Asset.name == clean_name, Asset.layer == _layer_for_folder(clean_folder))
     result = await db.execute(stmt)
     asset = result.scalar_one_or_none()
     if asset:
@@ -570,7 +582,7 @@ async def move_lakehouse_table(
     shutil.move(src_file, dst_file)
 
     # Update metadata brain
-    stmt = select(Asset).where(Asset.name == table_name)
+    stmt = select(Asset).where(Asset.name == table_name, Asset.layer == _layer_for_folder(src_folder))
     result = await db.execute(stmt)
     asset = result.scalar_one_or_none()
     if asset:

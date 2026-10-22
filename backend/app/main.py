@@ -1,14 +1,24 @@
 import sys
 from pathlib import Path
 
-# Ensure both backend/ and project root are in sys.path for uvicorn reloader child processes
+# Ensure backend/, project root and git_repo/ are on sys.path for uvicorn reloader
+# child processes. git_repo/ must be importable so the in-process Dagster fallback
+# (used whenever no Dagster service is deployed) can resolve
+# `from dagster_workspace.repository import create_ingest_asset`.
 _current_file = Path(__file__).resolve()
-_backend_dir = str(_current_file.parents[1])
-_project_root = str(_current_file.parents[2])
+_backend_dir = _current_file.parents[1]
+_project_root = _current_file.parents[2]
 
-for _p in [_project_root, _backend_dir]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+# git_repo/ lives next to backend/ in a source checkout, but inside the backend
+# working directory in the Docker image (./git_repo -> /app/git_repo).
+for _p in (
+    _project_root,
+    _backend_dir,
+    _project_root / "git_repo",
+    _backend_dir / "git_repo",
+):
+    if _p.is_dir() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from contextlib import asynccontextmanager
 import asyncio
@@ -39,6 +49,9 @@ async def lifespan(app: FastAPI):
     cron_engine.start()
     yield
     cron_engine.stop()
+    # Terminate the headless Marimo subprocess so no orphan holds port 2718.
+    from app.engines.marimo_service import marimo_service
+    marimo_service.stop()
 
 app = FastAPI(
     title=settings.APP_NAME,

@@ -33,6 +33,11 @@ class MarimoService:
         self.base_url = base_url if base_url.startswith("/") else f"/{base_url}"
         self._process: Optional[subprocess.Popen] = None
         self._started_at: Optional[float] = None
+        # Marimo logs continuously. Draining that output into a file instead of an
+        # unread PIPE keeps the child from blocking on write() once the ~64 KB pipe
+        # buffer fills up, which used to freeze the notebook server.
+        self.log_path = Path(__file__).resolve().parents[3] / "data" / "logs" / "marimo.log"
+        self._log_handle: Optional[Any] = None
 
     @property
     def url(self) -> str:
@@ -84,12 +89,16 @@ class MarimoService:
             "--skip-update-check",
         ]
 
+        # Stream the child's output to disk (never an unread PIPE) so it can never
+        # deadlock on a full pipe buffer.
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_handle = open(self.log_path, "a", encoding="utf-8", errors="replace")
+
         # Launch background subprocess
         self._process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=self._log_handle,
             stderr=subprocess.STDOUT,
-            text=True,
             cwd=str(self.notebooks_dir),
         )
         self._started_at = time.time()
@@ -99,8 +108,9 @@ class MarimoService:
         ready = False
         while time.time() < deadline:
             if self._process.poll() is not None:
-                out = self._process.stdout.read() if self._process.stdout else ""
-                raise RuntimeError(f"Marimo failed to start with code {self._process.poll()}: {out}")
+                tail = self._tail_log()
+                self._close_log_handle()
+                raise RuntimeError(f"Marimo failed to start with code {self._process.poll()}: {tail}")
             if self.is_running():
                 ready = True
                 break
@@ -119,12 +129,34 @@ class MarimoService:
             "notebooks_dir": str(self.notebooks_dir),
         }
 
+    def _tail_log(self, max_bytes: int = 4096) -> str:
+        """Returns the tail of the Marimo log, for startup-failure diagnostics."""
+        try:
+            if not self.log_path.exists():
+                return ""
+            with open(self.log_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - max_bytes))
+                return fh.read().decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def _close_log_handle(self) -> None:
+        """Closes the Marimo log file handle if one is open."""
+        if self._log_handle is not None:
+            try:
+                self._log_handle.close()
+            except Exception:
+                pass
+            self._log_handle = None
+
     def stop(self) -> Dict[str, Any]:
         """
         Cleanly terminates the Marimo process tree on Windows and Linux,
         guaranteeing zero orphaned processes holding the port.
         """
         if self._process is None and not self.is_running():
+            self._close_log_handle()
             return {"status": "not_running"}
 
         pid = self._process.pid if self._process else None
@@ -163,6 +195,7 @@ class MarimoService:
 
         self._process = None
         self._started_at = None
+        self._close_log_handle()
         return {"status": "stopped", "previous_pid": pid}
 
     def get_status(self) -> Dict[str, Any]:

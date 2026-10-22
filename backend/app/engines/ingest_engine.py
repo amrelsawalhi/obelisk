@@ -21,6 +21,20 @@ from app.core.host_resolver import resolve_connection_host
 
 logger = logging.getLogger(__name__)
 
+
+def _watermark_is_newer(value: Any, reference: Any) -> bool:
+    """Compares two watermark values, numerically when both look numeric.
+
+    Numeric watermarks must not be compared as text — "9" > "10" is True, which
+    silently corrupts incremental loads. Dates and other non-numeric values fall
+    back to a string/ISO comparison.
+    """
+    try:
+        return float(value) > float(reference)
+    except (TypeError, ValueError):
+        return str(value) > str(reference)
+
+
 class IngestEngine:
     """
     Universal Ingestion Engine:
@@ -54,7 +68,7 @@ class IngestEngine:
         schema_metadata: Dict[str, Any],
     ) -> None:
         """Records or updates the lakehouse asset metadata in SQLite brain."""
-        db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+        db_path = settings.sqlite_db_path
         now_iso = datetime.now(timezone.utc).isoformat()
         metadata_json = json.dumps(schema_metadata)
         asset_id = str(uuid.uuid4())
@@ -68,7 +82,7 @@ class IngestEngine:
                     """
                     INSERT INTO assets (id, name, layer, storage_uri, format, record_count, schema_metadata, created_at, last_materialized_at)
                     VALUES (?, ?, ?, ?, 'parquet', ?, ?, ?, ?)
-                    ON CONFLICT(name) DO UPDATE SET
+                    ON CONFLICT(layer, name) DO UPDATE SET
                         storage_uri=excluded.storage_uri,
                         record_count=excluded.record_count,
                         schema_metadata=excluded.schema_metadata,
@@ -154,21 +168,34 @@ class IngestEngine:
 
         existing_max_watermark = None
         existing_table: Optional[pa.Table] = None
+        existing_file: Optional[Path] = None
 
-        # 1. Inspect existing table for incremental watermark
+        # 1. Inspect the existing Parquet for its incremental watermark. Only the
+        # watermark column is read: materialising the whole file here would pull
+        # the entire history into RAM just to compute a max.
         if mode == "incremental" and watermark_column and target_file.exists():
+            existing_file = target_file
             try:
-                existing_table = pq.read_table(str(target_file))
-                if existing_table.num_rows > 0 and watermark_column in existing_table.column_names:
+                watermark_only = pq.read_table(str(target_file), columns=[watermark_column])
+                if watermark_only.num_rows > 0:
                     # High-performance C++ max calculation via PyArrow compute
-                    max_scalar = pc.max(existing_table[watermark_column])
+                    max_scalar = pc.max(watermark_only[watermark_column])
                     if max_scalar.is_valid:
                         existing_max_watermark = max_scalar.as_py()
             except Exception:
-                existing_table = None
                 existing_max_watermark = None
 
         st = source_type.lower()
+
+        # Postgres merges incrementally inside DuckDB (out-of-core) and must not be
+        # handed an in-memory copy of the existing table. The remaining sources
+        # still concatenate in RAM, so they need it materialised.
+        if st != "postgres" and existing_file is not None:
+            try:
+                existing_table = pq.read_table(str(existing_file))
+            except Exception:
+                existing_table = None
+
         if st == "postgres":
             res = self._ingest_postgres(
                 connection_params=connection_params,
@@ -177,7 +204,7 @@ class IngestEngine:
                 mode=mode,
                 watermark_column=watermark_column,
                 watermark_value=existing_max_watermark,
-                existing_table=existing_table,
+                existing_file=existing_file,
                 limit=limit,
                 write_strategy=write_strategy,
                 primary_key=primary_key,
@@ -277,6 +304,53 @@ class IngestEngine:
             "write_strategy": write_strategy,
         }
 
+    def _merge_incremental_parquet(
+        self,
+        existing_file: Path,
+        delta_file: Path,
+        output_file: Path,
+        write_strategy: str,
+        primary_key: Optional[str],
+        watermark_column: Optional[str],
+    ) -> int:
+        """Merges an existing Bronze Parquet file with a delta, out-of-core.
+
+        DuckDB reads both files lazily via read_parquet() and only the merged
+        result is written, so memory stays flat no matter how large the existing
+        history is (the old code concatenated both tables in Python RAM).
+        Returns the merged row count.
+        """
+        existing_posix = existing_file.as_posix()
+        delta_posix = delta_file.as_posix()
+        output_posix = output_file.as_posix()
+
+        union_sql = (
+            f"SELECT * FROM read_parquet('{existing_posix}') "
+            f"UNION ALL BY NAME SELECT * FROM read_parquet('{delta_posix}')"
+        )
+        dedup_sql = None
+        if write_strategy == "upsert" and primary_key:
+            order_sql = f'ORDER BY "{watermark_column}" DESC' if watermark_column else ""
+            dedup_sql = (
+                f'SELECT * FROM ({union_sql}) '
+                f'QUALIFY ROW_NUMBER() OVER (PARTITION BY "{primary_key}" {order_sql}) = 1'
+            )
+
+        copy_target = f"'{output_posix}' (FORMAT PARQUET, COMPRESSION SNAPPY);"
+        dconn = duckdb.connect()
+        try:
+            if dedup_sql is not None:
+                try:
+                    dconn.execute(f"COPY ({dedup_sql}) TO {copy_target}")
+                except Exception as e:
+                    logger.warning("Upsert deduplication failed in DuckDB, writing the raw union: %s", e)
+                    dconn.execute(f"COPY ({union_sql}) TO {copy_target}")
+            else:
+                dconn.execute(f"COPY ({union_sql}) TO {copy_target}")
+            return dconn.execute(f"SELECT COUNT(*) FROM read_parquet('{output_posix}')").fetchone()[0]
+        finally:
+            dconn.close()
+
     def _ingest_postgres(
         self,
         connection_params: Dict[str, Any],
@@ -285,7 +359,7 @@ class IngestEngine:
         mode: str,
         watermark_column: Optional[str] = None,
         watermark_value: Optional[Any] = None,
-        existing_table: Optional[pa.Table] = None,
+        existing_file: Optional[Path] = None,
         limit: Optional[int] = None,
         write_strategy: str = "append",
         primary_key: Optional[str] = None,
@@ -293,6 +367,7 @@ class IngestEngine:
         """
         Track A: DuckDB native C++ direct streaming extraction from PostgreSQL.
         Attaches the PostgreSQL database and streams directly to Snappy Parquet.
+        Incremental merges stay inside DuckDB so large histories never load into RAM.
         """
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
         port = connection_params["port"]
@@ -318,7 +393,7 @@ class IngestEngine:
             dsn = f"host={host} port={port} dbname={database} user={user} password={password} sslmode={sslmode}"
             conn.execute(f"ATTACH '{dsn}' AS {alias} (TYPE POSTGRES, READ_ONLY);")
 
-            if mode == "snapshot" or existing_table is None:
+            if mode == "snapshot" or existing_file is None:
                 # Direct C++ streaming snapshot straight to Snappy Parquet
                 query = f'COPY (SELECT * FROM {alias}."{schema_name}"."{table_name}"{limit_clause}) TO \'{temp_file_posix}\' (FORMAT PARQUET, COMPRESSION SNAPPY);'
                 conn.execute(query)
@@ -330,36 +405,42 @@ class IngestEngine:
                 os.replace(temp_file, target_file)
                 return {"num_rows": num_rows, "new_rows_extracted": num_rows}
 
+            # Incremental delta extraction via DuckDB
+            delta_file = target_file.with_name(f"{target_file.stem}_delta_{uuid.uuid4().hex[:8]}.tmp.parquet")
+            delta_file_posix = delta_file.as_posix()
+
+            if isinstance(watermark_value, (int, float)):
+                where_clause = f'WHERE "{watermark_column}" > {watermark_value}'
             else:
-                # Incremental delta extraction via DuckDB
-                delta_file = target_file.with_name(f"{target_file.stem}_delta_{uuid.uuid4().hex[:8]}.tmp.parquet")
-                delta_file_posix = delta_file.as_posix()
+                where_clause = f"WHERE \"{watermark_column}\" > '{watermark_value}'"
 
-                if isinstance(watermark_value, (int, float)):
-                    where_clause = f'WHERE "{watermark_column}" > {watermark_value}'
-                else:
-                    where_clause = f"WHERE \"{watermark_column}\" > '{watermark_value}'"
+            query = f'COPY (SELECT * FROM {alias}."{schema_name}"."{table_name}" {where_clause} ORDER BY "{watermark_column}" ASC{limit_clause}) TO \'{delta_file_posix}\' (FORMAT PARQUET, COMPRESSION SNAPPY);'
+            conn.execute(query)
 
-                query = f'COPY (SELECT * FROM {alias}."{schema_name}"."{table_name}" {where_clause} ORDER BY "{watermark_column}" ASC{limit_clause}) TO \'{delta_file_posix}\' (FORMAT PARQUET, COMPRESSION SNAPPY);'
-                conn.execute(query)
+            try:
+                new_rows = pq.read_metadata(str(delta_file)).num_rows if delta_file.exists() else 0
+                if new_rows == 0:
+                    # Nothing new — leave the existing Parquet file untouched.
+                    return {
+                        "num_rows": pq.read_metadata(str(existing_file)).num_rows,
+                        "new_rows_extracted": 0,
+                    }
 
-                try:
-                    delta_table = pq.read_table(str(delta_file))
-                    new_rows = delta_table.num_rows
-
-                    if new_rows > 0:
-                        # Schema-safe concatenation with null-type promotion
-                        final_table = pa.concat_tables([existing_table, delta_table], promote_options="default")
-                        final_table = self._apply_write_strategy(final_table, write_strategy, primary_key, watermark_column)
-                    else:
-                        final_table = existing_table
-
-                    pq.write_table(final_table, str(temp_file), compression="SNAPPY")
-                    os.replace(temp_file, target_file)
-                    return {"num_rows": final_table.num_rows, "new_rows_extracted": new_rows}
-                finally:
-                    if delta_file.exists():
-                        delta_file.unlink(missing_ok=True)
+                # Merge + upsert dedup stream out-of-core inside DuckDB, then the
+                # result is swapped in atomically.
+                num_rows = self._merge_incremental_parquet(
+                    existing_file=existing_file,
+                    delta_file=delta_file,
+                    output_file=temp_file,
+                    write_strategy=write_strategy,
+                    primary_key=primary_key,
+                    watermark_column=watermark_column,
+                )
+                os.replace(temp_file, target_file)
+                return {"num_rows": num_rows, "new_rows_extracted": new_rows}
+            finally:
+                if delta_file.exists():
+                    delta_file.unlink(missing_ok=True)
 
         finally:
             try:
@@ -509,11 +590,14 @@ class IngestEngine:
                 else:
                     cur.execute(f"SELECT * FROM {table_ref}{limit_clause}")
                 rows = cur.fetchall()
+                # Keep the projection's columns so an empty snapshot still writes a
+                # readable Parquet schema instead of a 0-column file.
+                columns = [desc[0] for desc in cur.description] if cur.description else []
 
             if not rows and existing_table is not None:
                 return {"num_rows": existing_table.num_rows, "new_rows_extracted": 0}
 
-            all_keys = list(rows[0].keys()) if rows else []
+            all_keys = list(rows[0].keys()) if rows else columns
             col_data = {k: [] for k in all_keys}
             for r in rows:
                 for k in all_keys:
@@ -522,7 +606,7 @@ class IngestEngine:
                         v = json.dumps(v, default=str)
                     col_data[k].append(v)
 
-            new_table = pa.Table.from_pydict(col_data) if rows else pa.Table.from_pydict({})
+            new_table = pa.Table.from_pydict(col_data)
 
             if mode == "incremental" and existing_table is not None:
                 if new_table.num_rows > 0:
@@ -594,7 +678,9 @@ class IngestEngine:
                         val = json.dumps(val, default=str)
                     col_data[c].append(val)
 
-            new_table = pa.Table.from_pydict(col_data) if raw_rows else pa.Table.from_pydict({})
+            # col_data is keyed by the projection's columns, so an empty snapshot
+            # still produces a readable (0-row) Parquet schema.
+            new_table = pa.Table.from_pydict(col_data)
 
             if mode == "incremental" and existing_table is not None:
                 if new_table.num_rows > 0:
@@ -661,12 +747,11 @@ class IngestEngine:
         records = Introspector._extract_api_records(data, data_key)
 
         if mode == "incremental" and watermark_column and watermark_value is not None:
-            filtered_records = []
-            for r in records:
-                val = r.get(watermark_column)
-                if val is not None and str(val) > str(watermark_value):
-                    filtered_records.append(r)
-            records = filtered_records
+            records = [
+                r for r in records
+                if r.get(watermark_column) is not None
+                and _watermark_is_newer(r[watermark_column], watermark_value)
+            ]
 
         if limit and limit > 0:
             records = records[:int(limit)]

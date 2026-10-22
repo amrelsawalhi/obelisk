@@ -36,6 +36,7 @@ class ServiceBlueprint:
     ports: Dict[str, int]                        # container port ("5432/tcp") -> default host port
     primary_container_port: str                  # container port whose host binding is canonical
     primary_host_port: int
+    category: str = ""                            # functional role (Warehouse, Orchestration, BI & Analytics, ...)
     deployable: bool = True
     reason_not_deployable: Optional[str] = None
     volume_name: Optional[str] = None            # named volume — persistence across stop/redeploy
@@ -48,6 +49,7 @@ class ServiceBlueprint:
     register_connection: bool = False            # auto-register as catalog Connection when ready
     connection_type: Optional[str] = None        # Connection.source_type for registration
     web_ui: bool = False                         # primary host port serves a browsable web UI
+    web_ui_path: Optional[str] = None             # relative gateway subpath (e.g. "/gitea") served by Caddy / Vite proxy
     post_start_commands: List[str] = field(default_factory=list)  # exec'd after container start (init flows)
     credential_username: Optional[str] = None     # username shown/registered for generated credentials
     credential_database: Optional[str] = None     # database shown/registered for generated credentials
@@ -63,7 +65,8 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
     ServiceBlueprint(
         name="postgres",
         display_name="PostgreSQL 16",
-        description="Relational warehouse for dbt marts and pipeline staging. Password is generated per-deploy, vaulted, and auto-registered as a catalog Connection.",
+        description="Relational warehouse for dbt marts and staging.",
+        category="Warehouse",
         image="postgres:16-alpine",
         ports={"5432/tcp": 5432},
         primary_container_port="5432/tcp",
@@ -82,7 +85,8 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
     ServiceBlueprint(
         name="clickhouse",
         display_name="ClickHouse OLAP",
-        description="Columnar OLAP engine for high-speed aggregation analytics. Data persists in a named volume.",
+        description="Columnar OLAP engine for real-time analytics.",
+        category="Analytics",
         image="clickhouse/clickhouse-server:24.8",
         ports={"8123/tcp": 8123, "9000/tcp": 9000},
         primary_container_port="8123/tcp",
@@ -96,7 +100,8 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
     ServiceBlueprint(
         name="redpanda",
         display_name="Redpanda Streaming",
-        description="Kafka-compatible event streaming engine for CDC and event pipelines.",
+        description="Kafka-compatible event streaming engine.",
+        category="Streaming",
         image="docker.redpanda.com/redpandadata/redpanda:v24.1.1",
         ports={"9092/tcp": 9092, "9644/tcp": 9644},
         primary_container_port="9092/tcp",
@@ -111,27 +116,46 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
     ServiceBlueprint(
         name="gitea",
         display_name="Gitea Git Server",
-        description="Self-hosted Git service for versioning notebooks, models, and pipelines.",
+        description="Self-hosted Git service.",
+        category="Version Control",
         image="gitea/gitea:1.22",
         ports={"3000/tcp": 3001, "22/tcp": 2222},
         primary_container_port="3000/tcp",
         primary_host_port=3001,
         volume_name="obelisk_gitea_data",
         volume_path="/data",
+        env={
+            "GITEA__server__HTTP_PORT": "3000",
+            # Gitea has no relative ROOT_URL mode; the deploy route expands
+            # {public_url} from the browser origin so subpath links work in dev
+            # (:5173) and behind Caddy (:80) alike.
+            # NOTE: Gitea mounts its routes at "/" regardless of ROOT_URL, so the
+            # gateway (Caddy handle_path / Vite rewrite) must strip /gitea. This
+            # value only controls the links Gitea generates.
+            "GITEA__server__ROOT_URL": "{public_url}/gitea/",
+            "GITEA__server__SSH_PORT": "2222",
+            "GITEA__server__SSH_LISTEN_PORT": "22",
+            "GITEA__server__START_SSH_SERVER": "true",
+            "GITEA__server__LFS_START_SERVER": "false",
+        },
+        # Probed directly against the published port, so the path must be the one
+        # Gitea actually serves: "/api/healthz" (not the /gitea-prefixed variant).
         readiness=ReadinessProbe(kind="http", host_port=3001, path="/api/healthz", expected_status=200),
         probe_timeout_seconds=90,
         image_size_gb=1.0,
         web_ui=True,
+        web_ui_path="/gitea",
     ),
     ServiceBlueprint(
         name="dagster",
         display_name="Dagster Engine",
-        description="Asset orchestrator: webserver + daemon running Obelisk's real workspace on the host (process mode — no image build, logs in data/logs/). Scheduled ingest DAGs fire via the daemon.",
+        description="Orchestrator for scheduled assets and pipelines.",
+        category="Orchestration",
         image="obelisk-dagster:local",
         build_dockerfile="Dockerfile.dagster",
         run_mode="process",
         process_commands=[
-            ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "{dagster_home}/workspace.yaml"],
+            ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "--path-prefix", "/dagster", "-w", "{dagster_home}/workspace.yaml"],
             ["dagster-daemon", "run", "-w", "{dagster_home}/workspace.yaml"],
         ],
         ports={"3000/tcp": 3000},
@@ -146,15 +170,17 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
         },
         env={"PYTHONPATH": "/opt/obelisk/backend"},
         pass_env=["OBELISK_MASTER_KEY", "DATABASE_URL", "STORAGE_URI"],
-        readiness=ReadinessProbe(kind="http", host_port=3000, path="/server_info", expected_status=200),
+        readiness=ReadinessProbe(kind="http", host_port=3000, path="/dagster/server_info", expected_status=200),
         probe_timeout_seconds=60,
         image_size_gb=3.0,
         web_ui=True,
+        web_ui_path="/dagster",
     ),
     ServiceBlueprint(
         name="superset",
         display_name="Apache Superset",
-        description="BI dashboards with SQL Lab. Deploy runs the full init flow (secret key, DB upgrade, admin creation); generated admin credentials are vaulted and shown once.",
+        description="BI dashboards and SQL analytics.",
+        category="BI & Analytics",
         image="apache/superset:4.1.1",
         ports={"8088/tcp": 8088},
         primary_container_port="8088/tcp",
@@ -167,9 +193,10 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
         image_size_gb=3.0,
         credential_username="admin",
         web_ui=True,
+        web_ui_path="/superset",
         post_start_commands=[
             "superset db upgrade",
-            'superset fab create-admin --username admin --firstname Admin --lastname User --email admin@obelisk.local --password "$SUPERSET_SECRET_KEY" || true',
+            'superset fab create-admin --username "$SUPERSET_ADMIN_USER" --firstname Admin --lastname User --email admin@obelisk.local --password "$SUPERSET_ADMIN_PASSWORD" || true',
             "superset init",
         ],
     ),
@@ -193,6 +220,7 @@ def blueprint_catalog_entries() -> List[Dict[str, Any]]:
             "name": bp.name,
             "display_name": bp.display_name,
             "description": bp.description,
+            "category": bp.category,
             "image": bp.image,
             "deployable": bp.deployable,
             "reason_not_deployable": bp.reason_not_deployable,
@@ -202,8 +230,11 @@ def blueprint_catalog_entries() -> List[Dict[str, Any]]:
             "probe_timeout_seconds": bp.probe_timeout_seconds,
             "recommended_min_disk_gb": bp.image_size_gb,
             "needs_credentials": "__GENERATED__" in bp.env.values(),
+            "default_username": bp.credential_username,
+            "default_database": bp.credential_database,
             "register_connection": bp.register_connection,
             "web_ui": bp.web_ui,
+            "web_ui_path": bp.web_ui_path,
             "post_start": bool(bp.post_start_commands),
             "run_mode": bp.run_mode,
         }

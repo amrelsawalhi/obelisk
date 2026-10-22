@@ -11,7 +11,8 @@ import httpx
 
 DAGSTER_HOST = os.environ.get("OBELISK_DAGSTER_HOST", "localhost")
 DAGSTER_PORT = int(os.environ.get("OBELISK_DAGSTER_PORT", "3000"))
-_GRAPHQL = f"http://{DAGSTER_HOST}:{DAGSTER_PORT}/graphql"
+DAGSTER_PATH_PREFIX = os.environ.get("OBELISK_DAGSTER_PATH_PREFIX", "/dagster").rstrip("/")
+_GRAPHQL = f"http://{DAGSTER_HOST}:{DAGSTER_PORT}{DAGSTER_PATH_PREFIX}/graphql"
 _TERMINAL = {"SUCCESS", "FAILURE", "CANCELED"}
 
 # Shared client keeps TCP + HTTP alive across GraphQL calls (and the readiness
@@ -27,7 +28,7 @@ class DagsterServiceUnavailable(RuntimeError):
 def service_status(timeout: float = 3.0) -> Dict[str, Any]:
     """Probes the Dagster webserver (/server_info)."""
     try:
-        resp = _http_client.get(f"http://{DAGSTER_HOST}:{DAGSTER_PORT}/server_info", timeout=timeout)
+        resp = _http_client.get(f"http://{DAGSTER_HOST}:{DAGSTER_PORT}{DAGSTER_PATH_PREFIX}/server_info", timeout=timeout)
         if resp.status_code == 200:
             return {"available": True, "info": resp.json()}
         return {"available": False, "info": f"HTTP {resp.status_code}"}
@@ -436,7 +437,7 @@ def list_recent_runs(limit: int = 20, timeout: float = 10.0) -> List[Dict[str, A
             "started_at": _ms_to_iso(ts_start),
             "ended_at": _ms_to_iso(ts_end),
             "duration_seconds": dur,
-            "dagster_url": f"http://{DAGSTER_HOST}:{DAGSTER_PORT}/runs/{run_id}",
+            "dagster_url": f"http://{DAGSTER_HOST}:{DAGSTER_PORT}{DAGSTER_PATH_PREFIX}/runs/{run_id}",
         })
     return out
 

@@ -12,6 +12,13 @@ backend_dir = Path(__file__).resolve().parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
+# git_repo/ must be importable so tests can exercise the in-process Dagster
+# workspace (`dagster_workspace.repository`) exactly as app/main.py does at
+# runtime; without it the ingest fallback raises ModuleNotFoundError.
+git_repo_dir = backend_dir.parent / "git_repo"
+if git_repo_dir.is_dir() and str(git_repo_dir) not in sys.path:
+    sys.path.insert(0, str(git_repo_dir))
+
 # Configure test environment
 os.environ.setdefault("STORAGE_URI", "file:///data/lakehouse/bronze")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///data/obelisk.db")
@@ -130,7 +137,7 @@ def cleanup_test_artifacts():
                 except Exception:
                     pass
 
-    db_path = Path("data/obelisk.db")
+    db_path = Path(settings.sqlite_db_path)
     if db_path.exists():
         try:
             with sqlite3.connect(str(db_path), timeout=5.0) as con:
@@ -190,10 +197,11 @@ def source_postgres_params(source_host) -> dict:
             except Exception:
                 pass
 
-    # 2. Check vault connections in data/obelisk.db
+    # 2. Check vault connections in the canonical SQLite brain
     import sqlite3
+    from app.config import settings
     from app.core.vault import decrypt
-    db_path = Path("data/obelisk.db")
+    db_path = Path(settings.sqlite_db_path)
     if db_path.exists():
         try:
             with sqlite3.connect(str(db_path)) as con:

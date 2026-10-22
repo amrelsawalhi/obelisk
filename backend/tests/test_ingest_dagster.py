@@ -248,7 +248,7 @@ def test_dagster_ingest_mongodb(source_mongo_params):
 
 
 @pytest.mark.asyncio
-async def test_ingest_api_trigger(source_postgres_params, monkeypatch):
+async def test_ingest_api_trigger(source_postgres_params):
     """Tests the POST /api/ingest/trigger endpoint with registered Connection.
 
     Forces the in-process Dagster fallback: a locally deployed Dagster service
@@ -256,7 +256,8 @@ async def test_ingest_api_trigger(source_postgres_params, monkeypatch):
     this test depend on ambient services instead of the test database.
     """
     from app.engines import dagster_client as dc_module
-    monkeypatch.setattr(dc_module, "service_status", lambda: {"available": False, "info": {}})
+    orig_service_status = dc_module.service_status
+    dc_module.service_status = lambda timeout=3.0: {"available": False, "info": {}}
 
     p = source_postgres_params
     rand_suffix = uuid.uuid4().hex[:6]
@@ -318,6 +319,7 @@ async def test_ingest_api_trigger(source_postgres_params, monkeypatch):
             assert pq.read_metadata(str(parquet_path)).num_rows == 2
 
     finally:
+        dc_module.service_status = orig_service_status
         with conn.cursor() as cur:
             cur.execute(f'DROP TABLE IF EXISTS "{table_name}";')
         conn.close()
@@ -370,7 +372,7 @@ def test_sqlite_asset_catalog_registration(source_postgres_params):
         assert res["num_rows"] == 2
 
         # Verify physical registration in SQLite
-        db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+        db_path = settings.sqlite_db_path
         sql_conn = sqlite3.connect(db_path)
         cur = sql_conn.cursor()
         cur.execute("SELECT name, layer, storage_uri, record_count, schema_metadata FROM assets WHERE name = ?;", (target_name,))

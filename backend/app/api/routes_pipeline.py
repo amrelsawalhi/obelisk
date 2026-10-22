@@ -2,8 +2,6 @@
 Pipelines API Routes: Exposes Medallion lineage graph, pipeline run triggers, and live logs.
 """
 
-import os
-import json
 import asyncio
 import logging
 from typing import Optional, Dict, Any, List
@@ -11,9 +9,8 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from app.database import AsyncSessionLocal
-from app.models.connection import Connection
 from app.models.pipeline_definition import PipelineDefinition
-from app.core.vault import vault
+from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 from app.engines.dbt_runner import dbt_runner
 
 router = APIRouter(prefix="/api/pipelines", tags=["Pipelines"])
@@ -130,50 +127,10 @@ async def trigger_pipeline_run(req: Optional[TriggerPipelineRequest] = None):
     selector = req.selector if req else None
     pipeline_name = req.pipeline_name if req else None
 
-    # Auto-resolve from registered PostgreSQL warehouse if not explicitly provided
+    # Auto-resolve the warehouse from the deployed service, the data catalog,
+    # environment variables or a reachable local test container.
     if not pg_params:
-        try:
-            async with AsyncSessionLocal() as session:
-                stmt = select(Connection).where(Connection.source_type == "postgres").order_by(Connection.id.desc())
-                res = await session.execute(stmt)
-                active_conn = res.scalars().first()
-                if active_conn:
-                    # Credentials are stored as an encrypted plaintext password string
-                    # (vault.encrypt(password)) everywhere else in Obelisk, but tolerate
-                    # a JSON dict payload for forward compatibility.
-                    raw_decrypted = vault.decrypt(active_conn.encrypted_credentials)
-                    password = ""
-                    if isinstance(raw_decrypted, str) and raw_decrypted:
-                        try:
-                            parsed = json.loads(raw_decrypted)
-                            if isinstance(parsed, dict):
-                                password = str(parsed.get("password", ""))
-                            else:
-                                password = str(parsed)
-                        except (json.JSONDecodeError, TypeError):
-                            password = raw_decrypted
-
-                    pg_params = {
-                        "host": active_conn.host,
-                        "port": active_conn.port,
-                        "username": active_conn.username,
-                        "password": password,
-                        "database": active_conn.database,
-                        "sslmode": "disable",
-                    }
-        except Exception as e:
-            logger.warning("Pipeline run: failed to auto-resolve registered PostgreSQL connection: %s", e)
-
-    # Fallback to environment variables or local host defaults if not found
-    if not pg_params:
-        pg_params = {
-            "host": os.environ.get("DBT_PG_HOST") or os.environ.get("POSTGRES_HOST") or "localhost",
-            "port": int(os.environ.get("DBT_PG_PORT") or os.environ.get("POSTGRES_PORT") or "5432"),
-            "username": os.environ.get("DBT_PG_USER") or os.environ.get("POSTGRES_USER") or "postgres",
-            "password": os.environ.get("DBT_PG_PASSWORD") or os.environ.get("POSTGRES_PASSWORD") or "postgres",
-            "database": os.environ.get("DBT_PG_DBNAME") or os.environ.get("POSTGRES_DB") or "dipsignal",
-            "sslmode": "disable",
-        }
+        pg_params = await asyncio.to_thread(resolve_warehouse_postgres_params)
 
     try:
         # dbt run/test are long blocking subprocess invocations — execute in a worker
@@ -403,7 +360,13 @@ async def list_orchestration_engines():
     """Returns available orchestration engines (Built-in Cron, Dagster, Apache Airflow) with live status."""
     from app.engines.orchestration_hub import orchestration_hub
     engines = await orchestration_hub.get_engines()
-    return {"engines": [e.model_dump() for e in engines]}
+    # Preferred engine for new pipelines: Dagster when it is actually reachable,
+    # otherwise the always-available in-process Cron scheduler.
+    dagster_running = any(e.id == "dagster" and e.status == "running" for e in engines)
+    return {
+        "engines": [e.model_dump() for e in engines],
+        "default_engine": "dagster" if dagster_running else "cron",
+    }
 
 
 @router.get("/cron/targets")

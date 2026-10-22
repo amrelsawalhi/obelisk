@@ -1,4 +1,3 @@
-import os
 import re
 import asyncio
 from typing import Dict, Any, List, Optional
@@ -16,6 +15,7 @@ from app.engines.duckdb_engine import duckdb_engine
 from app.engines.native_query_engine import native_query_engine
 from app.core.docker_manager import docker_mgr
 from app.core.host_resolver import resolve_connection_host
+from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 
 router = APIRouter(prefix="/api/query", tags=["query"])
 
@@ -139,15 +139,19 @@ async def list_query_targets(db: AsyncSession = Depends(get_db)):
             
             # Fetch schemas dynamically if running
             schemas = ["public"]
+            pg_params: Dict[str, Any] = {}
             if is_running:
                 try:
+                    # Same credential resolution the dbt runner / SDK use, so the
+                    # target reflects the user's configured database and password.
+                    pg_params = await asyncio.to_thread(resolve_warehouse_postgres_params)
                     schemas = await asyncio.to_thread(
                         native_query_engine.get_postgres_schemas,
-                        host=host,
-                        port=port,
-                        database="obelisk",
-                        username="obelisk",
-                        password="obelisk",
+                        host=pg_params["host"],
+                        port=pg_params["port"],
+                        database=pg_params["database"],
+                        username=pg_params["username"],
+                        password=pg_params["password"],
                     )
                 except Exception:
                     pass
@@ -162,7 +166,7 @@ async def list_query_targets(db: AsyncSession = Depends(get_db)):
                     capabilities=["Native DDL / DML", "Stored Procedures", "Materialized Views", "Triggers", "Transactions"],
                     status=status_val,
                     schemas=schemas,
-                    database="obelisk",
+                    database=pg_params.get("database") or "obelisk",
                     host=host,
                     port=port,
                 )
@@ -250,15 +254,14 @@ async def execute_sql(
             if target_id == "service:postgres":
                 target_name = "PostgreSQL"
                 target_engine = "postgres"
-                # Fetch port and host from ServiceConfig if registered
-                stmt = select(ServiceConfig).where(ServiceConfig.service_name == "postgres")
-                res = await db.execute(stmt)
-                svc_pg = res.scalar_one_or_none()
-                host = svc_pg.host if svc_pg else "localhost"
-                port = svc_pg.port if svc_pg else 5432
-                user = os.getenv("POSTGRES_USER", "obelisk")
-                pw = os.getenv("POSTGRES_PASSWORD", "obelisk")
-                dbname = os.getenv("POSTGRES_DB", "obelisk")
+                # Resolve the live warehouse credentials (deployed service, catalog
+                # connection, env vars, or a reachable local test container).
+                pg_params = await asyncio.to_thread(resolve_warehouse_postgres_params)
+                host = pg_params["host"]
+                port = pg_params["port"]
+                user = pg_params["username"]
+                pw = pg_params["password"]
+                dbname = pg_params["database"]
 
                 exec_res = await asyncio.wait_for(
                     asyncio.to_thread(

@@ -96,7 +96,7 @@ def test_obelisk_save_and_catalog():
 
     # Verify registration in SQLite assets catalog
     import sqlite3
-    db_path = settings.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
+    db_path = settings.sqlite_db_path
     with sqlite3.connect(db_path) as conn:
         cur = conn.cursor()
         cur.execute("SELECT name, layer, record_count FROM assets WHERE name = ?;", (gold_stem,))

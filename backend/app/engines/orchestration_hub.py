@@ -71,15 +71,18 @@ class OrchestrationHub:
         dagster_bp = get_blueprint("dagster")
         dagster_svc = services_map.get("dagster")
         dagster_status = "offline"
+        dagster_path = (dagster_bp.web_ui_path if dagster_bp and dagster_bp.web_ui_path else "/dagster").rstrip("/")
         dagster_url = None
         if dagster_svc:
             if dagster_svc.deployment_type == "remote":
                 dagster_status = (dagster_svc.status or "connected").lower()
-                dagster_url = f"http://{dagster_svc.host}:{dagster_svc.port or 3000}"
+                dagster_url = f"http://{dagster_svc.host}:{dagster_svc.port or 3000}{dagster_path}"
             else:
                 probe = await asyncio.to_thread(dagster_service.service_status)
                 dagster_status = "running" if probe["available"] else "stopped"
-                dagster_url = f"http://localhost:{dagster_svc.port or (dagster_bp.primary_host_port if dagster_bp else 3000)}"
+                # Relative gateway subpath: resolves against the current origin, so it
+                # works in local dev (Vite proxy) and behind Caddy on a remote host.
+                dagster_url = dagster_path
 
         engines.append(
             OrchestrationEngineInfo(
