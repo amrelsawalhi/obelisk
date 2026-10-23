@@ -46,6 +46,10 @@ from app.core.docker_manager import docker_mgr
 async def lifespan(app: FastAPI):
     # Initialize SQLite database and enforce WAL mode
     await init_db()
+    # Close out runs killed by the previous shutdown and reload recent history, so a
+    # restart no longer erases every job and dbt run (audit M3/H10).
+    from app.services.state import restore_task_history
+    await asyncio.to_thread(restore_task_history)
     from app.engines.cron_engine import cron_engine
     cron_engine.start()
     yield

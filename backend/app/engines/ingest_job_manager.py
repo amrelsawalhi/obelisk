@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 
 from app.engines.ingest_engine import ingest_engine
+from app.services.state import task_history
 
 
 @dataclass
@@ -50,6 +51,40 @@ class IngestJobManager:
         self._jobs: Dict[str, IngestJob] = {}
         self._subscribers: Dict[str, List[asyncio.Queue]] = defaultdict(list)
         self._lock = asyncio.Lock()
+        self._last_persist: Dict[str, float] = {}
+
+    def _persist(self, job: IngestJob) -> bool:
+        """Mirrors the job into task history (M3).
+
+        Throttled to once a second while running: progress arrives per log line, and
+        the point of this write is that a restart can reconstruct the job, not that it
+        captures every tick. Terminal states always land.
+        """
+        now = time.monotonic()
+        terminal = job.status != "running"
+        if not terminal and (now - self._last_persist.get(job.id, 0.0)) < 1.0:
+            return False
+        self._last_persist[job.id] = now
+        return task_history.record(
+            "ingest", job.id, job.status, job.started_at, job.to_dict()
+        )
+
+    def hydrate(self, limit: int = 50) -> int:
+        """Reloads recent jobs so history survives a restart.
+
+        Must run after ``mark_interrupted`` so nothing returns as still running.
+        """
+        restored = 0
+        for payload in task_history.recent("ingest", limit=limit):
+            job_id = payload.get("id")
+            if not job_id or job_id in self._jobs:
+                continue
+            try:
+                self._jobs[job_id] = IngestJob(**payload)
+            except TypeError:
+                continue
+            restored += 1
+        return restored
 
     def get_job(self, job_id: str) -> Optional[IngestJob]:
         return self._jobs.get(job_id)
@@ -95,6 +130,7 @@ class IngestJobManager:
             percent=0,
         )
         self._jobs[job_id] = job
+        self._persist(job)
         return job
 
     def append_log(self, job_id: str, message: str):
@@ -146,6 +182,8 @@ class IngestJobManager:
             done = job.completed_tables + job.failed_tables
             job.percent = min(100, int((done / job.total_tables) * 100))
 
+        self._persist(job)
+
         event_payload = json.dumps({
             "type": "progress",
             "percent": job.percent,
@@ -171,6 +209,7 @@ class IngestJobManager:
         job.is_cancelled = True
         job.status = "cancelled"
         job.completed_at = datetime.now(timezone.utc).isoformat()
+        self._persist(job)
         self.append_log(job_id, "⚠️ Ingestion cancelled by user. Terminating remaining operations...")
 
         event_payload = json.dumps({

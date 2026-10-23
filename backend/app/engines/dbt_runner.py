@@ -22,6 +22,7 @@ from app.config import settings
 from app.core.host_resolver import resolve_connection_host
 from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
+from app.services.state import task_history
 
 class DbtRunner:
     def __init__(self, dbt_project_dir: Optional[Path] = None):
@@ -32,6 +33,22 @@ class DbtRunner:
             self.dbt_project_dir = dbt_project_dir.resolve()
 
         self._runs_history: List[Dict[str, Any]] = []
+
+    def _record_run(self, run: Dict[str, Any]) -> None:
+        """Appends a run to the in-memory list *and* to durable task history (M3).
+
+        The list stays because the UI polls it at will; the table is what survives a
+        restart, which previously wiped every run.
+        """
+        self._runs_history.append(run)
+        run_id = str(run.get("run_id") or uuid.uuid4())
+        task_history.record(
+            "dbt",
+            run_id,
+            str(run.get("status") or "unknown"),
+            run.get("started_at"),
+            {**run, "run_id": run_id},
+        )
 
     def _ensure_core_bronze_tables(self) -> None:
         """
@@ -251,7 +268,7 @@ class DbtRunner:
                 "error": err_msg,
                 "logs": "\n".join(logs),
             }
-            self._runs_history.append(run_record)
+            self._record_run(run_record)
             return run_record
 
         # Step 2: dbt run with selector
@@ -272,7 +289,7 @@ class DbtRunner:
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "logs": "\n".join(logs),
             }
-            self._runs_history.append(run_data)
+            self._record_run(run_data)
             return run_data
 
         # Step 3: dbt test with selector
@@ -297,7 +314,7 @@ class DbtRunner:
             "dbt_test_duration": test_res["duration_seconds"],
             "logs": "\n".join(logs),
         }
-        self._runs_history.append(run_data)
+        self._record_run(run_data)
         return run_data
 
     def _discover_bronze_parquet(self) -> List[Path]:
@@ -410,6 +427,9 @@ class DbtRunner:
         }
 
     def get_runs_history(self) -> List[Dict[str, Any]]:
+        # After a restart the in-memory list is empty; the table is the record.
+        if not self._runs_history:
+            self._runs_history.extend(reversed(task_history.recent("dbt", limit=100)))
         return list(reversed(self._runs_history))
 
     def get_asset_graph(self, selector: Optional[str] = None) -> Dict[str, Any]:
