@@ -103,3 +103,7 @@ backend/scripts/test_duckdb_pg.py
 *~
 .DS_Store
 Thumbs.db
+
+# Internal Design Documents (working notes, not shipped with the platform)
+docs/architecture.md
+docs/implementation-plan.md
