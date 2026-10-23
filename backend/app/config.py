@@ -1,8 +1,23 @@
 import os
 import re
 from pathlib import Path
+from urllib.parse import unquote, urlparse
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+
+# Schemes that are recognised but cannot be served until the StorageProvider
+# seam lands (docs/architecture.md §7.1). They are rejected at startup instead
+# of being silently rewritten onto local disk.
+REMOTE_STORAGE_SCHEMES = frozenset(
+    {"s3", "gs", "gcs", "abfs", "abfss", "az", "azure", "http", "https"}
+)
+LOCAL_STORAGE_SCHEMES = frozenset({"", "file"})
+
+# Default path baked into the Docker image. It is remapped into the checkout
+# only when the host genuinely has no /data/lakehouse directory, so a real
+# bind mount at that path still wins.
+CONTAINER_LAKEHOUSE_PATH = "/data/lakehouse"
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -86,53 +101,88 @@ class Settings(BaseSettings):
     SPARK_REMOTE_URL: str | None = Field(default_factory=lambda: os.getenv("SPARK_REMOTE_URL", None))
 
     @property
-    def duckdb_storage_path(self) -> str:
-        """
-        DuckDB's read_parquet() and COPY do not accept the file:// URI scheme for local files.
-        Resolves local file:// URIs to the project's actual data/lakehouse directory on disk
-        (creating it if missing) and converts all Windows backslashes to forward slashes (.as_posix()),
-        while keeping s3://..., abfss://..., etc. intact.
-        """
-        uri = self.STORAGE_URI
-        if uri.startswith("file://"):
-            stripped = uri[len("file://"):]
-            # Normalize drive letters on Windows: /C:/path -> C:/path
-            if re.match(r"^/[a-zA-Z]:", stripped):
-                raw_path = stripped[1:]
-            else:
-                raw_path = stripped
+    def is_sqlite(self) -> bool:
+        """True when the brain is a SQLite file (the supported control-plane store)."""
+        return self.DATABASE_URL.startswith(("sqlite+aiosqlite:///", "sqlite:///"))
 
-            clean_raw = raw_path.rstrip("/\\").replace("\\", "/")
-            project_root = Path(__file__).resolve().parent.parent.parent
-            if clean_raw in ("/data/lakehouse", "data/lakehouse") or clean_raw.endswith("data/lakehouse"):
-                target_dir = project_root / "data" / "lakehouse"
-            elif "data/lakehouse/" in clean_raw:
-                # Retain whatever sub-tier directory was configured under data/lakehouse
-                # (e.g. bronze, silver, raw, landing, analytics, ...) instead of forcing
-                # a hardcoded medallion structure.
-                sub_tier = clean_raw.split("data/lakehouse/")[-1]
-                target_dir = project_root / "data" / "lakehouse" / sub_tier
-            else:
-                target_dir = Path(raw_path)
+    @property
+    def storage_scheme(self) -> str:
+        """Lower-cased scheme of STORAGE_URI ('file' when the URI has none)."""
+        return (urlparse(self.STORAGE_URI).scheme or "file").lower()
 
-            target_dir.mkdir(parents=True, exist_ok=True)
-            return target_dir.resolve().as_posix()
-        return uri
+    def validate_storage_uri(self) -> None:
+        """Fails fast on a STORAGE_URI this build cannot actually serve.
+
+        Object-store writes are not implemented yet (see the StorageProvider
+        seam). Previously an s3:// URI was silently rewritten onto local disk
+        while s3:// paths were recorded in the catalog, so ingestion reported
+        success while nothing reached the bucket.
+        """
+        scheme = self.storage_scheme
+        if scheme in REMOTE_STORAGE_SCHEMES:
+            raise RuntimeError(
+                f"STORAGE_URI={self.STORAGE_URI!r} uses the '{scheme}://' scheme, which is not "
+                "implemented yet. Obelisk currently writes to the local filesystem only. "
+                "Use a file:// URI or an absolute directory path."
+            )
+        if scheme not in LOCAL_STORAGE_SCHEMES:
+            raise RuntimeError(
+                f"STORAGE_URI={self.STORAGE_URI!r} uses an unsupported scheme '{scheme}://'. "
+                "Use a file:// URI or an absolute directory path."
+            )
 
     @property
     def lakehouse_root_path(self) -> Path:
+        """Absolute local directory that backs the lakehouse.
+
+        Resolution is strict: the scheme decides what happens and nothing is
+        guessed from substrings. A remote scheme raises instead of quietly
+        pointing at local disk, and the container default
+        ``file:///data/lakehouse`` is remapped into the checkout only when the
+        host has no such directory.
         """
-        Resolves the root data/lakehouse directory on the local filesystem.
-        """
-        path_str = self.duckdb_storage_path
-        if path_str.startswith(("s3://", "gs://", "abfss://", "http://", "https://")):
-            project_root = Path(__file__).resolve().parent.parent.parent
-            target = project_root / "data" / "lakehouse"
-            target.mkdir(parents=True, exist_ok=True)
-            return target
-        target = Path(path_str)
-        target.mkdir(parents=True, exist_ok=True)
-        return target
+        self.validate_storage_uri()
+        project_root = Path(__file__).resolve().parent.parent.parent
+        parsed = urlparse(self.STORAGE_URI)
+
+        if parsed.scheme.lower() == "file":
+            if parsed.netloc and parsed.netloc.lower() not in ("", "localhost"):
+                raw = f"//{parsed.netloc}{unquote(parsed.path)}"  # UNC share
+            else:
+                raw = unquote(parsed.path)
+                # Windows drive letter: /C:/data -> C:/data
+                if re.match(r"^/[a-zA-Z]:", raw):
+                    raw = raw[1:]
+        else:
+            raw = self.STORAGE_URI.strip()
+
+        if ".." in Path(raw).parts:
+            raise RuntimeError(
+                f"STORAGE_URI={self.STORAGE_URI!r} contains a '..' segment; the lakehouse "
+                "root must be an explicit, stable directory."
+            )
+
+        # Container default -> checkout, but only when the host has no such
+        # directory (a real bind mount must win).
+        normalised = raw.replace("\\", "/").rstrip("/")
+        if normalised == CONTAINER_LAKEHOUSE_PATH or normalised.startswith(CONTAINER_LAKEHOUSE_PATH + "/"):
+            if not Path(CONTAINER_LAKEHOUSE_PATH).exists():
+                suffix = normalised[len(CONTAINER_LAKEHOUSE_PATH):].strip("/")
+                raw = str(project_root / "data" / "lakehouse")
+                if suffix:
+                    raw = str(Path(raw) / suffix)
+
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = project_root / candidate
+        candidate = Path(os.path.normpath(str(candidate)))
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate.resolve()
+
+    @property
+    def duckdb_storage_path(self) -> str:
+        """POSIX string form of :attr:`lakehouse_root_path` for DuckDB."""
+        return self.lakehouse_root_path.as_posix()
 
     @property
     def git_repo_path(self) -> Path:

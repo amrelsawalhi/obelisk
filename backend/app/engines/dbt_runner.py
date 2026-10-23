@@ -34,11 +34,12 @@ class DbtRunner:
 
     def _ensure_core_bronze_tables(self) -> None:
         """
-        Ensures orders.parquet and customers.parquet exist in Bronze lakehouse
-        so dbt models never fail on missing relations.
+        Ensures orders.parquet and customers.parquet exist in the lakehouse
+        landing root so dbt models never fail on missing relations.
         """
-        storage_path = Path(settings.duckdb_storage_path)
-        storage_path.mkdir(parents=True, exist_ok=True)
+        # lakehouse_root_path creates the directory and rejects remote schemes;
+        # no local mkdir logic belongs here (audit B1).
+        storage_path = settings.lakehouse_root_path
 
         orders_file = storage_path / "orders.parquet"
         if not orders_file.exists():
@@ -299,7 +300,7 @@ class DbtRunner:
         medallion location, whereas the storage root only holds the seed
         fallbacks written by _ensure_core_bronze_tables().
         """
-        storage_path = Path(settings.duckdb_storage_path)
+        storage_path = settings.lakehouse_root_path
         if not storage_path.exists():
             return []
 

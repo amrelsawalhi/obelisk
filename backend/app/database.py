@@ -19,7 +19,7 @@ def _resolve_engine_url() -> str:
     against each process's own cwd, producing split-brain empty databases.
     """
     url = settings.DATABASE_URL
-    if url.startswith("sqlite+aiosqlite:///"):
+    if settings.is_sqlite:
         sqlite_path = settings.sqlite_db_path
         Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
         return f"sqlite+aiosqlite:///{sqlite_path}"
@@ -129,7 +129,7 @@ async def _migrate_assets_unique_constraint(conn) -> None:
     rebuilt and its rows copied over. Idempotent: a database that already has the
     composite key (including every freshly created one) is left untouched.
     """
-    if not settings.DATABASE_URL.startswith("sqlite+aiosqlite:///"):
+    if not settings.is_sqlite:
         return
 
     index_rows = (await conn.exec_driver_sql("PRAGMA index_list('assets')")).fetchall()
@@ -173,7 +173,7 @@ async def _migrate_assets_unique_constraint(conn) -> None:
 async def init_db() -> None:
     """Initialize database tables and enforce WAL mode."""
     # Ensure directory exists
-    if settings.DATABASE_URL.startswith("sqlite+aiosqlite:///"):
+    if settings.is_sqlite:
         path_str = settings.sqlite_db_path
         Path(path_str).parent.mkdir(parents=True, exist_ok=True)
 

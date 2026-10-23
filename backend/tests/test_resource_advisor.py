@@ -129,21 +129,29 @@ def test_sqlite_wal_proof():
         raw_conn.close()
 
 def test_storage_uri_normalization():
-    """Verifies duckdb_storage_path property properly normalizes URIs."""
-    # Local file:// scheme resolution with forward slashes
-    settings.STORAGE_URI = "file:///data/lakehouse/bronze"
-    storage_path = settings.duckdb_storage_path
-    assert storage_path.endswith("data/lakehouse/bronze")
-    assert "\\" not in storage_path
-    assert os.path.exists(storage_path)
+    """Verifies STORAGE_URI resolution: local paths resolve, remote schemes fail.
 
-    # Remote S3 scheme intact
-    settings.STORAGE_URI = "s3://enterprise-lake/bronze"
-    assert settings.duckdb_storage_path == "s3://enterprise-lake/bronze"
+    Remote schemes used to be returned verbatim from duckdb_storage_path while
+    every writer silently wrote to local disk (audit B1). They are now rejected
+    at resolution time instead of being passed through to Path()/os.replace().
+    """
+    original = settings.STORAGE_URI
+    try:
+        # Local file:// scheme resolution with forward slashes
+        settings.STORAGE_URI = "file:///data/lakehouse/bronze"
+        storage_path = settings.duckdb_storage_path
+        assert storage_path.endswith("data/lakehouse/bronze")
+        assert "\\" not in storage_path
+        assert os.path.exists(storage_path)
 
-    # Remote Azure scheme intact
-    settings.STORAGE_URI = "abfss://lake@account.dfs.core.windows.net/bronze"
-    assert settings.duckdb_storage_path == "abfss://lake@account.dfs.core.windows.net/bronze"
+        # Remote S3 scheme is refused, not passed through
+        settings.STORAGE_URI = "s3://enterprise-lake/bronze"
+        with pytest.raises(RuntimeError, match="not implemented yet"):
+            _ = settings.duckdb_storage_path
 
-    # Reset
-    settings.STORAGE_URI = "file:///data/lakehouse/bronze"
+        # Remote Azure scheme is refused too
+        settings.STORAGE_URI = "abfss://lake@account.dfs.core.windows.net/bronze"
+        with pytest.raises(RuntimeError, match="not implemented yet"):
+            _ = settings.duckdb_storage_path
+    finally:
+        settings.STORAGE_URI = original

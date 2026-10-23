@@ -30,11 +30,13 @@ class DuckDBEngine:
         self._ensure_storage()
 
     def _ensure_storage(self) -> str:
-        storage_path = settings.duckdb_storage_path
-        # Guard local directory creation against remote cloud URIs
-        if not settings.STORAGE_URI.startswith(("s3://", "gs://", "abfss://")):
-            Path(storage_path).mkdir(parents=True, exist_ok=True)
-        return storage_path
+        """Returns the resolved lakehouse root.
+
+        Path resolution (and the remote-scheme rejection) lives in Settings so
+        every caller agrees on a single answer; this method no longer re-derives
+        it from the raw URI (audit B1).
+        """
+        return settings.duckdb_storage_path
 
     def get_connection(self) -> duckdb.DuckDBPyConnection:
         """
