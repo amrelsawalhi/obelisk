@@ -1,4 +1,3 @@
-{{ config(materialized='table', schema='gold') }}
 
 -- Curated analytical fact mart enriching transactions with customer demographics
 select

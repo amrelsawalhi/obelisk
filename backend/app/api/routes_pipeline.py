@@ -26,7 +26,7 @@ class TriggerPipelineRequest(BaseModel):
     )
     table_names: Optional[List[str]] = Field(
         default=None,
-        description="Optional list of Bronze Parquet table stems to sync and transform."
+        description="Optional list of table stems to copy from the landing layer and transform."
     )
     selector: Optional[str] = Field(
         default=None,
@@ -117,11 +117,11 @@ async def get_medallion_asset_graph(selector: Optional[str] = None):
 @router.post("/run")
 async def trigger_pipeline_run(req: Optional[TriggerPipelineRequest] = None):
     """
-    Triggers an end-to-end Medallion transformation pipeline:
-    1. Stages Bronze Parquet files to PostgreSQL 'bronze' schema via DuckDB C++ COPY.
+    Triggers an end-to-end transformation pipeline:
+    1. Copies the landing layer's Parquet files into that layer's warehouse schema.
     2. Runs dbt models matching the specified selector (or all models).
     3. Runs dbt tests matching the selector.
-    4. Updates SQLite assets catalog.
+    4. Updates the SQLite catalog.
     """
     pg_params = req.postgres_params if req and req.postgres_params else None
     table_names = req.table_names if req else None
@@ -149,7 +149,7 @@ async def trigger_pipeline_run(req: Optional[TriggerPipelineRequest] = None):
 
 
 class SaveModelRequest(BaseModel):
-    layer: str = Field(..., description="Target layer: 'silver' (staging) or 'gold' (marts)")
+    layer: str = Field(..., description="Target layer path, e.g. 'raw' or 'marts.sales'")
     name: str = Field(..., description="Model name (e.g. stg_orders or fct_revenue)")
     sql: str = Field(..., description="SQL Jinja model code")
 

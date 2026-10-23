@@ -31,12 +31,12 @@ async def test_dbt_studio_file_lifecycle_and_compile():
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         rel_path = "models/staging/stg_test_unit.sql"
         content = (
-            "{{ config(materialized='view', schema='silver') }}\n\n"
+            "{{ config(materialized='view', schema=var('layer_staging')) }}\n\n"
             "select\n"
             "    order_id,\n"
             "    customer_id,\n"
             "    amount\n"
-            "from {{ source('bronze', 'orders') }}\n"
+            "from {{ source('landing', 'orders') }}\n"
             "where amount > 0\n"
         )
 

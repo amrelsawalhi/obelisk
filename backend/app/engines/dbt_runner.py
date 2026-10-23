@@ -1,9 +1,14 @@
 """
-dbt Runner & Medallion Pipeline Engine:
-- Stages Bronze Parquet files into PostgreSQL warehouse (bronze schema) via DuckDB C++ COPY
+dbt Runner & Pipeline Engine:
+- Stages landing Parquet files into the PostgreSQL warehouse, one schema per layer
 - Executes dbt run and dbt test via python -m dbt.cli.main
-- Exposes full Medallion asset graph (Bronze -> Silver -> Gold)
-- Tracks pipeline run history and registers Silver/Gold assets in SQLite catalog
+- Exposes the model graph with node ids keyed by the layer each model targets
+- Tracks pipeline run history and registers the transformed models in SQLite
+
+Which warehouse schema a model lands in comes from the layer it targets, never from
+the folder it sits in: the project declares two configurable slots (staging, marts),
+Obelisk resolves each slot's layer path to a schema and passes the mapping to dbt, and
+a `generate_schema_name` macro applies it. Rename a layer and the pipeline follows.
 """
 
 import os
@@ -20,8 +25,10 @@ from typing import Dict, Any, List, Optional
 import duckdb
 from app.config import settings
 from app.core.host_resolver import resolve_connection_host
-from app.core.dsn import build_pg_dsn, sql_string, validate_alias
+from app.core.dsn import build_pg_dsn, sql_ident, sql_string, validate_alias
+from app.core.layers import InvalidLayerPath, LayerLocation, resolve_layer
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
+from app.services.layers import default_layer_path, layer_paths, layer_schemas
 from app.services.state import task_history
 
 class DbtRunner:
@@ -50,16 +57,65 @@ class DbtRunner:
             {**run, "run_id": run_id},
         )
 
-    def _ensure_core_bronze_tables(self) -> None:
+    def _dbt_layer_vars(self) -> Dict[str, str]:
+        """Layer paths the bundled project writes to, read from its own ``vars`` block.
+
+        ``staging`` and ``marts`` are folder names in the project; the layer each one
+        targets is configuration, so repointing or renaming a layer never needs a code
+        change.
         """
-        Ensures orders.parquet and customers.parquet exist in the lakehouse
-        landing root so dbt models never fail on missing relations.
+        project_file = self.dbt_project_dir / "dbt_project.yml"
+        try:
+            import yaml
+
+            document = yaml.safe_load(project_file.read_text(encoding="utf-8")) or {}
+        except Exception:
+            document = {}
+
+        variables = document.get("vars") or {}
+        if isinstance(variables, dict) and "obelisk_dbt" in variables:
+            variables = variables["obelisk_dbt"] or {}
+
+        return {
+            "staging": str(variables.get("layer_staging") or "raw"),
+            "marts": str(variables.get("layer_marts") or "marts"),
+        }
+
+    def _dbt_vars_payload(self) -> Dict[str, Any]:
+        """The ``--vars`` payload: which layer each folder targets, and how paths flatten.
+
+        Every known layer is included so a model can target any of them, and the paths
+        the project itself declares are included even when no layer row exists yet —
+        that way a dotted path still resolves to its flattened schema instead of
+        silently becoming a schema with a dot in its name.
+        """
+        targets = self._dbt_layer_vars()
+        mapping = layer_schemas()
+        for path in targets.values():
+            try:
+                mapping.setdefault(path, resolve_layer(path).warehouse_schema)
+            except InvalidLayerPath:
+                continue
+        return {
+            "layer_staging": targets["staging"],
+            "layer_marts": targets["marts"],
+            "layer_schemas": mapping,
+        }
+
+    def _ensure_core_layer_tables(self, location: LayerLocation) -> None:
+        """Seeds two demo tables into a layer that holds no data yet.
+
+        The shipped models reference ``orders`` and ``customers``. On a fresh install
+        there is nothing to read, and a pipeline that dies on a missing relation is a
+        worse first run than one that works on sample data. Only called for an empty
+        layer, so it can never shadow real tables.
         """
         # lakehouse_root_path creates the directory and rejects remote schemes;
         # no local mkdir logic belongs here (audit B1).
-        storage_path = settings.lakehouse_root_path
+        directory = location.filesystem_dir
+        directory.mkdir(parents=True, exist_ok=True)
 
-        orders_file = storage_path / "orders.parquet"
+        orders_file = directory / "orders.parquet"
         if not orders_file.exists():
             import pyarrow as pa
             import pyarrow.parquet as pq
@@ -79,7 +135,7 @@ class DbtRunner:
             }
             pq.write_table(pa.Table.from_pydict(orders_data), orders_file, compression="SNAPPY")
 
-        customers_file = storage_path / "customers.parquet"
+        customers_file = directory / "customers.parquet"
         if not customers_file.exists():
             import pyarrow as pa
             import pyarrow.parquet as pq
@@ -92,16 +148,98 @@ class DbtRunner:
             }
             pq.write_table(pa.Table.from_pydict(customers_data), customers_file, compression="SNAPPY")
 
-    def sync_bronze_to_postgres(
+        # The project's two "enterprise" models read these, so a fresh install needs
+        # them too — otherwise a default run fails on a missing relation.
+        ecommerce_orders_file = directory / "ecommerce_orders.parquet"
+        if not ecommerce_orders_file.exists():
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            orders_data = {
+                "order_id": pa.array([9001, 9002], type=pa.int64()),
+                "order_uuid": pa.array(
+                    [
+                        "11111111-1111-1111-1111-111111111111",
+                        "22222222-2222-2222-2222-222222222222",
+                    ],
+                    type=pa.string(),
+                ),
+                "customer_id": pa.array(
+                    [
+                        "33333333-3333-3333-3333-333333333333",
+                        "44444444-4444-4444-4444-444444444444",
+                    ],
+                    type=pa.string(),
+                ),
+                "order_status": pa.array(["paid", "pending"], type=pa.string()),
+                "currency": pa.array(["EUR", "USD"], type=pa.string()),
+                "subtotal_amount": pa.array([100.0, 40.0], type=pa.float64()),
+                "tax_amount": pa.array([19.0, 4.0], type=pa.float64()),
+                "discount_amount": pa.array([0.0, 5.0], type=pa.float64()),
+                "total_amount": pa.array([119.0, 39.0], type=pa.float64()),
+                "order_placed_at": pa.array(
+                    ["2026-01-15 10:00:00+00", "2026-01-16 11:30:00+00"], type=pa.string()
+                ),
+                "shipping_address": pa.array(
+                    [
+                        '{"city": "Berlin", "street": "Main 1", "is_commercial": false}',
+                        '{"city": "Austin", "street": "Oak 7", "is_commercial": true}',
+                    ],
+                    type=pa.string(),
+                ),
+            }
+            pq.write_table(
+                pa.Table.from_pydict(orders_data), ecommerce_orders_file, compression="SNAPPY"
+            )
+
+        ecommerce_customers_file = directory / "ecommerce_customers.parquet"
+        if not ecommerce_customers_file.exists():
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            ecommerce_customers_data = {
+                "customer_id": pa.array(
+                    [
+                        "33333333-3333-3333-3333-333333333333",
+                        "44444444-4444-4444-4444-444444444444",
+                    ],
+                    type=pa.string(),
+                ),
+                "first_name": pa.array(["Ada", "Grace"], type=pa.string()),
+                "last_name": pa.array(["Lovelace", "Hopper"], type=pa.string()),
+                "email": pa.array(["ada@example.com", "grace@example.com"], type=pa.string()),
+                "tier": pa.array(["Platinum", "Standard"], type=pa.string()),
+                "country_code": pa.array(["DEU", "USA"], type=pa.string()),
+                "signup_timestamp": pa.array(
+                    ["2026-01-01 09:00:00+00", "2026-01-02 09:00:00+00"], type=pa.string()
+                ),
+                "metadata_json": pa.array(
+                    [
+                        '{"referral_source": "search", "preferred_channel": "email", "vip_flag": true}',
+                        '{"referral_source": "direct", "preferred_channel": "phone", "vip_flag": false}',
+                    ],
+                    type=pa.string(),
+                ),
+            }
+            pq.write_table(
+                pa.Table.from_pydict(ecommerce_customers_data),
+                ecommerce_customers_file,
+                compression="SNAPPY",
+            )
+
+    def sync_layer_to_postgres(
         self,
         postgres_params: Dict[str, Any],
         table_names: Optional[List[str]] = None,
+        layer_path: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Copies one layer's Parquet files into that layer's warehouse schema.
+
+        The schema comes from the layer path (``marts.sales`` -> ``marts__sales``) and
+        the files come from that same layer's directory, so a layer is the single thing
+        that decides where its data lives.
         """
-        Synchronizes Bronze Snappy Parquet files into the PostgreSQL warehouse 'bronze' schema
-        using DuckDB's native PostgreSQL attachment and high-speed COPY.
-        """
-        self._ensure_core_bronze_tables()
+        location = resolve_layer(layer_path or default_layer_path())
         port = int(postgres_params["port"])
         host = resolve_connection_host(postgres_params["host"], port)
         database = postgres_params["database"]
@@ -109,16 +247,27 @@ class DbtRunner:
         password = postgres_params["password"]
         sslmode = postgres_params.get("sslmode", "disable")
 
-        # Find parquet files to sync. Bronze tables are discovered whether
-        # STORAGE_URI points at data/lakehouse or data/lakehouse/bronze.
-        all_parquet = self._discover_bronze_parquet()
+        all_parquet = self._discover_layer_parquet(location)
+        if not all_parquet:
+            # Nothing to copy and nothing to overwrite: seed sample tables so the
+            # shipped models have something to read on a fresh install.
+            self._ensure_core_layer_tables(location)
+            all_parquet = self._discover_layer_parquet(location)
         if table_names:
             target_files = [f for f in all_parquet if f.stem in table_names]
         else:
             target_files = all_parquet
 
         if not target_files:
-            return {"synced_tables": 0, "tables": []}
+            return {
+                "status": "success",
+                "layer": location.path,
+                "schema": location.warehouse_schema,
+                "synced_tables": 0,
+                "tables": [],
+            }
+
+        schema = sql_ident(location.warehouse_schema)
 
         conn = duckdb.connect(":memory:")
         synced_info = []
@@ -137,20 +286,20 @@ class DbtRunner:
             alias = validate_alias(f"pg_sync_{uuid.uuid4().hex[:6]}")
             conn.execute(f"ATTACH {sql_string(conn_str)} AS {alias} (TYPE POSTGRES);")
 
-            # Ensure bronze schema exists in PostgreSQL
-            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.bronze;")
+            # The layer's own schema, created on first use.
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{schema};")
 
             for pf in target_files:
                 table_name = pf.stem
                 posix_src = pf.resolve().as_posix()
                 query = f"""
-                    CREATE OR REPLACE TABLE {alias}.bronze."{table_name}" AS
+                    CREATE OR REPLACE TABLE {alias}.{schema}."{table_name}" AS
                     SELECT * FROM read_parquet('{posix_src}');
                 """
                 conn.execute(query)
 
                 # Get row count
-                cnt_row = conn.execute(f'SELECT COUNT(*) FROM {alias}.bronze."{table_name}";').fetchone()
+                cnt_row = conn.execute(f'SELECT COUNT(*) FROM {alias}.{schema}."{table_name}";').fetchone()
                 cnt = cnt_row[0] if cnt_row else 0
                 synced_info.append({"table": table_name, "rows": cnt})
 
@@ -160,6 +309,8 @@ class DbtRunner:
 
         return {
             "status": "success",
+            "layer": location.path,
+            "schema": location.warehouse_schema,
             "synced_tables": len(synced_info),
             "tables": synced_info,
         }
@@ -169,10 +320,14 @@ class DbtRunner:
         command: str = "run",
         env_vars: Optional[Dict[str, str]] = None,
         select: Optional[str] = None,
+        dbt_vars: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Executes a dbt command (run, test, seed, compile) inside the dbt_project directory.
         Captures full terminal output and execution metrics.
+
+        ``dbt_vars`` carries the layer → schema mapping, so the project never has to
+        know which schema a layer resolves to.
         """
         cmd = [
             sys.executable,
@@ -186,6 +341,8 @@ class DbtRunner:
         ]
         if select:
             cmd.extend(["--select", select])
+        if dbt_vars:
+            cmd.extend(["--vars", json.dumps(dbt_vars)])
 
         env = os.environ.copy()
         if env_vars:
@@ -223,11 +380,11 @@ class DbtRunner:
         pipeline_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Executes an end-to-end Medallion pipeline run:
-        1. Syncs Bronze Parquet files to PostgreSQL bronze schema
-        2. Executes scoped dbt run (materializing models matching selector)
-        3. Executes scoped dbt test (validating schema and business tests)
-        4. Registers transformed Silver and Gold assets into the SQLite catalog
+        Runs the pipeline end to end:
+        1. Copies the landing layer's Parquet files into that layer's warehouse schema
+        2. Runs the selected dbt models, each into the schema its layer resolves to
+        3. Runs the dbt tests
+        4. Registers the materialised models in the catalog
         """
         run_id = str(uuid.uuid4())
         now_dt = datetime.now(timezone.utc)
@@ -248,18 +405,32 @@ class DbtRunner:
             "DBT_PG_SSLMODE": str(postgres_params.get("sslmode", "disable")),
         }
 
-        # Step 1: Bronze Staging Sync
-        logs.append(f"[{time_str}] Step 1/3: Staging Bronze Parquet tables to PostgreSQL 'bronze' schema...")
+        dbt_vars = self._dbt_vars_payload()
+        staging_layer = dbt_vars["layer_staging"]
+        staging_schema = dbt_vars["layer_schemas"].get(staging_layer, staging_layer)
+
+        # Step 1: copy the landing layer into its schema
+        logs.append(
+            f"[{time_str}] Step 1/3: Copying layer '{staging_layer}' into warehouse "
+            f"schema '{staging_schema}'..."
+        )
         try:
-            sync_res = self.sync_bronze_to_postgres(postgres_params=postgres_params, table_names=table_names)
+            sync_res = self.sync_layer_to_postgres(
+                postgres_params=postgres_params,
+                table_names=table_names,
+                layer_path=staging_layer,
+            )
             tbl_summary = ", ".join([f"{t['table']} ({t['rows']} rows)" for t in sync_res.get("tables", [])])
             logs.append(f"[{time_str}] Synced {sync_res['synced_tables']} tables to warehouse: {tbl_summary}")
         except Exception as e:
-            err_msg = f"Failed to sync Bronze to PostgreSQL warehouse at {host}:{port}: {str(e)}"
+            err_msg = (
+                f"Failed to copy layer '{staging_layer}' into the warehouse at "
+                f"{host}:{port}: {str(e)}"
+            )
             logs.append(f"[{time_str}] ERROR: {err_msg}")
             run_record = {
                 "run_id": run_id,
-                "pipeline_name": pipeline_name or "Full Medallion Pipeline",
+                "pipeline_name": pipeline_name or "Full pipeline",
                 "selector": selector or "*",
                 "started_at": started_at,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -274,14 +445,22 @@ class DbtRunner:
         # Step 2: dbt run with selector
         dbt_select = selector if selector and selector != "*" else None
         select_display = f" (selector: '{dbt_select}')" if dbt_select else " (all models)"
-        logs.append(f"\nStep 2/3: Executing dbt run{select_display} (transforming to Silver & Gold schemas)...")
-        run_res = self.run_dbt(command="run", env_vars=env_vars, select=dbt_select)
+        target_layers = ", ".join(
+            f"'{self._dbt_layer_vars()[slot]}'" for slot in ("staging", "marts")
+        )
+        logs.append(
+            f"\nStep 2/3: Executing dbt run{select_display} "
+            f"(writing to layers {target_layers})..."
+        )
+        run_res = self.run_dbt(
+            command="run", env_vars=env_vars, select=dbt_select, dbt_vars=dbt_vars
+        )
         logs.append(run_res["output"])
 
         if not run_res["success"]:
             run_data = {
                 "run_id": run_id,
-                "pipeline_name": pipeline_name or "Full Medallion Pipeline",
+                "pipeline_name": pipeline_name or "Full pipeline",
                 "selector": selector or "*",
                 "status": "failed",
                 "failed_step": "dbt_run",
@@ -294,17 +473,19 @@ class DbtRunner:
 
         # Step 3: dbt test with selector
         logs.append(f"\nStep 3/3: Executing dbt test{select_display} (enforcing constraints & tests)...")
-        test_res = self.run_dbt(command="test", env_vars=env_vars, select=dbt_select)
+        test_res = self.run_dbt(
+            command="test", env_vars=env_vars, select=dbt_select, dbt_vars=dbt_vars
+        )
         logs.append(test_res["output"])
 
         status = "success" if test_res["success"] else "test_failure"
 
-        # Step 4: Register Silver & Gold models in SQLite catalog
+        # Step 4: register the materialised models in the catalog
         self._catalog_dbt_models()
 
         run_data = {
             "run_id": run_id,
-            "pipeline_name": pipeline_name or "Full Medallion Pipeline",
+            "pipeline_name": pipeline_name or "Full pipeline",
             "selector": selector or "*",
             "status": status,
             "started_at": started_at,
@@ -317,24 +498,19 @@ class DbtRunner:
         self._record_run(run_data)
         return run_data
 
-    def _discover_bronze_parquet(self) -> List[Path]:
-        """Finds Bronze Parquet files on disk, de-duplicated by table name.
+    def _discover_layer_parquet(self, location: Optional[LayerLocation] = None) -> List[Path]:
+        """Finds the Parquet files that belong to one layer.
 
-        STORAGE_URI may point at data/lakehouse (tables live in the bronze/
-        subfolder) or straight at data/lakehouse/bronze, so both locations are
-        scanned. The bronze/ tier wins on a stem collision: it is the canonical
-        medallion location, whereas the storage root only holds the seed
-        fallbacks written by _ensure_core_bronze_tables().
+        The layer's own directory is authoritative, but the lakehouse root is scanned
+        too: installs that predate layers wrote their tables straight there. On a stem
+        collision the layer directory wins.
         """
-        storage_path = settings.lakehouse_root_path
-        if not storage_path.exists():
-            return []
-
+        location = location or resolve_layer(default_layer_path())
         found: Dict[str, Path] = {}
-        for tier_dir in (storage_path / "bronze", storage_path):
-            if not tier_dir.is_dir():
+        for directory in (location.filesystem_dir, settings.lakehouse_root_path):
+            if not directory.is_dir():
                 continue
-            for parquet in sorted(tier_dir.glob("*.parquet")):
+            for parquet in sorted(directory.glob("*.parquet")):
                 found.setdefault(parquet.stem, parquet)
         return list(found.values())
 
@@ -355,23 +531,29 @@ class DbtRunner:
         }
 
     def _catalog_dbt_models(self) -> None:
-        """Registers every dbt model found on disk into the SQLite assets table.
+        """Registers every dbt model found on disk in the SQLite catalog.
 
-        Models are discovered dynamically (staging -> silver, marts -> gold) so
-        user-authored .sql files get catalogued too; this used to hardcode 4 of
-        the 9 shipped models.
+        A model's layer is whatever its folder is configured to write to, resolved the
+        same way dbt resolves it, so the catalog and the warehouse cannot disagree
+        about where a model landed.
         """
         db_path = settings.sqlite_db_path
         now_iso = datetime.now(timezone.utc).isoformat()
         descriptions = self._dbt_model_descriptions()
 
         models: List[Dict[str, str]] = []
-        for subdir, layer in (("staging", "silver"), ("marts", "gold")):
-            models_dir = self.dbt_project_dir / "models" / subdir
+        for folder, layer_path in self._dbt_layer_vars().items():
+            models_dir = self.dbt_project_dir / "models" / folder
             if not models_dir.exists():
                 continue
+            try:
+                schema = resolve_layer(layer_path).warehouse_schema
+            except InvalidLayerPath:
+                schema = layer_path
             for sql_file in sorted(models_dir.glob("*.sql")):
-                models.append({"name": sql_file.stem, "layer": layer})
+                models.append(
+                    {"name": sql_file.stem, "layer": layer_path, "schema": schema}
+                )
 
         try:
             with sqlite3.connect(db_path, timeout=10.0) as conn:
@@ -393,7 +575,7 @@ class DbtRunner:
                             asset_id,
                             m["name"],
                             m["layer"],
-                            f"postgresql:///{m['layer']}.{m['name']}",
+                            f"postgresql:///{m['schema']}.{m['name']}",
                             json.dumps({"description": descriptions.get(m["name"], "")}),
                             now_iso,
                             now_iso,
@@ -403,9 +585,18 @@ class DbtRunner:
         except Exception:
             pass
 
+    def _folder_for_layer(self, layer: str) -> str:
+        """Maps a layer path onto the project folder configured to write to it."""
+        wanted = (layer or "").strip()
+        targets = self._dbt_layer_vars()
+        for folder in ("marts", "staging"):
+            if wanted == targets[folder]:
+                return folder
+        return "marts"
+
     def get_model_code(self, layer: str, name: str) -> Optional[str]:
         """Reads SQL source code of a dbt model from git_repo/dbt_project/models/."""
-        target_dir = "staging" if layer.lower() == "silver" else "marts"
+        target_dir = self._folder_for_layer(layer)
         file_path = self.dbt_project_dir / "models" / target_dir / f"{name}.sql"
         if file_path.exists():
             return file_path.read_text(encoding="utf-8")
@@ -414,7 +605,7 @@ class DbtRunner:
     def save_model_code(self, layer: str, name: str, sql: str) -> Dict[str, Any]:
         """Saves or creates a dbt SQL transformation model on disk."""
         clean_name = name.lower().strip().replace(".sql", "")
-        target_dir = "staging" if layer.lower() == "silver" else "marts"
+        target_dir = self._folder_for_layer(layer)
         dir_path = self.dbt_project_dir / "models" / target_dir
         dir_path.mkdir(parents=True, exist_ok=True)
         file_path = dir_path / f"{clean_name}.sql"
@@ -433,69 +624,75 @@ class DbtRunner:
         return list(reversed(self._runs_history))
 
     def get_asset_graph(self, selector: Optional[str] = None) -> Dict[str, Any]:
-        """Dynamically parses and returns the full Medallion lineage graph from disk, optionally filtered by pipeline selector."""
+        """Builds the lineage graph from what is on disk, keyed by layer path.
+
+        Node ids are ``<layer>.<model>`` using the layer each folder is configured to
+        target, so a graph node always points at the schema the model actually landed
+        in — whatever the workspace decided to call its layers.
+        """
         import re
-        bronze_nodes = []
-        for f in self._discover_bronze_parquet():
-            bronze_nodes.append({
-                "id": f"bronze.{f.stem}",
+
+        targets = self._dbt_layer_vars()
+        staging_layer = targets["staging"]
+        marts_layer = targets["marts"]
+
+        nodes: List[Dict[str, Any]] = []
+        edges: List[Dict[str, str]] = []
+        node_map: Dict[str, str] = {}
+
+        try:
+            landing = resolve_layer(staging_layer)
+        except InvalidLayerPath:
+            landing = None
+
+        for f in self._discover_layer_parquet(landing):
+            node_id = f"{staging_layer}.{f.stem}"
+            node_map.setdefault(f.stem, node_id)
+            nodes.append({
+                "id": node_id,
                 "name": f.stem,
-                "layer": "bronze",
+                "layer": staging_layer,
                 "type": "parquet",
                 "path": f.as_posix(),
             })
 
-        silver_nodes = []
-        gold_nodes = []
-        edges = []
-        node_map = {n["name"]: n["id"] for n in bronze_nodes}
-
-        # 1. Dynamically scan Silver staging models
-        staging_dir = self.dbt_project_dir / "models" / "staging"
-        if staging_dir.exists():
-            for sql_file in staging_dir.glob("*.sql"):
+        # 1 & 2. Scan the project's model folders, in dependency order
+        for folder, layer_path, node_type in (
+            ("staging", staging_layer, "dbt_model"),
+            ("marts", marts_layer, "dbt_mart"),
+        ):
+            models_dir = self.dbt_project_dir / "models" / folder
+            if not models_dir.exists():
+                continue
+            for sql_file in sorted(models_dir.glob("*.sql")):
                 model_name = sql_file.stem
-                node_id = f"silver.{model_name}"
+                node_id = f"{layer_path}.{model_name}"
                 node_map[model_name] = node_id
                 code = sql_file.read_text(encoding="utf-8")
-                silver_nodes.append({
+                nodes.append({
                     "id": node_id,
                     "name": model_name,
-                    "layer": "silver",
-                    "type": "dbt_model",
+                    "layer": layer_path,
+                    "folder": folder,
+                    "type": node_type,
                     "path": sql_file.as_posix(),
                     "sql_code": code,
                 })
-                # Parse source('bronze', '...') references
-                for src_match in re.finditer(r"source\(\s*['\"]bronze['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)", code):
-                    src_name = src_match.group(1)
-                    edges.append({"source": f"bronze.{src_name}", "target": node_id})
-                # Parse ref('...') references
+                # source('<name>', '<table>') always reads the landing layer.
+                for src_match in re.finditer(
+                    r"source\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)", code
+                ):
+                    table = src_match.group(1)
+                    edges.append({
+                        "source": node_map.get(table, f"{staging_layer}.{table}"),
+                        "target": node_id,
+                    })
                 for ref_match in re.finditer(r"ref\(\s*['\"]([^'\"]+)['\"]\s*\)", code):
                     ref_name = ref_match.group(1)
-                    edges.append({"source": node_map.get(ref_name, f"silver.{ref_name}"), "target": node_id})
-
-        # 2. Dynamically scan Gold marts models
-        marts_dir = self.dbt_project_dir / "models" / "marts"
-        if marts_dir.exists():
-            for sql_file in marts_dir.glob("*.sql"):
-                model_name = sql_file.stem
-                node_id = f"gold.{model_name}"
-                node_map[model_name] = node_id
-                code = sql_file.read_text(encoding="utf-8")
-                gold_nodes.append({
-                    "id": node_id,
-                    "name": model_name,
-                    "layer": "gold",
-                    "type": "dbt_mart",
-                    "path": sql_file.as_posix(),
-                    "sql_code": code,
-                })
-                # Parse ref('...') references
-                for ref_match in re.finditer(r"ref\(\s*['\"]([^'\"]+)['\"]\s*\)", code):
-                    ref_name = ref_match.group(1)
-                    src_id = node_map.get(ref_name, f"silver.{ref_name}")
-                    edges.append({"source": src_id, "target": node_id})
+                    edges.append({
+                        "source": node_map.get(ref_name, f"{staging_layer}.{ref_name}"),
+                        "target": node_id,
+                    })
 
         # 3. Dynamically scan custom DAG assets from git_repo/dags/
         custom_dag_nodes = []
@@ -509,12 +706,9 @@ class DbtRunner:
                 for dep in cnode.get("deps", []):
                     upstream_id = node_map.get(dep)
                     if not upstream_id:
-                        # Try searching matching node across existing layers
-                        for prefix in ["gold.", "silver.", "bronze.", "dag."]:
-                            test_id = f"{prefix}{dep}"
-                            if any(n["id"] == test_id for n in bronze_nodes + silver_nodes + gold_nodes + custom_dag_nodes):
-                                upstream_id = test_id
-                                break
+                        # A dependency may name a model without its layer prefix.
+                        matches = [n["id"] for n in nodes if n["name"] == dep]
+                        upstream_id = matches[0] if matches else None
                     if upstream_id:
                         edges.append({"source": upstream_id, "target": c_id})
         except Exception as e:
@@ -529,7 +723,7 @@ class DbtRunner:
                 seen.add(key)
                 unique_edges.append(e)
 
-        all_nodes = bronze_nodes + silver_nodes + gold_nodes + custom_dag_nodes
+        all_nodes = nodes + custom_dag_nodes
 
         # Selector active node calculation
         active_ids = set()
@@ -537,14 +731,14 @@ class DbtRunner:
             active_ids = {n["id"] for n in all_nodes}
         elif selector == "models/staging" or selector == "staging":
             for n in all_nodes:
-                if n["layer"] == "silver":
+                if n.get("folder") == "staging":
                     active_ids.add(n["id"])
                     for e in unique_edges:
                         if e["target"] == n["id"]:
                             active_ids.add(e["source"])
         elif selector == "models/marts" or selector == "marts":
             for n in all_nodes:
-                if n["layer"] == "gold":
+                if n.get("folder") == "marts":
                     active_ids.add(n["id"])
                     for e in unique_edges:
                         if e["target"] == n["id"]:
@@ -586,9 +780,10 @@ class DbtRunner:
         for n in all_nodes:
             n["is_in_pipeline"] = n["id"] in active_ids
 
-        layers = ["bronze", "silver", "gold"]
+        layers = {n["layer"] for n in all_nodes if n.get("layer")}
         if custom_dag_nodes:
-            layers.append("custom")
+            layers.add("custom")
+        layers = sorted(layers)
 
         return {
             "nodes": all_nodes,
@@ -642,14 +837,18 @@ class DbtRunner:
         if clean_target == "dev":
             clean_target = "postgres"
 
-        # Ensure Bronze core tables exist in storage
-        self._ensure_core_bronze_tables()
+        dbt_vars = self._dbt_vars_payload()
+        staging_layer = dbt_vars["layer_staging"]
 
-        # If targeting postgres and running models, ensure bronze tables are synced if not already present
+        # A layer with no data yet gets sample tables, so the shipped models have
+        # something to read. Never when the operator already has data.
+        if not self._discover_layer_parquet(resolve_layer(staging_layer)):
+            self._ensure_core_layer_tables(resolve_layer(staging_layer))
+
         if clean_target == "postgres" and command == "run":
             pg_params = self._resolve_postgres_params()
             try:
-                self.sync_bronze_to_postgres(pg_params)
+                self.sync_layer_to_postgres(pg_params, layer_path=staging_layer)
             except Exception:
                 pass
 
@@ -669,6 +868,7 @@ class DbtRunner:
         if selector and selector != "*":
             clean_sel = selector.strip()
             cmd.extend(["--select", clean_sel])
+        cmd.extend(["--vars", json.dumps(dbt_vars)])
 
         env = os.environ.copy()
         if env_vars:
@@ -911,9 +1111,9 @@ class DbtRunner:
             if target.suffix.lower() == ".sql":
                 if "staging" in posix_rel:
                     content = (
-                        "{{ config(materialized='table', schema='silver') }}\n\n"
+                        "{{ config(materialized='table', schema=var('layer_staging')) }}\n\n"
                         "with source as (\n"
-                        f"    select * from {{{{ source('bronze', '{model_stem.replace('stg_', '')}') }}}}\n"
+                        f"    select * from {{{{ source('landing', '{model_stem.replace('stg_', '')}') }}}}\n"
                         "),\n\n"
                         "cleaned as (\n"
                         "    select\n"
@@ -925,7 +1125,7 @@ class DbtRunner:
                     )
                 else:
                     content = (
-                        "{{ config(materialized='table', schema='gold') }}\n\n"
+                        "{{ config(materialized='table', schema=var('layer_marts')) }}\n\n"
                         "with staging as (\n"
                         "    select * from {{ ref('stg_orders') }}\n"
                         ")\n\n"
@@ -983,6 +1183,10 @@ class DbtRunner:
         clean_name = model_name.strip().replace(".sql", "")
         manifest_path = self.dbt_project_dir / "target" / "manifest.json"
 
+        targets = self._dbt_layer_vars()
+        staging_layer = targets["staging"]
+        marts_layer = targets["marts"]
+
         nodes: List[Dict[str, Any]] = []
         edges: List[Dict[str, Any]] = []
 
@@ -1007,7 +1211,9 @@ class DbtRunner:
                 if matching_id:
                     found_in_manifest = True
                     target_node = manifest_nodes[matching_id]
-                    schema = target_node.get("config", {}).get("schema") or ("silver" if "staging" in target_node.get("original_file_path", "") else "gold")
+                    schema = target_node.get("config", {}).get("schema") or (
+                        staging_layer if "staging" in target_node.get("original_file_path", "") else marts_layer
+                    )
 
                     # Current Node
                     nodes.append({
@@ -1027,7 +1233,7 @@ class DbtRunner:
                             continue
                         up_name = up_id.split(".")[-1]
                         is_source = up_id.startswith("source.")
-                        up_layer = "bronze" if is_source else ("silver" if "stg_" in up_name else "gold")
+                        up_layer = staging_layer if is_source or "stg_" in up_name else marts_layer
                         nodes.append({
                             "id": up_id,
                             "name": up_name,
@@ -1042,7 +1248,7 @@ class DbtRunner:
                     for down_id in downstreams:
                         down_name = down_id.split(".")[-1]
                         is_test = down_id.startswith("test.")
-                        down_layer = "gold" if ("fct_" in down_name or "dim_" in down_name) else "silver"
+                        down_layer = marts_layer if ("fct_" in down_name or "dim_" in down_name) else staging_layer
                         nodes.append({
                             "id": down_id,
                             "name": down_name if not is_test else down_id.split(".")[2],
@@ -1055,8 +1261,8 @@ class DbtRunner:
                 pass
 
         if not found_in_manifest:
-            code = self.get_model_code("silver", clean_name) or self.get_model_code("gold", clean_name)
-            current_layer = "silver" if self.get_model_code("silver", clean_name) else "gold"
+            code = self.get_model_code(staging_layer, clean_name) or self.get_model_code(marts_layer, clean_name)
+            current_layer = staging_layer if self.get_model_code(staging_layer, clean_name) else marts_layer
             nodes.append({
                 "id": target_node_id,
                 "name": clean_name,
@@ -1067,14 +1273,14 @@ class DbtRunner:
 
             if code:
                 import re
-                for src_match in re.finditer(r"source\(\s*['\"]bronze['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)", code):
+                for src_match in re.finditer(r"source\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)", code):
                     s_name = src_match.group(1)
-                    s_id = f"source.obelisk_dbt.bronze.{s_name}"
+                    s_id = f"source.obelisk_dbt.landing.{s_name}"
                     nodes.append({
                         "id": s_id,
                         "name": s_name,
                         "type": "source",
-                        "layer": "bronze",
+                        "layer": staging_layer,
                         "is_current": False,
                     })
                     edges.append({"source": s_id, "target": target_node_id})
@@ -1082,7 +1288,7 @@ class DbtRunner:
                 for ref_match in re.finditer(r"ref\(\s*['\"]([^'\"]+)['\"]\s*\)", code):
                     r_name = ref_match.group(1)
                     r_id = f"model.obelisk_dbt.{r_name}"
-                    r_layer = "silver" if "stg_" in r_name else "gold"
+                    r_layer = staging_layer if "stg_" in r_name else marts_layer
                     nodes.append({
                         "id": r_id,
                         "name": r_name,
@@ -1101,7 +1307,7 @@ class DbtRunner:
                     other_code = other_file.read_text(encoding="utf-8")
                     if f"ref('{clean_name}')" in other_code or f'ref("{clean_name}")' in other_code:
                         other_id = f"model.obelisk_dbt.{other_file.stem}"
-                        other_layer = "silver" if "staging" in str(other_file) else "gold"
+                        other_layer = staging_layer if "staging" in str(other_file) else marts_layer
                         nodes.append({
                             "id": other_id,
                             "name": other_file.stem,

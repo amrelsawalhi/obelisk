@@ -1,6 +1,5 @@
-{{ config(materialized='table', schema='silver') }}
 
--- Silver transformation computing order frequency and spending aggregates
+-- Computes order frequency and spending aggregates
 select
     customer_id,
     count(order_id) as total_orders,

@@ -1,4 +1,3 @@
-{{ config(materialized='table', schema='gold') }}
 
 select
     c.customer_id,

@@ -1,4 +1,3 @@
-{{ config(materialized='table', schema='gold') }}
 
 select
     coalesce(c.customer_tier, 'Unknown') as customer_tier,

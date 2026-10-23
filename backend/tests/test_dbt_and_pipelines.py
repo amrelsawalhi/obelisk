@@ -48,23 +48,36 @@ def test_docker_manager_service_blueprints():
     assert rec_git["recommended_ram_mb"] >= 128
 
 
-def test_dbt_medallion_pipeline_end_to_end(source_postgres_params):
+def test_dbt_pipeline_end_to_end(source_postgres_params):
     """
-    Full Medallion Lakehouse Integration Test:
-    1. Creates real Bronze Parquet files (orders & customers) on host storage.
-    2. DuckDB stages Bronze Parquet into PostgreSQL 'bronze' schema.
-    3. dbt-core transforms raw tables into 'silver' schema (stg_orders, stg_customers).
-    4. dbt-core aggregates business marts into 'gold' schema (fct_revenue, dim_customers).
+    Full pipeline integration test:
+    1. Creates real Parquet files (orders & customers) in the landing layer.
+    2. DuckDB copies the layer into its warehouse schema.
+    3. dbt-core transforms raw tables into the staging layer (stg_orders, stg_customers).
+    4. dbt-core aggregates business marts into the marts layer (fct_revenue, dim_customers).
     5. dbt test validates unique and not-null constraints.
     6. Directly queries PostgreSQL to assert data integrity and aggregated calculations.
+
+    The two schemas are read from the project's own config, so renaming a layer does
+    not require editing this test.
     """
     p = source_postgres_params
-    storage_dir = Path(settings.duckdb_storage_path)
-    storage_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Create real Bronze Parquet files
-    orders_path = storage_dir / "orders.parquet"
-    customers_path = storage_dir / "customers.parquet"
+    # Which schemas the run will write to, taken from the project's own config.
+    from app.core.layers import resolve_layer
+
+    targets = dbt_runner._dbt_layer_vars()
+    staging_layer = resolve_layer(targets["staging"])
+    staging_schema = staging_layer.warehouse_schema
+    marts_schema = resolve_layer(targets["marts"]).warehouse_schema
+
+    # Files live in the landing layer's directory — that is what the pipeline copies.
+    staging_dir = staging_layer.filesystem_dir
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Create real Parquet files
+    orders_path = staging_dir / "orders.parquet"
+    customers_path = staging_dir / "customers.parquet"
 
     orders_table = pa.Table.from_pydict({
         "order_id": [1, 2, 3, 4],
@@ -83,6 +96,42 @@ def test_dbt_medallion_pipeline_end_to_end(source_postgres_params):
     })
     pq.write_table(customers_table, str(customers_path), compression="SNAPPY")
 
+    # The project also declares two enterprise sources. Give them one row each so
+    # `dbt run` can build every model in the project, not just the ones asserted on.
+    ecommerce_orders_path = staging_dir / "ecommerce_orders.parquet"
+    ecommerce_customers_path = staging_dir / "ecommerce_customers.parquet"
+    pq.write_table(
+        pa.Table.from_pydict({
+            "order_id": [9001],
+            "order_uuid": ["11111111-1111-1111-1111-111111111111"],
+            "customer_id": ["33333333-3333-3333-3333-333333333333"],
+            "order_status": ["paid"],
+            "currency": ["EUR"],
+            "subtotal_amount": [100.0],
+            "tax_amount": [19.0],
+            "discount_amount": [0.0],
+            "total_amount": [119.0],
+            "order_placed_at": ["2026-01-15 10:00:00+00"],
+            "shipping_address": ['{"city": "Berlin", "street": "Main 1", "is_commercial": false}'],
+        }),
+        str(ecommerce_orders_path),
+        compression="SNAPPY",
+    )
+    pq.write_table(
+        pa.Table.from_pydict({
+            "customer_id": ["33333333-3333-3333-3333-333333333333"],
+            "first_name": ["Ada"],
+            "last_name": ["Lovelace"],
+            "email": ["ada@example.com"],
+            "tier": ["Platinum"],
+            "country_code": ["DEU"],
+            "signup_timestamp": ["2026-01-01 09:00:00+00"],
+            "metadata_json": ['{"referral_source": "search", "preferred_channel": "email", "vip_flag": true}'],
+        }),
+        str(ecommerce_customers_path),
+        compression="SNAPPY",
+    )
+
     pg_params = {
         "host": p["host"],
         "port": p["port"],
@@ -96,7 +145,6 @@ def test_dbt_medallion_pipeline_end_to_end(source_postgres_params):
         # 2. Run end-to-end Medallion Pipeline
         res = dbt_runner.run_medallion_pipeline(
             postgres_params=pg_params,
-            table_names=["orders", "customers"],
         )
         assert res["status"] == "success", f"Pipeline failed with logs:\n{res.get('logs')}"
 
@@ -113,23 +161,23 @@ def test_dbt_medallion_pipeline_end_to_end(source_postgres_params):
         )
         try:
             with conn.cursor() as cur:
-                # Assert Silver stg_orders has 4 typed rows
-                cur.execute("SELECT count(*), sum(amount) FROM silver.stg_orders;")
+                # Assert staging stg_orders has 4 typed rows
+                cur.execute(f"SELECT count(*), sum(amount) FROM {staging_schema}.stg_orders;")
                 stg_count, stg_sum = cur.fetchone()
                 assert stg_count == 4
                 assert float(stg_sum) == 575.75
 
-                # Assert Silver stg_customers has 3 rows
-                cur.execute("SELECT count(*) FROM silver.stg_customers;")
+                # Assert staging stg_customers has 3 rows
+                cur.execute(f"SELECT count(*) FROM {staging_schema}.stg_customers;")
                 cust_count = cur.fetchone()[0]
                 assert cust_count == 3
 
                 # Assert Gold fct_revenue has correctly aggregated customer tiers
                 # Enterprise: customer 10 ($100 + $150 = $250) + customer 30 ($75.25) = $325.25 (3 orders)
                 # MidMarket: customer 20 ($250.50) = $250.50 (1 order)
-                cur.execute("""
-                    SELECT customer_tier, total_orders, total_revenue 
-                    FROM gold.fct_revenue 
+                cur.execute(f"""
+                    SELECT customer_tier, total_orders, total_revenue
+                    FROM {marts_schema}.fct_revenue
                     ORDER BY customer_tier;
                 """)
                 revenue_rows = cur.fetchall()
@@ -144,9 +192,9 @@ def test_dbt_medallion_pipeline_end_to_end(source_postgres_params):
                 assert tier_dict["MidMarket"]["revenue"] == 250.50
 
                 # Assert Gold dim_customers customer lifetime metrics
-                cur.execute("""
-                    SELECT customer_name, lifetime_orders, lifetime_spend 
-                    FROM gold.dim_customers 
+                cur.execute(f"""
+                    SELECT customer_name, lifetime_orders, lifetime_spend
+                    FROM {marts_schema}.dim_customers
                     WHERE customer_id = 10;
                 """)
                 cust10 = cur.fetchone()
@@ -159,10 +207,14 @@ def test_dbt_medallion_pipeline_end_to_end(source_postgres_params):
 
     finally:
         # Cleanup Parquet files
-        if orders_path.exists():
-            orders_path.unlink(missing_ok=True)
-        if customers_path.exists():
-            customers_path.unlink(missing_ok=True)
+        for leftover in (
+            orders_path,
+            customers_path,
+            ecommerce_orders_path,
+            ecommerce_customers_path,
+        ):
+            if leftover.exists():
+                leftover.unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio
@@ -179,9 +231,10 @@ async def test_pipelines_api_flow(source_postgres_params):
         assert "nodes" in graph_data
         assert "edges" in graph_data
         assert "layers" in graph_data
-        assert "bronze" in graph_data["layers"]
-        assert "silver" in graph_data["layers"]
-        assert "gold" in graph_data["layers"]
+        # The graph is keyed by layer path, so it only names layers this workspace has.
+        targets = dbt_runner._dbt_layer_vars()
+        assert targets["staging"] in graph_data["layers"]
+        assert targets["marts"] in graph_data["layers"]
 
         # 2. Pipeline Run Trigger
         payload = {

@@ -1,4 +1,3 @@
-{{ config(materialized='table', schema='silver') }}
 
 select
     cast(customer_id as uuid) as customer_id,
@@ -11,5 +10,5 @@ select
     cast(metadata_json as jsonb)->>'referral_source' as referral_source,
     cast(metadata_json as jsonb)->>'preferred_channel' as preferred_channel,
     cast(coalesce(cast(metadata_json as jsonb)->>'vip_flag', 'false') as boolean) as is_vip
-from {{ source('bronze', 'ecommerce_customers') }}
+from {{ source('landing', 'ecommerce_customers') }}
 where customer_id is not null

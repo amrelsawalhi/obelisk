@@ -1,4 +1,3 @@
-{{ config(materialized='table', schema='silver') }}
 
 select
     cast(order_id as integer) as order_id,
@@ -14,5 +13,5 @@ select
     cast(shipping_address as jsonb)->>'city' as destination_city,
     cast(shipping_address as jsonb)->>'street' as destination_street,
     cast(coalesce(cast(shipping_address as jsonb)->>'is_commercial', 'false') as boolean) as is_commercial_delivery
-from {{ source('bronze', 'ecommerce_orders') }}
+from {{ source('landing', 'ecommerce_orders') }}
 where order_id is not null

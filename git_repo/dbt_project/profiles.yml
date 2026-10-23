@@ -8,7 +8,7 @@ obelisk:
       user: "{{ env_var('DBT_PG_USER', 'testuser') }}"
       password: "{{ env_var('DBT_PG_PASSWORD', 'testpass') }}"
       dbname: "{{ env_var('DBT_PG_DBNAME', 'sourcedb') }}"
-      schema: silver
+      schema: public
       sslmode: "{{ env_var('DBT_PG_SSLMODE', 'disable') }}"
       threads: 2
       connect_timeout: 10
@@ -20,7 +20,7 @@ obelisk:
       user: "{{ env_var('DBT_PG_USER', 'testuser') }}"
       password: "{{ env_var('DBT_PG_PASSWORD', 'testpass') }}"
       dbname: "{{ env_var('DBT_PG_DBNAME', 'sourcedb') }}"
-      schema: silver
+      schema: public
       sslmode: "{{ env_var('DBT_PG_SSLMODE', 'disable') }}"
       threads: 2
       connect_timeout: 10
@@ -28,5 +28,5 @@ obelisk:
     duckdb:
       type: duckdb
       path: "{{ env_var('DBT_DUCKDB_PATH', 'data/lakehouse/obelisk.duckdb') }}"
-      schema: silver
+      schema: public
       threads: 2

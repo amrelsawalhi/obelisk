@@ -1,9 +1,11 @@
 version: 2
 
 sources:
-  - name: bronze
-    schema: bronze
-    description: "Raw ingested datasets synchronized from Obelisk Bronze Parquet files."
+  # `landing` is only this source's name inside the project. The schema it reads is
+  # whatever layer_staging points at, so the pipeline and the models always agree.
+  - name: landing
+    schema: "{{ var('layer_staging', 'raw') }}"
+    description: "Raw datasets copied from the workspace's landing layer."
     tables:
       - name: orders
         description: "Raw orders table"
@@ -32,7 +34,7 @@ sources:
 
 models:
   - name: stg_orders
-    description: "Cleaned and typed orders in Silver schema"
+    description: "Cleaned and typed orders"
     columns:
       - name: order_id
         tests:
@@ -40,7 +42,7 @@ models:
           - not_null
 
   - name: stg_customers
-    description: "Cleaned customer dimensions in Silver schema"
+    description: "Cleaned customer dimensions"
     columns:
       - name: customer_id
         tests:
@@ -48,7 +50,7 @@ models:
           - not_null
 
   - name: stg_order_metrics
-    description: "Aggregated order spending metrics per customer in Silver schema"
+    description: "Aggregated order spending metrics per customer"
     columns:
       - name: customer_id
         tests:
@@ -56,7 +58,7 @@ models:
           - not_null
 
   - name: fct_revenue
-    description: "Aggregated revenue mart by customer tier in Gold schema"
+    description: "Aggregated revenue mart by customer tier"
     columns:
       - name: customer_tier
         tests:
@@ -66,7 +68,7 @@ models:
           - not_null
 
   - name: dim_customers
-    description: "Customer lifetime value mart in Gold schema"
+    description: "Customer lifetime value mart"
     columns:
       - name: customer_id
         tests:
@@ -74,7 +76,7 @@ models:
           - not_null
 
   - name: fct_orders_enriched
-    description: "Orders enriched with customer profile dimensions in Gold schema"
+    description: "Orders enriched with customer profile dimensions"
     columns:
       - name: order_id
         tests:
@@ -85,7 +87,7 @@ models:
           - not_null
 
   - name: stg_enterprise_customers
-    description: "Silver cleaned enterprise customers with unpacked JSON metadata"
+    description: "Cleaned enterprise customers with unpacked JSON metadata"
     columns:
       - name: customer_id
         tests:
@@ -99,7 +101,7 @@ models:
                 values: ['Standard', 'Silver', 'Gold', 'Platinum']
 
   - name: stg_enterprise_orders
-    description: "Silver cleaned enterprise orders with net amount calculations"
+    description: "Cleaned enterprise orders with net amount calculations"
     columns:
       - name: order_id
         tests:
@@ -113,7 +115,7 @@ models:
           - not_null
 
   - name: fct_enterprise_revenue
-    description: "Gold analytical revenue mart aggregated by customer tier and currency"
+    description: "Analytical revenue mart aggregated by customer tier and currency"
     columns:
       - name: customer_tier
         tests:

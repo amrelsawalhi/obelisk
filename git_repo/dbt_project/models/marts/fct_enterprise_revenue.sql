@@ -1,4 +1,3 @@
-{{ config(materialized='table', schema='gold') }}
 
 with orders as (
     select * from {{ ref('stg_enterprise_orders') }}
