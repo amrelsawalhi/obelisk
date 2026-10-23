@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from typing import Optional
 
 from app.config import settings
-from app.core.layers import InvalidLayerPath, resolve_layer
+from app.core.layers import InvalidLayerPath, resolve_layer, safe_layer_path
 
 logger = logging.getLogger(__name__)
 
@@ -77,3 +78,60 @@ def layer_schemas(paths: Optional[list[str]] = None) -> dict[str, str]:
         except InvalidLayerPath as exc:
             logger.warning("Skipping unrepresentable layer %r: %s", path, exc)
     return mapping
+
+
+def ensure_layer(path: str, *, description: Optional[str] = None) -> str:
+    """Creates a layer row, plus any missing parents, for a path data lands in.
+
+    Ingest and the SDK call this so a table can never end up in a folder that no
+    layer owns. The HTTP API stays strict on purpose: creating a layer from the UI is
+    a deliberate act, and a typo there should be reported rather than materialised.
+
+    Idempotent, and never raises — a layer is bookkeeping, not a reason to fail an
+    ingest that has already written its file.
+    """
+    clean = safe_layer_path(path)
+    segments = clean.split(".")
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        with sqlite3.connect(settings.sqlite_db_path, timeout=10.0) as conn:
+            conn.execute("PRAGMA busy_timeout=15000;")
+            known = {row[0] for row in conn.execute("SELECT path FROM layers")}
+            has_default = bool(
+                conn.execute(
+                    "SELECT 1 FROM layers WHERE is_default = 1 LIMIT 1"
+                ).fetchone()
+            )
+
+            for depth in range(1, len(segments) + 1):
+                candidate = ".".join(segments[:depth])
+                if candidate in known:
+                    continue
+                parent = ".".join(segments[: depth - 1]) or None
+                position = conn.execute(
+                    "SELECT COALESCE(MAX(position), 0) + 1 FROM layers WHERE parent_path IS ?",
+                    (parent,),
+                ).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO layers (path, name, parent_path, position, description,"
+                    " is_default, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        candidate,
+                        segments[depth - 1],
+                        parent,
+                        position,
+                        description if depth == len(segments) else None,
+                        0 if has_default else 1,
+                        now,
+                        now,
+                    ),
+                )
+                known.add(candidate)
+                has_default = True
+
+            conn.commit()
+    except sqlite3.Error as exc:
+        logger.warning("Could not record layer %r: %s", path, exc)
+
+    return clean

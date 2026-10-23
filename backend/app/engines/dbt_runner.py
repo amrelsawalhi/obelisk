@@ -372,7 +372,7 @@ class DbtRunner:
             "output": output,
         }
 
-    def run_medallion_pipeline(
+    def run_pipeline(
         self,
         postgres_params: Dict[str, Any],
         table_names: Optional[List[str]] = None,

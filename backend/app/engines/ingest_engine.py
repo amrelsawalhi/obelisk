@@ -18,7 +18,8 @@ import httpx
 from app.config import settings
 from app.engines.duckdb_engine import duckdb_engine
 from app.core.host_resolver import resolve_connection_host
-from app.core.layers import safe_layer_path
+from app.core.layers import resolve_layer, safe_layer_path
+from app.services.layers import default_layer_path, ensure_layer
 from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,11 @@ class IngestEngine:
         metadata_json = json.dumps(schema_metadata)
         asset_id = str(uuid.uuid4())
 
+        # A written table always belongs to a layer. If the caller named a folder that
+        # is not in the tree yet, add it (and its parents) so the tree never lags
+        # behind what is on disk.
+        layer_path = ensure_layer(layer)
+
         try:
             conn = sqlite3.connect(db_path, timeout=10.0)
             with conn:
@@ -93,13 +99,10 @@ class IngestEngine:
                         schema_metadata=excluded.schema_metadata,
                         last_materialized_at=excluded.last_materialized_at;
                     """,
-                    (asset_id, name, layer, storage_uri, record_count, metadata_json, now_iso, now_iso),
+                    (asset_id, name, layer_path, storage_uri, record_count, metadata_json, now_iso, now_iso),
                 )
-                # Phase 1a: the catalog registry mirrors the legacy assets table so
-                # it can never drift while `assets` is still the write target. One
-                # statement, same transaction — Phase 4 makes catalog_objects the
-                # authoritative write and deletes this mirror.
-                layer_path = safe_layer_path(layer)
+                # The registry mirrors the legacy assets table so it cannot drift while
+                # `assets` is still the write target.
                 cur.execute(
                     """
                     INSERT INTO catalog_objects (
@@ -212,11 +215,11 @@ class IngestEngine:
         Executes ingestion and writes a Snappy Parquet file atomically to lakehouse storage.
         Returns execution statistics and registers asset in Obelisk catalog.
         """
-        clean_folder = target_folder.strip("/\\").replace("..", "") if target_folder else ""
-        if clean_folder:
-            target_dir = settings.lakehouse_root_path / clean_folder
-        else:
-            target_dir = settings.lakehouse_root_path
+        # Everything lands in a layer. An unspecified target means the default layer,
+        # not the lakehouse root, so the tree always covers what is on disk.
+        requested = target_folder.strip("/\\").replace("..", "") if target_folder else ""
+        clean_folder = safe_layer_path(requested) if requested else default_layer_path()
+        target_dir = resolve_layer(clean_folder).filesystem_dir
         target_dir.mkdir(parents=True, exist_ok=True)
 
         # Default clean table stem without database/schema prefixes
@@ -350,7 +353,7 @@ class IngestEngine:
 
         self._record_asset_in_db(
             name=table_stem,
-            layer=clean_folder or "main",
+            layer=clean_folder,
             storage_uri=asset_storage_uri,
             record_count=res["num_rows"],
             schema_metadata=schema_meta,

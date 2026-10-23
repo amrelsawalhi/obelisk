@@ -26,6 +26,8 @@ from app.core.sources import (
     resolve_source,
 )
 from app.services.catalog import catalog_service
+from app.services.layers import find_layer_path
+from app.core.layers import resolve_layer
 
 router = APIRouter(prefix="/api/catalog", tags=["catalog"])
 
@@ -951,38 +953,38 @@ async def get_table_preview(
         )
     table_name = _stem
 
-    # 1. Lakehouse Parquet preview
+    # 1. Lakehouse Parquet preview. A tier identifier is either a layer path or a
+    # folder that predates layers; both resolve to a directory the same way.
     lakehouse_root = settings.lakehouse_root_path
     raw_tier = source_id.split(":", 1)[1] if source_id.startswith("lakehouse:") else source_id
-    clean_tier = raw_tier if raw_tier in ("root", "main", "", "lakehouse", "bronze") else _clean_lakehouse_path(raw_tier)
+    is_root = raw_tier in ("root", "main", "", "lakehouse")
+    clean_tier = "" if is_root else _clean_lakehouse_path(raw_tier)
+
+    tier_dir: Optional[Path] = None
+    if not is_root:
+        layer_path = find_layer_path(clean_tier)
+        if layer_path:
+            tier_dir = resolve_layer(layer_path).filesystem_dir
+        elif (lakehouse_root / clean_tier).is_dir():
+            tier_dir = lakehouse_root / clean_tier
 
     if (
-        source_id == "bronze"
-        or source_id == "lakehouse"
+        source_id == "lakehouse"
         or source_id.startswith("lakehouse:")
-        or clean_tier in ("root", "main", "")
-        or (lakehouse_root / clean_tier).is_dir()
+        or is_root
+        or tier_dir is not None
     ):
         parquet_file = None
 
-        if clean_tier in ("root", "main", ""):
+        if is_root:
             candidate = lakehouse_root / f"{table_name}.parquet"
             if candidate.exists():
                 parquet_file = candidate
 
-        if not parquet_file and (source_id.startswith("lakehouse:") or (lakehouse_root / clean_tier).is_dir()):
-            candidate = lakehouse_root / clean_tier / f"{table_name}.parquet"
+        if not parquet_file and tier_dir is not None:
+            candidate = tier_dir / f"{table_name}.parquet"
             if candidate.exists():
                 parquet_file = candidate
-
-        if not parquet_file and source_id == "bronze":
-            candidate = lakehouse_root / "bronze" / f"{table_name}.parquet"
-            if candidate.exists():
-                parquet_file = candidate
-            else:
-                candidate2 = Path(settings.duckdb_storage_path) / f"{table_name}.parquet"
-                if candidate2.exists():
-                    parquet_file = candidate2
 
         # Fallbacks: check directly in lakehouse root or search all subdirectories
         if not parquet_file or not parquet_file.exists():

@@ -142,8 +142,8 @@ def test_dbt_pipeline_end_to_end(source_postgres_params):
     }
 
     try:
-        # 2. Run end-to-end Medallion Pipeline
-        res = dbt_runner.run_medallion_pipeline(
+        # 2. Run the pipeline end to end
+        res = dbt_runner.run_pipeline(
             postgres_params=pg_params,
         )
         assert res["status"] == "success", f"Pipeline failed with logs:\n{res.get('logs')}"
@@ -276,10 +276,12 @@ async def test_multi_pipeline_definitions_and_scoping():
         assert res.status_code == 200
         pipelines = res.json()
         assert len(pipelines) >= 5
-        names = [p["name"] for p in pipelines]
-        assert "All Medallion Assets" in names
-        assert "Orders & Revenue Flow" in names
-        assert "Customer 360 Analytics" in names
+        assert all(entry["selector"] for entry in pipelines)
+        # The seeded examples are ordinary editable rows, not a fixed vocabulary:
+        # nothing in them should still be named after a tier.
+        lowered = {entry["name"].lower() for entry in pipelines}
+        assert "all medallion assets" not in lowered
+        assert "gold marts only" not in lowered
 
         # 2. Test Scoped DAG retrieval for Orders Flow
         scoped_graph_resp = await client.get("/api/pipelines/assets?selector=stg_orders%2B")

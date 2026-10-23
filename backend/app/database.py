@@ -109,33 +109,34 @@ async def seed_defaults(session: AsyncSession) -> None:
             ),
         ])
 
-    # Seed default pipeline definitions if table is empty
+    # Seed default pipeline definitions if table is empty. These are examples, not a
+    # fixed set of layers: rename them, retarget the selectors, or delete them.
     p_res = await session.execute(select(PipelineDefinition.id).limit(1))
     if not p_res.scalars().first():
         session.add_all([
             PipelineDefinition(
-                name="All Medallion Assets",
-                description="Full end-to-end Medallion pipeline from Bronze raw Parquet through Silver staging to Gold marts",
+                name="Everything",
+                description="Runs every model in the project",
                 selector="*",
             ),
             PipelineDefinition(
-                name="Orders & Revenue Flow",
-                description="Processes transactional orders from Bronze staging to financial and enriched fact marts",
+                name="Orders & Revenue",
+                description="Builds the order staging models and the revenue marts that depend on them",
                 selector="stg_orders+",
             ),
             PipelineDefinition(
-                name="Customer 360 Analytics",
-                description="Cleans customer dimensions and updates lifetime value & metric marts",
+                name="Customer Analytics",
+                description="Builds the customer staging models and the lifetime-value marts",
                 selector="stg_customers+",
             ),
             PipelineDefinition(
-                name="Staging Tier Only",
-                description="Rapid materialization and validation of Silver staging models without gold aggregations",
+                name="Staging Models Only",
+                description="Materialises and tests the staging folder without building marts",
                 selector="models/staging",
             ),
             PipelineDefinition(
-                name="Gold Marts Only",
-                description="Refreshes analytical business marts and metrics from materialized silver staging models",
+                name="Marts Only",
+                description="Rebuilds the marts from already-materialised staging models",
                 selector="models/marts",
             ),
         ])

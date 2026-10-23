@@ -2,12 +2,15 @@
 Obelisk SDK: Zero-config notebook and analytical client.
 Usage:
     import obelisk
-    df = obelisk.table("bronze.orders").to_polars()
+    df = obelisk.table("raw.orders").to_polars()
     res = obelisk.query("SELECT * FROM read_parquet(...)")
-    obelisk.save(df, "gold.monthly_revenue")
+    obelisk.save(df, "marts.monthly_revenue")
     spark = obelisk.spark()
+
+Layer names are whatever the workspace uses; there is nothing reserved.
 """
 
+import logging
 import os
 import sys
 import json
@@ -25,9 +28,12 @@ import polars as pl
 from app.config import settings
 from app.core.resource_advisor import advisor
 from app.core.dsn import build_pg_dsn, sql_string, validate_alias
+from app.core.layers import resolve_layer, safe_layer_path
 from app.engines.duckdb_engine import DuckDBEngine
+from app.services.layers import default_layer_path, ensure_layer
 
 duckdb_engine = DuckDBEngine()
+logger = logging.getLogger(__name__)
 
 # One shared connection for SDK helpers that do not receive an explicit one.
 # Creating a fresh in-memory connection per call leaked a DuckDB instance every
@@ -333,17 +339,20 @@ def query_arrow(sql: str) -> pa.Table:
         conn.close()
 
 
-def save(df: Any, target: str, sync_postgres: bool = True) -> Dict[str, Any]:
+def save(df: Any, target: str, sync_postgres: Optional[bool] = None) -> Dict[str, Any]:
     """
     Persists a Polars, Pandas, Arrow, or Spark DataFrame to the Lakehouse.
-    Target format: '<layer>.<name>' (e.g., 'gold.monthly_revenue' or 'silver.cleaned_users').
-    Automatically registers asset metadata in SQLite brain and syncs to PostgreSQL if gold/silver.
+
+    ``target`` is ``<layer path>.<name>`` - ``"raw.orders"`` or
+    ``"marts.sales.orders"``. Without a layer prefix the default layer is used. The
+    layer is added to the tree if it is new, and the table is mirrored into the
+    warehouse under that layer's schema unless ``sync_postgres`` is False.
     """
     if "." in target:
-        layer, stem = target.split(".", 1)
-        layer = layer.lower()
+        layer, stem = target.rsplit(".", 1)
+        layer = safe_layer_path(layer)
     else:
-        layer, stem = "main", target
+        layer, stem = default_layer_path(), target
 
     # 1. Normalize input to PyArrow Table
     if isinstance(df, pl.DataFrame):
@@ -361,14 +370,11 @@ def save(df: Any, target: str, sync_postgres: bool = True) -> Dict[str, Any]:
     else:
         raise TypeError(f"Unsupported DataFrame type '{type(df)}' for obelisk.save().")
 
-    # 2. Write to Parquet atomically inside data/lakehouse/{layer} or flat in root
+    # 2. Write to Parquet atomically inside the layer's directory
     storage_uri_clean = settings.STORAGE_URI.rstrip("/")
-    if layer != "main":
-        storage_dir = settings.lakehouse_root_path / layer
-        asset_storage_uri = f"{storage_uri_clean}/{layer}/{stem}.parquet"
-    else:
-        storage_dir = settings.lakehouse_root_path
-        asset_storage_uri = f"{storage_uri_clean}/{stem}.parquet"
+    location = resolve_layer(layer)
+    storage_dir = location.filesystem_dir
+    asset_storage_uri = f"{storage_uri_clean}/{layer}/{stem}.parquet"
 
     storage_dir.mkdir(parents=True, exist_ok=True)
     target_file = storage_dir / f"{stem}.parquet"
@@ -384,7 +390,9 @@ def save(df: Any, target: str, sync_postgres: bool = True) -> Dict[str, Any]:
     ]
     schema_meta = {"num_rows": num_rows, "columns": columns}
 
-    # 3. Register in SQLite assets table
+    # 3. Register in the SQLite catalog. The layer comes first so the tree always
+    # covers what is on disk, then the asset row and its registry mirror.
+    ensure_layer(layer)
     db_path = settings.sqlite_db_path
     now_iso = datetime.now(timezone.utc).isoformat()
     asset_id = str(uuid.uuid4())
@@ -405,18 +413,59 @@ def save(df: Any, target: str, sync_postgres: bool = True) -> Dict[str, Any]:
                 """,
                 (asset_id, stem, layer, asset_storage_uri, num_rows, json.dumps(schema_meta), now_iso, now_iso),
             )
+            cur.execute(
+                """
+                INSERT INTO catalog_objects (
+                    id, fqn, name, layer_path, kind, backend, location,
+                    schema_json, row_count, version, created_at, last_materialized_at
+                )
+                VALUES (?, ?, ?, ?, 'parquet', 'local', ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(fqn) DO UPDATE SET
+                    location=excluded.location,
+                    schema_json=excluded.schema_json,
+                    row_count=excluded.row_count,
+                    last_materialized_at=excluded.last_materialized_at,
+                    version=catalog_objects.version + 1;
+                """,
+                (
+                    str(uuid.uuid4()),
+                    f"lakehouse.{layer}.{stem}",
+                    stem,
+                    layer,
+                    asset_storage_uri,
+                    json.dumps(schema_meta),
+                    num_rows,
+                    now_iso,
+                    now_iso,
+                ),
+            )
             conn.commit()
-    except Exception:
-        pass
+    except sqlite3.Error as exc:
+        logger.warning("obelisk.save: could not record %s.%s in the catalog: %s", layer, stem, exc)
 
-    # 4. Sync to PostgreSQL warehouse if Silver/Gold and warehouse configured
-    if sync_postgres and layer in ("silver", "gold"):
-        _sync_table_to_postgres(target_file, schema=layer, table_name=stem)
+    # 4. Mirror into the warehouse unless the caller opts out. The layer's schema is
+    # the target, and a failure is reported rather than swallowed: the Parquet file is
+    # already written, so the save itself did succeed.
+    warehouse_sync: Optional[Dict[str, Any]] = None
+    if sync_postgres is not False:
+        try:
+            _sync_table_to_postgres(
+                target_file, schema=location.warehouse_schema, table_name=stem
+            )
+            warehouse_sync = {"status": "success", "schema": location.warehouse_schema}
+        except Exception as exc:
+            warehouse_sync = {
+                "status": "error",
+                "schema": location.warehouse_schema,
+                "error": str(exc),
+            }
 
     return {
         "status": "success",
         "target": target,
         "layer": layer,
+        "warehouse_schema": location.warehouse_schema,
+        "warehouse_sync": warehouse_sync,
         "name": stem,
         "num_rows": num_rows,
         "file_path": target_file.as_posix(),

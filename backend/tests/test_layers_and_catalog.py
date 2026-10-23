@@ -164,7 +164,11 @@ def test_baseline_then_backfill_preserves_assets(tmp_path: Path) -> None:
         revision = con.execute("SELECT version_num FROM alembic_version").fetchone()[0]
 
     assert revision == _head(db)
-    assert layers == [("raw", 1)]
+    # The seeded landing layer is the default …
+    assert ("raw", 1) in layers
+    # … and the layers the existing assets already live in are discovered too.
+    assert ("bronze", 0) in layers
+    assert ("silver", 0) in layers
     assert len(rows) == 2
     by_name = {row[1]: row for row in rows}
     assert by_name["orders"] == (
@@ -426,6 +430,8 @@ def test_ingest_writes_one_catalog_object_per_fqn() -> None:
         with sqlite3.connect(settings.sqlite_db_path) as con:
             con.execute("DELETE FROM catalog_objects WHERE fqn = ?", (fqn,))
             con.execute("DELETE FROM assets WHERE name = ? AND layer = ?", (name, layer))
+            # Ingest creates the layer it lands in; drop the probe one again.
+            con.execute("DELETE FROM layers WHERE path = ?", (layer,))
             con.commit()
 
 

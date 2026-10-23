@@ -1,5 +1,5 @@
 """
-Pipelines API Routes: Exposes Medallion lineage graph, pipeline run triggers, and live logs.
+Pipelines API Routes: exposes the pipeline lineage graph, run triggers and live logs.
 """
 
 import asyncio
@@ -109,8 +109,8 @@ async def delete_pipeline(pipeline_id: str):
 
 
 @router.get("/assets")
-async def get_medallion_asset_graph(selector: Optional[str] = None):
-    """Returns the Medallion lineage graph, optionally tagged or scoped to a selector."""
+async def get_pipeline_asset_graph(selector: Optional[str] = None):
+    """Returns the pipeline lineage graph, optionally scoped to a selector."""
     return dbt_runner.get_asset_graph(selector=selector)
 
 
@@ -137,7 +137,7 @@ async def trigger_pipeline_run(req: Optional[TriggerPipelineRequest] = None):
         # dbt run/test are long blocking subprocess invocations — execute in a worker
         # thread so the event loop (UI, terminal, telemetry) stays responsive.
         res = await asyncio.to_thread(
-            dbt_runner.run_medallion_pipeline,
+            dbt_runner.run_pipeline,
             postgres_params=pg_params,
             table_names=table_names,
             selector=selector,

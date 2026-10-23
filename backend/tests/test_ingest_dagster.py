@@ -15,6 +15,19 @@ from app.models.connection import Connection
 from app.core.vault import vault
 from app.engines.dagster_client import dagster_client
 
+
+def _landing_path(name: str) -> Path:
+    """Where an ingest with no explicit layer writes its file.
+
+    An ingest that does not name a layer lands in the default one, so the file sits
+    inside that layer's directory rather than at the lakehouse root.
+    """
+    from app.core.layers import resolve_layer
+    from app.services.layers import default_layer_path
+
+    return resolve_layer(default_layer_path()).filesystem_dir / f"{name}.parquet"
+
+
 def test_dagster_ingest_postgres_snapshot(source_postgres_params):
     """
     Physical Parquet verification for Postgres snapshot ingestion:
@@ -76,8 +89,7 @@ def test_dagster_ingest_postgres_snapshot(source_postgres_params):
         assert run_res["run_id"]
 
         # Physical file verification
-        storage_dir = Path(settings.duckdb_storage_path)
-        parquet_path = storage_dir / f"{target_name}.parquet"
+        parquet_path = _landing_path(target_name)
         assert parquet_path.exists(), f"Physical Parquet file {parquet_path} not found on disk!"
 
         meta = pq.read_metadata(str(parquet_path))
@@ -153,7 +165,7 @@ def test_dagster_ingest_postgres_incremental(source_postgres_params):
         )
         assert res1["success"] is True
 
-        parquet_path = Path(settings.duckdb_storage_path) / f"{target_name}.parquet"
+        parquet_path = _landing_path(target_name)
         assert parquet_path.exists()
         assert pq.read_metadata(str(parquet_path)).num_rows == 3
 
@@ -235,7 +247,7 @@ def test_dagster_ingest_mongodb(source_mongo_params):
         )
         assert run_res["success"] is True
 
-        parquet_path = Path(settings.duckdb_storage_path) / f"{target_name}.parquet"
+        parquet_path = _landing_path(target_name)
         assert parquet_path.exists()
         meta = pq.read_metadata(str(parquet_path))
         assert meta.num_rows == 4
@@ -314,7 +326,7 @@ async def test_ingest_api_trigger(source_postgres_params):
             assert data["run_id"]
             assert data["metadata"]["num_rows"] == 2
 
-            parquet_path = Path(settings.duckdb_storage_path) / f"{target_name}.parquet"
+            parquet_path = _landing_path(target_name)
             assert parquet_path.exists()
             assert pq.read_metadata(str(parquet_path)).num_rows == 2
 
@@ -382,9 +394,11 @@ def test_sqlite_asset_catalog_registration(source_postgres_params):
         assert row is not None, f"Asset '{target_name}' was not recorded in SQLite assets table!"
         name, layer, storage_uri, count, schema_json = row
         assert name == target_name
-        # Layer is inherited from the target folder (medallion decoupled):
-        # no target_folder means the file lands in the lakehouse root ('main').
-        assert layer == "main"
+        # With no target folder the default layer is used, so the file lands inside
+        # that layer's directory rather than at the lakehouse root.
+        from app.services.layers import default_layer_path
+
+        assert layer == default_layer_path()
         assert count == 2
         assert "parquet" in storage_uri
 
@@ -458,7 +472,7 @@ def test_mongodb_incremental_date_watermark(source_mongo_params):
         assert res2["new_rows_extracted"] == 2
         assert res2["num_rows"] == 4
 
-        parquet_path = Path(settings.duckdb_storage_path) / f"{target_name}.parquet"
+        parquet_path = _landing_path(target_name)
         assert pq.read_metadata(str(parquet_path)).num_rows == 4
 
     finally:
