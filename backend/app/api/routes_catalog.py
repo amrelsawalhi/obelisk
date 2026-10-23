@@ -12,6 +12,7 @@ from app.database import get_db
 from app.config import settings
 from app.core.vault import encrypt, decrypt
 from app.core.host_resolver import resolve_connection_host
+from app.core.dsn import sql_string
 from app.models.connection import Connection
 from app.models.asset import Asset
 from app.engines.introspector import introspector
@@ -162,11 +163,16 @@ def _execute_live_test(
         elif st == "mongodb":
             from pymongo import MongoClient
             auth_source = (options or {}).get("auth_source", "admin")
-            if username and password:
-                uri = f"mongodb://{username}:{password}@{resolved_host}:{port}/?authSource={auth_source}"
-            else:
-                uri = f"mongodb://{resolved_host}:{port}/"
-            client = MongoClient(uri, serverSelectionTimeoutMS=3000)
+            # Credentials go in as kwargs so characters like @ : / % ? cannot
+            # break RFC 3986 URI parsing (audit H5).
+            client = MongoClient(
+                host=resolved_host,
+                port=port,
+                username=username or None,
+                password=password or None,
+                authSource=auth_source if (username and password) else None,
+                serverSelectionTimeoutMS=3000,
+            )
             client.admin.command("ping")
             client.close()
         elif st in ("mysql", "mariadb"):
@@ -771,9 +777,20 @@ async def get_table_preview(
     else:
         source_id, table_name = "lakehouse", parts[0]
 
+    # Table names arrive straight from the URL, so reject separators, glob
+    # characters and parent references before anything touches disk (audit H6).
+    _stem = table_name[:-len(".parquet")] if table_name.lower().endswith(".parquet") else table_name
+    if not _stem or any(token in _stem for token in ("/", "\\", "*", "?", "..")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid table name.",
+        )
+    table_name = _stem
+
     # 1. Lakehouse Parquet preview
     lakehouse_root = settings.lakehouse_root_path
-    clean_tier = source_id.split(":", 1)[1] if source_id.startswith("lakehouse:") else source_id
+    raw_tier = source_id.split(":", 1)[1] if source_id.startswith("lakehouse:") else source_id
+    clean_tier = raw_tier if raw_tier in ("root", "main", "", "lakehouse", "bronze") else _clean_lakehouse_path(raw_tier)
 
     if (
         source_id == "bronze"
@@ -820,8 +837,13 @@ async def get_table_preview(
                 detail=f"Parquet table '{table_name}' does not exist in Lakehouse."
             )
 
-        escaped_path = parquet_file.as_posix()
-        query = f"SELECT * FROM read_parquet('{escaped_path}') LIMIT 50;"
+        resolved = parquet_file.resolve()
+        if not resolved.is_relative_to(lakehouse_root.resolve()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Resolved table path escapes the lakehouse root.",
+            )
+        query = f"SELECT * FROM read_parquet({sql_string(resolved.as_posix())}) LIMIT 50;"
         res = await asyncio.to_thread(duckdb_engine.execute_query, query)
         return res
 

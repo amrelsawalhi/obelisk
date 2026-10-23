@@ -24,6 +24,7 @@ import polars as pl
 
 from app.config import settings
 from app.core.resource_advisor import advisor
+from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 from app.engines.duckdb_engine import DuckDBEngine
 
 duckdb_engine = DuckDBEngine()
@@ -421,10 +422,17 @@ def _sync_table_to_postgres(parquet_file: Path, schema: str, table_name: str) ->
     import duckdb
     conn = duckdb.connect(":memory:")
     try:
-        conn.execute("INSTALL postgres; LOAD postgres;")
-        conn_str = f"dbname={pg_db} host={pg_host} port={pg_port} user={pg_user} password={pg_pass} sslmode={pg_sslmode}"
+        conn.execute("LOAD postgres;")
+        conn_str = build_pg_dsn(
+            dbname=pg_db,
+            host=pg_host,
+            port=pg_port,
+            user=pg_user,
+            password=pg_pass,
+            sslmode=pg_sslmode,
+        )
         alias = "pg_sync_wh"
-        conn.execute(f"ATTACH '{conn_str}' AS {alias} (TYPE POSTGRES);")
+        conn.execute(f"ATTACH {sql_string(conn_str)} AS {validate_alias(alias)} (TYPE POSTGRES);")
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{schema};")
         posix_src = parquet_file.resolve().as_posix()
         conn.execute(f"CREATE OR REPLACE TABLE {alias}.{schema}.\"{table_name}\" AS SELECT * FROM read_parquet('{posix_src}');")

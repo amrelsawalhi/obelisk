@@ -18,6 +18,7 @@ import httpx
 from app.config import settings
 from app.engines.duckdb_engine import duckdb_engine
 from app.core.host_resolver import resolve_connection_host
+from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 
 logger = logging.getLogger(__name__)
 
@@ -437,8 +438,18 @@ class IngestEngine:
         conn = duckdb_engine.get_connection()
         try:
             conn.execute("LOAD postgres;")
-            dsn = f"host={host} port={port} dbname={database} user={user} password={password} sslmode={sslmode}"
-            conn.execute(f"ATTACH '{dsn}' AS {alias} (TYPE POSTGRES, READ_ONLY);")
+            dsn = build_pg_dsn(
+                host=host,
+                port=port,
+                dbname=database,
+                user=user,
+                password=password,
+                sslmode=sslmode,
+            )
+            conn.execute(
+                f"ATTACH {sql_string(dsn)} AS {validate_alias(alias)} "
+                f"(TYPE POSTGRES, READ_ONLY);"
+            )
 
             # A full refresh runs for a snapshot, for a first run, or when the
             # existing file has no usable incremental cursor. That last case used
@@ -549,12 +560,15 @@ class IngestEngine:
         auth_db = connection_params.get("auth_db", "admin")
         db_name = connection_params["database"]
 
-        if user and pw:
-            uri = f"mongodb://{user}:{pw}@{host}:{port}/?authSource={auth_db}"
-        else:
-            uri = f"mongodb://{host}:{port}/"
-
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        # Kwargs avoid URI escaping problems in passwords (audit H5).
+        client = MongoClient(
+            host=host,
+            port=port,
+            username=user or None,
+            password=pw or None,
+            authSource=auth_db if (user and pw) else None,
+            serverSelectionTimeoutMS=5000,
+        )
         temp_file = target_file.with_name(f"{target_file.stem}_{uuid.uuid4().hex[:8]}.tmp.parquet")
 
         try:

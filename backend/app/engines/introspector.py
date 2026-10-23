@@ -230,12 +230,15 @@ class Introspector:
     ) -> List[Dict[str, Any]]:
         """Introspects collections, sampled document schemas, and counts in MongoDB."""
         resolved_host = resolve_connection_host(host, port)
-        if username and password:
-            uri = f"mongodb://{username}:{password}@{resolved_host}:{port}/?authSource={auth_db}"
-        else:
-            uri = f"mongodb://{resolved_host}:{port}/"
-
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        # Kwargs avoid URI escaping problems in passwords (audit H5).
+        client = MongoClient(
+            host=resolved_host,
+            port=port,
+            username=username or None,
+            password=password or None,
+            authSource=auth_db if (username and password) else None,
+            serverSelectionTimeoutMS=5000,
+        )
         tables = []
         try:
             db_names = [database_name] if database_name else client.list_database_names()
@@ -300,12 +303,15 @@ class Introspector:
     ) -> Dict[str, Any]:
         """Fetches up to `limit` documents from a live MongoDB collection."""
         resolved_host = resolve_connection_host(host, port)
-        if username and password:
-            uri = f"mongodb://{username}:{password}@{resolved_host}:{port}/?authSource={auth_db}"
-        else:
-            uri = f"mongodb://{resolved_host}:{port}/"
-
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        # Kwargs avoid URI escaping problems in passwords (audit H5).
+        client = MongoClient(
+            host=resolved_host,
+            port=port,
+            username=username or None,
+            password=password or None,
+            authSource=auth_db if (username and password) else None,
+            serverSelectionTimeoutMS=5000,
+        )
         try:
             db = client[database]
             coll = db[collection]

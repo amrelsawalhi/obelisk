@@ -124,21 +124,6 @@ async def reveal_variable(key: str):
         }
 
 
-@router.get("/sdk/{key}")
-async def get_sdk_variable(key: str):
-    """Internal SDK endpoint: Returns raw decrypted value for notebook and pipeline runtime execution."""
-    clean_key = key.strip().upper()
-    async with AsyncSessionLocal() as session:
-        stmt = select(Variable).where(Variable.key == clean_key)
-        res = await session.execute(stmt)
-        v = res.scalars().first()
-        if not v:
-            raise HTTPException(status_code=404, detail=f"Variable '{key}' not found")
-
-        raw_val = vault.decrypt(v.value) if v.is_secret else v.value
-        return {"key": v.key, "value": raw_val}
-
-
 @router.delete("/{var_id}")
 async def delete_variable(var_id: str):
     """Deletes a variable by ID."""

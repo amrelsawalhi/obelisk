@@ -20,6 +20,7 @@ from typing import Dict, Any, List, Optional
 import duckdb
 from app.config import settings
 from app.core.host_resolver import resolve_connection_host
+from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 
 class DbtRunner:
@@ -106,10 +107,18 @@ class DbtRunner:
         synced_info = []
 
         try:
-            conn.execute("INSTALL postgres; LOAD postgres;")
-            conn_str = f"dbname={database} host={host} port={port} user={user} password={password} sslmode={sslmode} connect_timeout=10"
-            alias = f"pg_sync_{uuid.uuid4().hex[:6]}"
-            conn.execute(f"ATTACH '{conn_str}' AS {alias} (TYPE POSTGRES);")
+            conn.execute("LOAD postgres;")
+            conn_str = build_pg_dsn(
+                dbname=database,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                sslmode=sslmode,
+                connect_timeout=10,
+            )
+            alias = validate_alias(f"pg_sync_{uuid.uuid4().hex[:6]}")
+            conn.execute(f"ATTACH {sql_string(conn_str)} AS {alias} (TYPE POSTGRES);")
 
             # Ensure bronze schema exists in PostgreSQL
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.bronze;")
