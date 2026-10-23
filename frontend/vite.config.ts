@@ -4,6 +4,19 @@ import react from '@vitejs/plugin-react'
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        // Monaco and xterm are only needed by the editor and terminal routes. Giving
+        // them their own chunks keeps them out of the shell that every page loads.
+        manualChunks: {
+          monaco: ['monaco-editor', '@monaco-editor/react'],
+          xterm: ['@xterm/xterm', '@xterm/addon-fit'],
+          'react-vendor': ['react', 'react-dom', 'react-router-dom'],
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     host: '0.0.0.0',
