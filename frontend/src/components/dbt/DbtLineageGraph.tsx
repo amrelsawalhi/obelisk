@@ -67,7 +67,7 @@ export const DbtLineageGraph: React.FC<DbtLineageGraphProps> = ({
     if (node.type === 'test') {
       return 'border-emerald-300 bg-emerald-50/60 text-emerald-950';
     }
-    if (node.layer === 'gold') {
+    if (node.folder === 'marts') {
       return 'border-indigo-300 bg-indigo-50/60 text-indigo-950';
     }
     return 'border-slate-300 bg-white text-slate-900';
@@ -80,7 +80,7 @@ export const DbtLineageGraph: React.FC<DbtLineageGraphProps> = ({
     if (node.type === 'test') {
       return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />;
     }
-    if (node.layer === 'gold') {
+    if (node.folder === 'marts') {
       return <Layers className="w-3.5 h-3.5 text-indigo-600 shrink-0" />;
     }
     return <FileCode className="w-3.5 h-3.5 text-sky-600 shrink-0" />;

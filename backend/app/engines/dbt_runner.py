@@ -1211,8 +1211,10 @@ class DbtRunner:
                 if matching_id:
                     found_in_manifest = True
                     target_node = manifest_nodes[matching_id]
+                    target_path = target_node.get("original_file_path", "")
+                    target_folder = "staging" if "staging" in target_path else "marts"
                     schema = target_node.get("config", {}).get("schema") or (
-                        staging_layer if "staging" in target_node.get("original_file_path", "") else marts_layer
+                        staging_layer if target_folder == "staging" else marts_layer
                     )
 
                     # Current Node
@@ -1221,9 +1223,10 @@ class DbtRunner:
                         "name": clean_name,
                         "type": "model",
                         "layer": schema,
+                        "folder": target_folder,
                         "is_current": True,
                         "materialized": target_node.get("config", {}).get("materialized", "table"),
-                        "path": target_node.get("original_file_path", ""),
+                        "path": target_path,
                     })
 
                     # Upstream Parents
@@ -1233,12 +1236,15 @@ class DbtRunner:
                             continue
                         up_name = up_id.split(".")[-1]
                         is_source = up_id.startswith("source.")
-                        up_layer = staging_layer if is_source or "stg_" in up_name else marts_layer
+                        up_path = manifest_nodes.get(up_id, {}).get("original_file_path", "")
+                        up_folder = "staging" if "staging" in up_path else "marts"
+                        up_layer = staging_layer if is_source or up_folder == "staging" else marts_layer
                         nodes.append({
                             "id": up_id,
                             "name": up_name,
                             "type": "source" if is_source else "model",
                             "layer": up_layer,
+                            "folder": "landing" if is_source else up_folder,
                             "is_current": False,
                         })
                         edges.append({"source": up_id, "target": matching_id})
@@ -1248,12 +1254,15 @@ class DbtRunner:
                     for down_id in downstreams:
                         down_name = down_id.split(".")[-1]
                         is_test = down_id.startswith("test.")
-                        down_layer = marts_layer if ("fct_" in down_name or "dim_" in down_name) else staging_layer
+                        down_path = manifest_nodes.get(down_id, {}).get("original_file_path", "")
+                        down_folder = "staging" if "staging" in down_path else "marts"
+                        down_layer = staging_layer if down_folder == "staging" else marts_layer
                         nodes.append({
                             "id": down_id,
                             "name": down_name if not is_test else down_id.split(".")[2],
                             "type": "test" if is_test else "model",
                             "layer": down_layer if not is_test else "test",
+                            "folder": down_folder,
                             "is_current": False,
                         })
                         edges.append({"source": matching_id, "target": down_id})

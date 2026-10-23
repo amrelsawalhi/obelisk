@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { tableSizeLabel } from '../../lib/format';
 import {
   X,
@@ -46,8 +46,29 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
   const [writeStrategy, setWriteStrategy] = useState<'append' | 'upsert'>('append');
   const [primaryKey, setPrimaryKey] = useState('id');
 
-  const defaultFolder = schemaName ? schemaName.replace(/[^a-zA-Z0-9_-]/g, '_') : 'bronze';
+  const defaultFolder = schemaName ? schemaName.replace(/[^a-zA-Z0-9_-]/g, '_') : '';
   const [targetFolder, setTargetFolder] = useState<string>(defaultFolder);
+  const [layerPaths, setLayerPaths] = useState<string[]>([]);
+  const folderChoices = Array.from(new Set([defaultFolder, ...layerPaths].filter(Boolean)));
+
+  useEffect(() => {
+    let active = true;
+    api
+      .listLayers()
+      .then((layers) => {
+        if (!active) return;
+        const paths = layers.map((layer) => layer.path);
+        setLayerPaths(paths);
+        const fallback = layers.find((layer) => layer.is_default)?.path ?? paths[0];
+        if (!defaultFolder && fallback) setTargetFolder((current) => current || fallback);
+      })
+      .catch(() => {
+        if (active) setLayerPaths([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [defaultFolder]);
 
   // Sample ingestion option
   const [isSample, setIsSample] = useState(false);
@@ -164,7 +185,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                     {' '}• Schema: <span className="text-slate-800 font-semibold">{schemaName}</span>
                   </>
                 )}
-                {' '}→ <span className="text-indigo-600 font-semibold">data/lakehouse/{targetFolder || 'bronze'}/</span>
+                {' '}→ <span className="text-indigo-600 font-semibold">data/lakehouse/{targetFolder || 'default layer'}/</span>
               </p>
             </div>
           </div>
@@ -344,10 +365,10 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                 <Folder className="w-3.5 h-3.5 text-indigo-600" />
                 <span>Target Lakehouse Folder</span>
               </label>
-              <span className="text-[10px] text-slate-400 font-mono">data/lakehouse/{targetFolder || 'bronze'}</span>
+              <span className="text-[10px] text-slate-400 font-mono">data/lakehouse/{targetFolder || 'default layer'}</span>
             </div>
             <div className="flex items-center gap-2 mb-1.5">
-              {['bronze', schemaName || 'custom', 'raw', 'staging'].map((f) => {
+              {folderChoices.map((f) => {
                 if (!f) return null;
                 return (
                   <button
@@ -369,7 +390,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
               type="text"
               value={targetFolder}
               onChange={(e) => setTargetFolder(e.target.value)}
-              placeholder="bronze"
+              placeholder="layer path, e.g. marts.sales"
               className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 font-mono text-slate-800 outline-hidden focus:border-indigo-500 focus:bg-white"
             />
           </div>

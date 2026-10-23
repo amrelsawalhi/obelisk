@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   X,
   ArrowDownToLine,
@@ -42,8 +42,28 @@ export const IngestModal: React.FC<IngestModalProps> = ({
   const defaultTargetName = table.name.includes('.') ? table.name.split('.').pop()! : table.name;
   const [targetName, setTargetName] = useState(defaultTargetName);
 
-  // Folder selection
-  const [targetFolder, setTargetFolder] = useState<string>('bronze');
+  // Folder selection. Empty means "the workspace's default layer"; the real layer
+  // paths are offered as chips once they load.
+  const [targetFolder, setTargetFolder] = useState<string>('');
+  const [layerPaths, setLayerPaths] = useState<string[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    api
+      .listLayers()
+      .then((layers) => {
+        if (!active) return;
+        setLayerPaths(layers.map((layer) => layer.path));
+        const fallback = layers.find((layer) => layer.is_default)?.path ?? layers[0]?.path;
+        if (fallback) setTargetFolder((current) => current || fallback);
+      })
+      .catch(() => {
+        if (active) setLayerPaths([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Sample ingestion option
   const [isSample, setIsSample] = useState(false);
@@ -90,7 +110,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({
         write_strategy: mode === 'incremental' ? writeStrategy : undefined,
         primary_key: mode === 'incremental' && writeStrategy === 'upsert' ? primaryKey : undefined,
         target_name: targetFileName,
-        target_folder: targetFolder.trim() || 'bronze',
+        target_folder: targetFolder.trim(),
         limit: isSample ? Number(sampleLimit) : undefined,
         schedule: isScheduled ? getEffectiveCron() : undefined,
         schedule_engine: isScheduled ? scheduleEngine : undefined,
@@ -263,7 +283,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({
               </span>
             </label>
             <div className="flex items-center gap-2 mb-1.5">
-              {['bronze', 'raw', 'staging', 'events'].map((folder) => (
+              {layerPaths.map((folder) => (
                 <button
                   key={folder}
                   type="button"
@@ -282,7 +302,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({
               type="text"
               value={targetFolder}
               onChange={(e) => setTargetFolder(e.target.value)}
-              placeholder="bronze"
+              placeholder="layer path, e.g. marts.sales"
               className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 font-mono text-slate-800 outline-hidden focus:border-indigo-500 focus:bg-white"
             />
           </div>

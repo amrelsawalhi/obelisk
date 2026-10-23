@@ -151,6 +151,10 @@ export const api = {
     const res = await apiClient.get<Connection[]>('/catalog/connections');
     return res.data;
   },
+  listLayers: async (): Promise<import('./types').Layer[]> => {
+    const res = await apiClient.get<import('./types').Layer[]>('/layers');
+    return res.data;
+  },
   createConnection: async (req: CreateConnectionRequest): Promise<Connection> => {
     const res = await apiClient.post<Connection>('/catalog/connections', req);
     return res.data;

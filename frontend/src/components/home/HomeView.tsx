@@ -99,9 +99,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const totalCronCount = cronJobs.length;
   const dagsterEngine = orchestratorEngines.find((e) => e.id === 'dagster');
 
-  const silverModels = assetNodes.filter((n) => n.layer === 'silver');
-  const goldModels = assetNodes.filter((n) => n.layer === 'gold');
-  const totalDbtModels = silverModels.length + goldModels.length;
+  const stagingModels = assetNodes.filter((n) => n.folder === 'staging');
+  const martModels = assetNodes.filter((n) => n.folder === 'marts');
+  const totalDbtModels = stagingModels.length + martModels.length;
 
   const notebooksCount = notebooks.length;
   const isMarimoRunning = notebookStatus?.is_running ?? false;
@@ -297,7 +297,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                 </div>
               </div>
               <div className="mt-2 pt-2 border-t border-violet-100 text-[11px] text-slate-500 font-mono truncate">
-                {silverModels.length} Staging • {goldModels.length} Marts
+                {stagingModels.length} Staging • {martModels.length} Marts
               </div>
             </div>
 

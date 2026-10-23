@@ -37,9 +37,9 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
 
     let template = '';
     if (layer === 'staging') {
-      template = `{{ config(materialized='${materialization}', schema='silver') }}\n\n` +
+      template = `{{ config(materialized='${materialization}', schema=var('layer_staging')) }}\n\n` +
         `with source as (\n` +
-        `    select * from {{ source('bronze', '${sourceTable || 'orders'}') }}\n` +
+        `    select * from {{ source('landing', '${sourceTable || 'orders'}') }}\n` +
         `),\n\n` +
         `cleaned as (\n` +
         `    select\n` +
@@ -52,7 +52,7 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
         `)\n\n` +
         `select * from cleaned\n`;
     } else {
-      template = `{{ config(materialized='${materialization}', schema='gold') }}\n\n` +
+      template = `{{ config(materialized='${materialization}', schema=var('layer_marts')) }}\n\n` +
         `with staging as (\n` +
         `    select * from {{ ref('stg_orders') }}\n` +
         `)\n\n` +
@@ -127,7 +127,7 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
 
           {/* Target Layer Selector */}
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-700">Medallion Layer</label>
+            <label className="text-xs font-semibold text-slate-700">Model Folder</label>
             <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"
@@ -139,7 +139,7 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
                 }`}
               >
                 <div className="font-semibold text-xs text-slate-900 flex items-center justify-between">
-                  <span>Silver Staging</span>
+                  <span>Staging</span>
                   {layer === 'staging' && <Check className="w-3.5 h-3.5 text-sky-600" />}
                 </div>
                 <div className="text-[10px] text-slate-500 mt-1">models/staging/</div>
@@ -155,7 +155,7 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
                 }`}
               >
                 <div className="font-semibold text-xs text-slate-900 flex items-center justify-between">
-                  <span>Gold Marts</span>
+                  <span>Marts</span>
                   {layer === 'marts' && <Check className="w-3.5 h-3.5 text-indigo-600" />}
                 </div>
                 <div className="text-[10px] text-slate-500 mt-1">models/marts/</div>
@@ -166,7 +166,7 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
           {/* Staging source table option */}
           {layer === 'staging' && (
             <div className="space-y-1.5">
-              <label className="text-xs font-semibold text-slate-700">Source Bronze Table</label>
+              <label className="text-xs font-semibold text-slate-700">Landing Table</label>
               <input
                 type="text"
                 placeholder="orders"
@@ -175,7 +175,7 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
                 className="w-full bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs font-mono text-slate-900 placeholder-slate-400 focus:outline-sky-500 shadow-2xs"
               />
               <p className="text-[10px] text-slate-400">
-                Resolves to {`{{ source('bronze', '${sourceTable || 'orders'}') }}`}
+                Resolves to {`{{ source('landing', '${sourceTable || 'orders'}') }}`}
               </p>
             </div>
           )}

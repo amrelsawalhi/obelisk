@@ -369,10 +369,27 @@ export interface NotebookServerStatus {
   notebooks_dir: string;
 }
 
+export interface Layer {
+  /** Dot-separated path, e.g. "raw" or "marts.sales". */
+  path: string;
+  name: string;
+  parent_path: string | null;
+  depth: number;
+  position: number;
+  description?: string | null;
+  color?: string | null;
+  icon?: string | null;
+  is_default: boolean;
+  object_count: number;
+}
+
 export interface AssetGraphNode {
   id: string;
   name: string;
-  layer: 'bronze' | 'silver' | 'gold' | 'custom';
+  /** Layer path the node belongs to, e.g. "raw" or "marts.sales". */
+  layer: string;
+  /** Project folder it came from: landing, staging or marts. */
+  folder?: string;
   type: string;
   path?: string;
   sql_code?: string;
@@ -632,7 +649,9 @@ export interface DbtLineageNode {
   id: string;
   name: string;
   type: 'model' | 'source' | 'test';
-  layer: 'bronze' | 'silver' | 'gold' | 'test' | string;
+  /** Layer path, or "test" for a dbt test node. */
+  layer: string;
+  folder?: string;
   is_current?: boolean;
   materialized?: string;
   path?: string;
