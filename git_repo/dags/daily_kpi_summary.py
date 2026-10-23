@@ -33,7 +33,7 @@ def daily_kpi_summary(context: AssetExecutionContext) -> MaterializeResult:
         FROM (
             SELECT 100.0 AS amount UNION ALL SELECT 250.0 UNION ALL SELECT 75.0
         )
-    """).to_polars()
+    """)
 
     total_orders = int(res["total_orders"][0])
     gross_revenue = float(res["gross_revenue"][0])
