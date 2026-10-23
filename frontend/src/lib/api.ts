@@ -155,6 +155,31 @@ export const api = {
     const res = await apiClient.get<import('./types').Layer[]>('/layers');
     return res.data;
   },
+  createLayer: async (req: {
+    path: string;
+    description?: string;
+  }): Promise<import('./types').Layer> => {
+    const res = await apiClient.post<import('./types').Layer>('/layers', req);
+    return res.data;
+  },
+  updateLayer: async (
+    path: string,
+    req: { name?: string; description?: string; position?: number; is_default?: boolean },
+  ): Promise<import('./types').Layer> => {
+    const res = await apiClient.patch<import('./types').Layer>(
+      `/layers/${encodeURIComponent(path)}`,
+      req,
+    );
+    return res.data;
+  },
+  deleteLayer: async (
+    path: string,
+  ): Promise<{ deleted: string; default_layer: string | null }> => {
+    const res = await apiClient.delete<{ deleted: string; default_layer: string | null }>(
+      `/layers/${encodeURIComponent(path)}`,
+    );
+    return res.data;
+  },
   createConnection: async (req: CreateConnectionRequest): Promise<Connection> => {
     const res = await apiClient.post<Connection>('/catalog/connections', req);
     return res.data;
