@@ -60,9 +60,21 @@ cleanup() {
 
 trap cleanup SIGINT SIGTERM EXIT
 
-# 5. Start Backend
+# 5. Guard the API port (a stale uvicorn parent can hold it while unresponsive)
+echo "[*] Checking port 8000 ..."
+if ! "$PROJECT_ROOT/$PYTHON_BIN" "$PROJECT_ROOT/backend/scripts/preflight_port.py" --port 8000; then
+    echo "[!] Aborting: port 8000 is not available."
+    exit 1
+fi
+
+# 6. Start Backend. --reload is opt-in (OBELISK_DEV_RELOAD=1): the reloader is
+#    what leaves orphaned socket holders behind.
+RELOAD_FLAG=""
+if [ "${OBELISK_DEV_RELOAD:-0}" = "1" ]; then
+    RELOAD_FLAG="--reload"
+fi
 echo "[*] Starting FastAPI Backend on http://localhost:8000 ..."
-(cd "$PROJECT_ROOT/backend" && "$PROJECT_ROOT/$PYTHON_BIN" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload) &
+(cd "$PROJECT_ROOT/backend" && "$PROJECT_ROOT/$PYTHON_BIN" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 $RELOAD_FLAG) &
 BACKEND_PID=$!
 
 sleep 2
