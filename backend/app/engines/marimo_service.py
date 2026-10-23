@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 import psutil
 
+from app.config import settings
+
 class MarimoService:
     def __init__(
         self,
@@ -42,6 +44,21 @@ class MarimoService:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}{self.base_url}"
+
+    @property
+    def session_ttl_seconds(self) -> int:
+        """Seconds a notebook kernel outlives its browser tab (0 = never expires).
+
+        `marimo edit` leaves this unset by default, so a closed tab keeps its
+        kernel (~155 MB resident) until the backend restarts. Passing the value
+        to `--session-ttl` makes Marimo close the session -- and shut down its
+        kernel -- that many seconds after the websocket disconnects.
+        """
+        try:
+            configured = int(settings.MARIMO_SESSION_TTL_SECONDS)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, configured)
 
     def is_running(self) -> bool:
         """Checks if process is alive and responds to HTTP probe."""
@@ -72,6 +89,7 @@ class MarimoService:
                 "base_url": self.base_url,
                 "url": self.url,
                 "pid": self._process.pid if self._process else None,
+                "session_ttl_seconds": self.session_ttl_seconds,
             }
 
         cmd = [
@@ -88,6 +106,13 @@ class MarimoService:
             self.base_url,
             "--skip-update-check",
         ]
+
+        # Reclaim notebook kernels once their tab disconnects. `marimo edit` has no
+        # default TTL, so without this each kernel stays resident until the backend
+        # restarts; 0 keeps that legacy behaviour.
+        ttl_seconds = self.session_ttl_seconds
+        if ttl_seconds > 0:
+            cmd += ["--session-ttl", str(ttl_seconds)]
 
         # Stream the child's output to disk (never an unread PIPE) so it can never
         # deadlock on a full pipe buffer.
@@ -127,6 +152,7 @@ class MarimoService:
             "url": self.url,
             "pid": self._process.pid,
             "notebooks_dir": str(self.notebooks_dir),
+            "session_ttl_seconds": ttl_seconds,
         }
 
     def _tail_log(self, max_bytes: int = 4096) -> str:
@@ -213,6 +239,7 @@ class MarimoService:
             "uptime_seconds": uptime_seconds,
             "notebook_count": len(notebooks),
             "notebooks_dir": str(self.notebooks_dir),
+            "session_ttl_seconds": self.session_ttl_seconds,
         }
 
     def list_notebooks(self) -> List[Dict[str, Any]]:

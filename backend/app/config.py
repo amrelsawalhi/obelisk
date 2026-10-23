@@ -72,6 +72,12 @@ class Settings(BaseSettings):
         default_factory=lambda: os.getenv("STORAGE_URI", "file:///data/lakehouse")
     )
 
+    # Marimo notebook kernel expiry: seconds a notebook's kernel survives after its
+    # browser tab disconnects. In `marimo edit` mode Marimo disables this by default,
+    # so every notebook ever opened leaves a kernel (~155 MB) resident until the
+    # backend restarts. 0 disables the expiry (pre-change behaviour).
+    MARIMO_SESSION_TTL_SECONDS: int = 600
+
     # Docker network and host
     OBELISK_NET: str = "obelisk_net"
     DOCKER_HOST: str | None = Field(default_factory=lambda: os.getenv("DOCKER_HOST", None))
