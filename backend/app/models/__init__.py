@@ -6,5 +6,19 @@ from app.models.asset import Asset
 from app.models.pipeline_definition import PipelineDefinition
 from app.models.variable import Variable
 from app.models.cron_job import CronJob
+from app.models.layer import Layer
+from app.models.catalog_object import CatalogObject
 
-__all__ = ["Base", "Connection", "ServiceConfig", "QueryHistory", "Asset", "PipelineDefinition", "Variable", "CronJob"]
+__all__ = [
+    "Base",
+    "Connection",
+    "ServiceConfig",
+    "QueryHistory",
+    "Asset",
+    "PipelineDefinition",
+    "Variable",
+    "CronJob",
+    "Layer",
+    "CatalogObject",
+]
+

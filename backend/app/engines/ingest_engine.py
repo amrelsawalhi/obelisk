@@ -18,6 +18,7 @@ import httpx
 from app.config import settings
 from app.engines.duckdb_engine import duckdb_engine
 from app.core.host_resolver import resolve_connection_host
+from app.core.layers import safe_layer_path
 from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,37 @@ class IngestEngine:
                         last_materialized_at=excluded.last_materialized_at;
                     """,
                     (asset_id, name, layer, storage_uri, record_count, metadata_json, now_iso, now_iso),
+                )
+                # Phase 1a: the catalog registry mirrors the legacy assets table so
+                # it can never drift while `assets` is still the write target. One
+                # statement, same transaction — Phase 4 makes catalog_objects the
+                # authoritative write and deletes this mirror.
+                layer_path = safe_layer_path(layer)
+                cur.execute(
+                    """
+                    INSERT INTO catalog_objects (
+                        id, fqn, name, layer_path, kind, backend, location,
+                        schema_json, row_count, version, created_at, last_materialized_at
+                    )
+                    VALUES (?, ?, ?, ?, 'parquet', 'local', ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(fqn) DO UPDATE SET
+                        location=excluded.location,
+                        schema_json=excluded.schema_json,
+                        row_count=excluded.row_count,
+                        last_materialized_at=excluded.last_materialized_at,
+                        version=catalog_objects.version + 1;
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        f"lakehouse.{layer_path}.{name}",
+                        name,
+                        layer_path,
+                        storage_uri,
+                        metadata_json,
+                        record_count,
+                        now_iso,
+                        now_iso,
+                    ),
                 )
             conn.close()
         except Exception:

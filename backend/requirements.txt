@@ -14,6 +14,7 @@ python-multipart>=0.0.9
 # Internal Brain & Database ORM (SQLite / aiosqlite WAL)
 sqlalchemy[asyncio]>=2.0.28,<3.0.0
 aiosqlite>=0.20.0
+alembic>=1.13.0
 greenlet>=3.0.3
 
 # In-Process OLAP & Zero-Copy Arrow / Polars

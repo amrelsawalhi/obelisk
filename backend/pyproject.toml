@@ -17,6 +17,7 @@ dependencies = [
     "fsspec>=2024.2.0",
     "s3fs>=2024.2.0",
     "sqlalchemy[asyncio]>=2.0.0",
+    "alembic>=1.13.0",
     "greenlet>=3.0.0",
     "aiosqlite>=0.20.0",
     "cryptography>=42.0.0",

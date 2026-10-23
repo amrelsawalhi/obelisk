@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 from typing import AsyncGenerator
@@ -8,7 +9,25 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from app.config import settings
-from app.models.base import Base
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+
+def run_migrations() -> None:
+    """Applies every pending Alembic revision to the brain database.
+
+    Blocking by design — Alembic has no async API. Callers use
+    ``asyncio.to_thread`` so the event loop keeps serving requests during startup.
+    Alembic's own ``env.py`` derives the URL from Settings, so this always targets
+    the same file as the async engine.
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    config = Config(str(BACKEND_DIR / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
+    command.upgrade(config, "head")
+
 
 def _resolve_engine_url() -> str:
     """Returns the SQLAlchemy URL for the internal brain database.
@@ -174,11 +193,18 @@ async def _migrate_assets_unique_constraint(conn) -> None:
 
 
 async def init_db() -> None:
-    """Initialize database tables and enforce WAL mode."""
-    # Ensure directory exists
+    """Initializes the brain database and enforces WAL mode.
+
+    Schema changes are owned by Alembic (audit M16): ``create_all`` is gone, so a
+    fresh install and an upgraded one follow the same path — ``upgrade head``.
+    Migrations run synchronously in a worker thread against the same SQLite file
+    the async engine uses, because Alembic's API is blocking.
+    """
     if settings.is_sqlite:
         path_str = settings.sqlite_db_path
         Path(path_str).parent.mkdir(parents=True, exist_ok=True)
+
+    await asyncio.to_thread(run_migrations)
 
     async with engine.begin() as conn:
         # Explicitly verify PRAGMA in async session
@@ -186,15 +212,15 @@ async def init_db() -> None:
             # ensures WAL pragma is executed
             __import__("sqlalchemy").text("PRAGMA journal_mode=WAL;")
         ))
-        await conn.run_sync(Base.metadata.create_all)
         # Workstream 3.1: legacy databases key assets on `name` alone, which
-        # collides across tiers. Runs after create_all so fresh databases (already
-        # correct) short-circuit.
+        # collides across tiers. Runs after migrations so databases created by
+        # the baseline (already correct) short-circuit.
         await _migrate_assets_unique_constraint(conn)
 
     # Seed default system data exactly once at startup (idempotent).
     async with AsyncSessionLocal() as session:
         await seed_defaults(session)
+
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency for obtaining an async database session."""
