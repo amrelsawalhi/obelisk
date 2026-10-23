@@ -658,58 +658,114 @@ class Introspector:
         return {"columns": columns, "rows": slice_records, "row_count": len(slice_records)}
 
     @staticmethod
+    def _table_from_file(f: Path, schema_name: str, fqn: str) -> Optional[Dict[str, Any]]:
+        """Describes one Parquet file from its footer: columns, rows and size.
+
+        Shared by the single-directory and whole-lakehouse paths so they cannot drift.
+        A file that cannot be read is skipped rather than failing the whole listing.
+        """
+        try:
+            parquet_file = pq.ParquetFile(str(f))
+            schema = parquet_file.schema_arrow
+            num_rows = parquet_file.metadata.num_rows
+
+            cols = []
+            for field in schema:
+                cols.append({
+                    "name": field.name,
+                    "data_type": str(field.type),
+                    "is_nullable": field.nullable,
+                    "is_primary_key": False,
+                })
+
+            file_size = f.stat().st_size
+            return {
+                "name": f.stem,
+                "schema_name": schema_name,
+                "fqn": fqn,
+                "columns": cols,
+                "row_count": num_rows,
+                "size_bytes": file_size,
+                "size_human": format_bytes(file_size),
+                "size_is_estimate": False,
+                "file_path": f.as_posix(),
+            }
+        except Exception:
+            return None
+
+    @staticmethod
     def introspect_parquet(dir_or_file_path: str, schema_name: Optional[str] = None) -> List[Dict[str, Any]]:
         """Introspects Parquet metadata and columns from disk."""
         path = Path(dir_or_file_path)
-        tables = []
-
-        files = []
+        files: List[Path] = []
         inferred_schema = schema_name
+
         if path.is_file() and path.suffix == ".parquet":
             files = [path]
             if not inferred_schema:
-                # Tier is inherited from the parent folder name (bronze, silver, raw,
-                # landing, ...) — no hardcoded medallion enforcement.
+                # The schema is the folder the file sits in; nothing is reserved.
                 parent_name = path.parent.name
                 inferred_schema = parent_name if parent_name and parent_name != "lakehouse" else "main"
         elif path.is_dir():
-            files = list(path.glob("*.parquet"))
+            files = sorted(path.glob("*.parquet"))
             if not inferred_schema:
                 inferred_schema = path.name if path.name != "lakehouse" else "main"
 
         final_schema = inferred_schema or "main"
+        clean_schema = final_schema.replace("/", ".")
 
+        tables = []
         for f in files:
-            try:
-                parquet_file = pq.ParquetFile(str(f))
-                schema = parquet_file.schema_arrow
-                num_rows = parquet_file.metadata.num_rows
-
-                cols = []
-                for field in schema:
-                    cols.append({
-                        "name": field.name,
-                        "data_type": str(field.type),
-                        "is_nullable": field.nullable,
-                        "is_primary_key": False,
-                    })
-
-                clean_schema = final_schema.replace("/", ".")
-                file_size = f.stat().st_size
-                tables.append({
-                    "name": f.stem,
-                    "schema_name": final_schema,
-                    "fqn": f"lakehouse.{clean_schema}.{f.stem}",
-                    "columns": cols,
-                    "row_count": num_rows,
-                    "size_bytes": file_size,
-                    "size_human": format_bytes(file_size),
-                    "size_is_estimate": False,
-                    "file_path": f.as_posix(),
-                })
-            except Exception:
-                continue
-
+            entry = Introspector._table_from_file(
+                f, final_schema, f"lakehouse.{clean_schema}.{f.stem}"
+            )
+            if entry:
+                tables.append(entry)
         return tables
+
+    @staticmethod
+    def introspect_lakehouse(root: Path) -> tuple[List[str], Dict[str, List[Dict[str, Any]]]]:
+        """Walks a lakehouse root once and reads every Parquet footer in that pass.
+
+        Returns ``(directories, tables_by_directory)``: directories are relative POSIX
+        paths with hidden folders skipped, and the table map is keyed the same way,
+        with ``""`` holding the files that sit directly in the root.
+
+        The catalog tree used to call :meth:`introspect_parquet` once per directory, so
+        every directory re-walked the tree and paid its own thread hop. This is one
+        walk, one footer read per file, and one hop for the whole tree.
+        """
+        root = Path(root)
+        directories: List[str] = []
+        tables: Dict[str, List[Dict[str, Any]]] = {}
+
+        if not root.is_dir():
+            return directories, tables
+
+        for current, subdirs, filenames in os.walk(root):
+            subdirs[:] = sorted(name for name in subdirs if not name.startswith("."))
+            current_path = Path(current)
+            rel = current_path.relative_to(root).as_posix()
+            rel = "" if rel == "." else rel
+            if rel:
+                directories.append(rel)
+
+            schema_name = "main" if not rel else rel.replace("/", ".")
+            entries = []
+            for filename in sorted(filenames):
+                if not filename.endswith(".parquet"):
+                    continue
+                entry = Introspector._table_from_file(
+                    current_path / filename,
+                    schema_name,
+                    f"lakehouse.{schema_name}.{filename[: -len('.parquet')]}",
+                )
+                if entry:
+                    entries.append(entry)
+            if entries:
+                tables[rel] = entries
+
+        directories.sort(key=str.lower)
+        return directories, tables
 
 introspector = Introspector()

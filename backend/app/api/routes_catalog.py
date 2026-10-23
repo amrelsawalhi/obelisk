@@ -816,43 +816,32 @@ async def get_catalog_tree(
 
     tree: List[Dict[str, Any]] = []
 
-    # 1. Discover all Lakehouse directories and nested subfolders
+    # 1. Lakehouse: one walk over the tree, with every Parquet footer read in it
     lakehouse_root = settings.lakehouse_root_path
     lakehouse_root.mkdir(parents=True, exist_ok=True)
 
-    # Introspect any flat Parquet tables residing directly in lakehouse root
-    root_flat_tables = await asyncio.to_thread(introspector.introspect_parquet, str(lakehouse_root), "main")
-
-    all_dirs = []
-    for p in sorted(lakehouse_root.rglob("*")):
-        if p.is_dir():
-            rel_parts = p.relative_to(lakehouse_root).parts
-            if not any(part.startswith(".") for part in rel_parts):
-                all_dirs.append(p)
-
-    all_dirs.sort(key=lambda d: d.relative_to(lakehouse_root).as_posix().lower())
+    discovered_dirs, tables_by_dir = await asyncio.to_thread(
+        introspector.introspect_lakehouse, lakehouse_root
+    )
 
     lakehouse_directories: List[Dict[str, Any]] = []
     all_lakehouse_tables: List[Dict[str, Any]] = []
 
-    for d in all_dirs:
-        rel_posix = d.relative_to(lakehouse_root).as_posix()
-        parent_posix = d.parent.relative_to(lakehouse_root).as_posix() if d.parent != lakehouse_root else None
-        depth = len(d.relative_to(lakehouse_root).parts) - 1
-
-        dir_tables = await asyncio.to_thread(introspector.introspect_parquet, str(d), rel_posix)
-        dir_entry = {
+    for rel_posix in discovered_dirs:
+        parts = rel_posix.split("/")
+        dir_tables = tables_by_dir.get(rel_posix, [])
+        lakehouse_directories.append({
             "id": f"lakehouse:{rel_posix}",
-            "name": d.name,
+            "name": parts[-1],
             "tier": rel_posix,
             "path": rel_posix,
-            "parent_path": parent_posix,
-            "depth": depth,
+            "parent_path": "/".join(parts[:-1]) or None,
+            "depth": len(parts) - 1,
             "tables": dir_tables,
-        }
-        lakehouse_directories.append(dir_entry)
+        })
         all_lakehouse_tables.extend(dir_tables)
 
+    root_flat_tables = tables_by_dir.get("", [])
     if root_flat_tables:
         lakehouse_directories.insert(0, {
             "id": "lakehouse:root",
