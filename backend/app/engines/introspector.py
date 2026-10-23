@@ -11,6 +11,26 @@ import httpx
 
 from app.core.host_resolver import resolve_connection_host
 
+
+def format_bytes(num_bytes: Optional[int]) -> Optional[str]:
+    """Formats a byte count as ``B``/``KB``/``MB``/``GB``/``TB`` (binary units).
+
+    Catalog listings show physical table size instead of a row count because size
+    is served from database metadata (``pg_total_relation_size``,
+    ``data_length``, ``storageSize``, segment bytes) and never requires a scan.
+    Returns ``None`` when the size is unknown so the UI can render "—" rather
+    than a misleading zero.
+    """
+    if num_bytes is None or num_bytes < 0:
+        return None
+    size = float(num_bytes)
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            return f"{int(round(size))} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return None
+
 @dataclass
 class ColumnInfo:
     name: str
@@ -41,7 +61,13 @@ class Introspector:
         schema: str = "public",
         sslmode: str = "disable",
     ) -> List[Dict[str, Any]]:
-        """Introspects live PostgreSQL tables, columns, primary keys, and counts."""
+        """Introspects live PostgreSQL tables, columns and primary keys.
+
+        ``size_bytes`` comes from ``pg_total_relation_size``, a catalog lookup, so
+        opening the platform never scans user tables. Row counts are deliberately
+        not reported: the planner's ``reltuples`` is a stale statistic that reads
+        -1 until the first ANALYZE, and a wrong number is worse than none.
+        """
         resolved_host = resolve_connection_host(host, port)
         conn = psycopg2.connect(
             host=resolved_host,
@@ -64,8 +90,15 @@ class Introspector:
                     params = ()
 
                 q_tables = f"""
-                    SELECT table_schema, table_name
+                    SELECT information_schema.tables.table_schema,
+                           information_schema.tables.table_name,
+                           pg_total_relation_size(c.oid)
                     FROM information_schema.tables
+                    JOIN pg_namespace n
+                      ON n.nspname = information_schema.tables.table_schema
+                    JOIN pg_class c
+                      ON c.relnamespace = n.oid
+                     AND c.relname = information_schema.tables.table_name
                     WHERE {schema_cond} AND table_type = 'BASE TABLE'
                     ORDER BY table_schema, table_name;
                 """
@@ -117,14 +150,18 @@ class Introspector:
                         "is_primary_key": c_name in pk_map.get((s_name, t_name), set()),
                     })
 
-                # Skip expensive count(*) to protect against sequential scans on large tables
-                for s_name, t_name in raw_tables:
+                # pg_total_relation_size is a catalog lookup: no table scan, and
+                # no stale row estimate is reported alongside it.
+                for s_name, t_name, relation_bytes in raw_tables:
                     display_name = f"{s_name}.{t_name}" if s_name != "public" else t_name
+                    size_bytes = int(relation_bytes) if relation_bytes is not None else None
                     tables.append({
                         "name": display_name,
                         "schema_name": s_name,
                         "columns": col_map.get((s_name, t_name), []),
-                        "row_count": None,
+                        "size_bytes": size_bytes,
+                        "size_human": format_bytes(size_bytes),
+                        "size_is_estimate": False,
                     })
         finally:
             conn.close()
@@ -228,16 +265,22 @@ class Introspector:
                                     "is_primary_key": (k == "_id"),
                                 }
 
+                    # storageSize is the on-disk footprint reported by collStats.
+                    # Document counts are omitted on purpose: count_documents({})
+                    # scans the whole collection and estimated_document_count()
+                    # can be far off, so the catalog reports size only.
                     try:
-                        coll_row_count = coll.count_documents({})
+                        coll_size = int(db.command("collStats", coll_name).get("storageSize") or 0)
                     except Exception:
-                        coll_row_count = None
+                        coll_size = None
 
                     tables.append({
                         "name": coll_name,
                         "schema_name": db_name,
                         "columns": list(cols.values()),
-                        "row_count": coll_row_count,
+                        "size_bytes": coll_size,
+                        "size_human": format_bytes(coll_size),
+                        "size_is_estimate": False,
                     })
         finally:
             client.close()
@@ -308,7 +351,8 @@ class Introspector:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT table_name, table_rows
+                    SELECT table_name,
+                           COALESCE(data_length, 0) + COALESCE(index_length, 0)
                     FROM information_schema.tables
                     WHERE table_schema = %s AND table_type = 'BASE TABLE'
                     ORDER BY table_name;
@@ -317,7 +361,7 @@ class Introspector:
                 )
                 table_rows = cur.fetchall()
                 table_names = [r[0] for r in table_rows]
-                row_count_est = {r[0]: r[1] for r in table_rows}
+                size_est = {r[0]: r[1] for r in table_rows}
 
                 # Fetch primary keys
                 cur.execute(
@@ -351,12 +395,17 @@ class Introspector:
                         "is_primary_key": c_name in pk_map.get(t_name, set()),
                     })
 
+                # InnoDB's data_length is a statistic rather than an exact value,
+                # but reading it never scans the table.
                 for t_name in table_names:
+                    t_bytes = size_est.get(t_name)
                     tables.append({
                         "name": t_name,
                         "schema_name": database,
                         "columns": col_map.get(t_name, []),
-                        "row_count": None,
+                        "size_bytes": int(t_bytes) if t_bytes is not None else None,
+                        "size_human": format_bytes(t_bytes),
+                        "size_is_estimate": True,
                     })
         finally:
             conn.close()
@@ -421,17 +470,25 @@ class Introspector:
         try:
             cur = conn.cursor()
             cur.execute("""
-                SELECT table_name
-                FROM all_tables
-                WHERE owner = UPPER(:1)
-                ORDER BY table_name
+                SELECT t.table_name, s.bytes
+                FROM all_tables t
+                LEFT JOIN user_segments s
+                  ON s.segment_name = t.table_name AND s.segment_type = 'TABLE'
+                WHERE t.owner = UPPER(:1)
+                ORDER BY t.table_name
             """, [username])
-            table_names = [r[0] for r in cur.fetchall()]
-            if not table_names:
-                cur.execute("SELECT table_name FROM user_tables ORDER BY table_name")
-                table_names = [r[0] for r in cur.fetchall()]
+            table_rows = cur.fetchall()
+            if not table_rows:
+                cur.execute("""
+                    SELECT t.table_name, s.bytes
+                    FROM user_tables t
+                    LEFT JOIN user_segments s
+                      ON s.segment_name = t.table_name AND s.segment_type = 'TABLE'
+                    ORDER BY t.table_name
+                """)
+                table_rows = cur.fetchall()
 
-            for t_name in table_names:
+            for t_name, t_bytes in table_rows:
                 cur.execute("""
                     SELECT column_name, data_type, nullable
                     FROM all_tab_columns
@@ -450,7 +507,9 @@ class Introspector:
                     "name": t_name,
                     "schema_name": username.upper(),
                     "columns": cols,
-                    "row_count": None,
+                    "size_bytes": int(t_bytes) if t_bytes is not None else None,
+                    "size_human": format_bytes(t_bytes),
+                    "size_is_estimate": True,
                 })
         finally:
             conn.close()
@@ -630,12 +689,16 @@ class Introspector:
                     })
 
                 clean_schema = final_schema.replace("/", ".")
+                file_size = f.stat().st_size
                 tables.append({
                     "name": f.stem,
                     "schema_name": final_schema,
                     "fqn": f"lakehouse.{clean_schema}.{f.stem}",
                     "columns": cols,
                     "row_count": num_rows,
+                    "size_bytes": file_size,
+                    "size_human": format_bytes(file_size),
+                    "size_is_estimate": False,
                     "file_path": f.as_posix(),
                 })
             except Exception:

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { tableSizeLabel } from '../../lib/format';
 import {
   ChevronRight,
   ChevronDown,
@@ -778,9 +779,9 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
                                           </button>
                                         </div>
 
-                                        {table.row_count != null && (
+                                        {tableSizeLabel(table) != null && (
                                           <span className="text-[10px] font-mono text-slate-400 shrink-0">
-                                            {Number(table.row_count).toLocaleString()} rows
+                                            {tableSizeLabel(table)}
                                           </span>
                                         )}
                                       </div>
@@ -1084,9 +1085,9 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
                                                     </span>
                                                   )}
                                                 </div>
-                                                {table.row_count != null && (
+                                                {tableSizeLabel(table) != null && (
                                                   <span className="text-[10px] font-mono text-slate-400 shrink-0">
-                                                    {Number(table.row_count).toLocaleString()} rows
+                                                    {tableSizeLabel(table)}
                                                   </span>
                                                 )}
                                               </div>

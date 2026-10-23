@@ -75,7 +75,12 @@ async def test_postgres_introspection_dynamic_mutation(source_postgres_params):
         assert len(matched_tables) == 1, f"Table {table_name} not discovered by introspector!"
         tbl_info = matched_tables[0]
 
-        assert tbl_info["row_count"] == 3
+        # Physical size is served from pg_total_relation_size, never a scan.
+        assert tbl_info["size_bytes"] is not None and tbl_info["size_bytes"] > 0
+        assert tbl_info["size_human"]
+        # Row counts are deliberately absent for database tables: stale planner
+        # statistics are worse than no number at all.
+        assert "row_count" not in tbl_info
         col_names = {c["name"] for c in tbl_info["columns"]}
         assert {"id", "customer_name", "total_amount", "is_active", "created_at"}.issubset(col_names)
 
@@ -145,7 +150,12 @@ def test_mongodb_introspection_dynamic_mutation(source_mongo_params):
         matched = [t for t in tables if t["name"] == coll_name]
         assert len(matched) == 1, f"Collection {coll_name} not found by MongoDB introspector!"
         coll_info = matched[0]
-        assert coll_info["row_count"] == 3
+        # Size comes from collStats; document counts are intentionally omitted
+        # because counting documents either scans the collection or returns a
+        # rough estimate.
+        assert coll_info["size_bytes"] is not None and coll_info["size_bytes"] > 0
+        assert coll_info["size_human"]
+        assert "row_count" not in coll_info
 
         col_names = {c["name"] for c in coll_info["columns"]}
         assert {"event_type", "user_id", "score", "verified", "ts"}.issubset(col_names)
@@ -173,7 +183,12 @@ def test_mongodb_introspection_dynamic_mutation(source_mongo_params):
 
 def test_parquet_introspection(tmp_path):
     """Verifies Parquet file introspection directly against disk."""
-    test_file = tmp_path / "test_bronze_sample.parquet"
+    # The introspector inherits the tier from the parent folder name, which is
+    # the documented behaviour (no hardcoded medallion): a file under bronze/
+    # belongs to the bronze layer.
+    tier_dir = tmp_path / "bronze"
+    tier_dir.mkdir()
+    test_file = tier_dir / "test_bronze_sample.parquet"
 
     table = pa.Table.from_pydict({
         "order_id": [1, 2, 3, 4, 5],

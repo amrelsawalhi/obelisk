@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { tableSizeLabel } from '../../lib/format';
 import Editor from '@monaco-editor/react';
 import axios from 'axios';
 import {
@@ -761,7 +762,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
             kind: monaco.languages.CompletionItemKind.Struct,
             insertText: fullQualified,
             detail: `Remote Table (${node.name})`,
-            documentation: `Source: ${node.name}\nSchema: ${schema}\nRows: ${table.row_count != null ? table.row_count : 'Unknown'}`,
+            documentation: `Source: ${node.name}\nSchema: ${schema}\nSize: ${tableSizeLabel(table) ?? 'Unknown'}`,
             sortText: `0_${fullQualified}`,
           });
 
@@ -1126,9 +1127,9 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
                                             >
                                               {t.name}
                                             </span>
-                                            {t.row_count != null && (
+                                            {tableSizeLabel(t) != null && (
                                               <span className="text-[9px] text-slate-500 font-mono bg-slate-100 px-1 py-0.2 rounded shrink-0">
-                                                {t.row_count} rows
+                                                {tableSizeLabel(t)}
                                               </span>
                                             )}
                                           </div>
@@ -1186,9 +1187,9 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
                                 >
                                   {t.name}
                                 </span>
-                                {t.row_count != null && (
+                                {tableSizeLabel(t) != null && (
                                   <span className="text-[9px] text-slate-500 font-mono bg-slate-100 px-1.5 py-0.5 rounded shrink-0">
-                                    {t.row_count} rows
+                                    {tableSizeLabel(t)}
                                   </span>
                                 )}
                               </div>
@@ -1280,9 +1281,9 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
                                             >
                                               {cleanTableName}
                                             </span>
-                                            {t.row_count != null && (
+                                            {tableSizeLabel(t) != null && (
                                               <span className="text-[9px] text-slate-500 font-mono bg-slate-100 px-1 py-0.2 rounded shrink-0">
-                                                {t.row_count} rows
+                                                {tableSizeLabel(t)}
                                               </span>
                                             )}
                                           </div>

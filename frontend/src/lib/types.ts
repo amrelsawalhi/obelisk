@@ -132,6 +132,8 @@ export interface CatalogTable {
   columns: CatalogTableColumn[];
   row_count?: number;
   size_bytes?: number;
+  size_human?: string | null;
+  size_is_estimate?: boolean;
   format?: string;
   path?: string;
   schema_name?: string;

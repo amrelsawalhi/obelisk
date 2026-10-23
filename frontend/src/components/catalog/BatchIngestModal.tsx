@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { tableSizeLabel } from '../../lib/format';
 import {
   X,
   Layers,
@@ -233,9 +234,9 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                       </div>
                       <div className="flex items-center gap-2 text-[10px] text-slate-400 font-mono">
                         <span>{t.columns.length} cols</span>
-                        {((t.row_count ?? (t as any).record_count) != null) && (
+                        {tableSizeLabel(t) != null && (
                           <span className="bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">
-                            {Number(t.row_count ?? (t as any).record_count).toLocaleString()} rows
+                            {tableSizeLabel(t)}
                           </span>
                         )}
                       </div>

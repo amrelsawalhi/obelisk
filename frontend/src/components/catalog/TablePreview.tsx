@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { tableSizeLabel } from '../../lib/format';
 import {
   FileSpreadsheet,
   Layers,
@@ -93,7 +94,7 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
               </span>
             </div>
             <div className="text-xs text-slate-500 font-mono">
-              {(table.columns || []).length} columns • {table.format || 'Snappy Parquet'} • {table.row_count != null ? `${Number(table.row_count).toLocaleString()} rows` : preview ? `${Number(preview.row_count).toLocaleString()} rows` : ''}
+              {(table.columns || []).length} columns • {table.format || 'Snappy Parquet'}{tableSizeLabel(table) ? ` • ${tableSizeLabel(table)}` : ''}
             </div>
           </div>
         </div>
