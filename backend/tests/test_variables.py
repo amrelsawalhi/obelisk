@@ -9,7 +9,7 @@ async def test_variables_lifecycle_and_vault_encryption():
     """
     Real integration test for Obelisk Variables & Secrets Engine:
     - Verifies default seeded variables in SQLite
-    - Creates plaintext and AES-256 Fernet encrypted variables
+    - Creates plaintext and AES-128 Fernet encrypted variables
     - Verifies masking on list endpoint
     - Verifies reveal endpoint decrypts accurately
     - Verifies Python SDK obelisk.var() reads and decrypts directly
@@ -40,7 +40,7 @@ async def test_variables_lifecycle_and_vault_encryption():
         assert plain_data["value"] == "batch_mode_v2"
         assert plain_data["is_secret"] is False
 
-        # 3. Create an AES-256 encrypted secret
+        # 3. Create an AES-128 encrypted secret
         secret_payload = {
             "key": "INTEGRATION_TEST_SECRET_KEY",
             "value": "super-confidential-token-9988",

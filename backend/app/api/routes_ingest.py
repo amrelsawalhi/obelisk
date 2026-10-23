@@ -11,6 +11,7 @@ from app.database import get_db
 from app.models.connection import Connection
 from app.core.vault import decrypt
 from app.engines.dagster_client import dagster_client
+from app.engines.ingest_job_manager import ingest_job_manager
 
 router = APIRouter(prefix="/api/ingest", tags=["ingest"])
 
@@ -450,7 +451,6 @@ async def trigger_ingest_async(
     Launches a single-table Lakehouse ingestion job in the background and returns immediately.
     The client can stream live progress and logs via SSE (/jobs/{job_id}/stream).
     """
-    from app.engines.ingest_job_manager import ingest_job_manager
 
     stmt = select(Connection).where(Connection.id == req.connection_id)
     result = await db.execute(stmt)
@@ -568,7 +568,6 @@ async def trigger_batch_ingest_async(
     Launches a multi-table batch Lakehouse ingestion job in the background and returns immediately.
     The client can stream live progress and logs via SSE (/jobs/{job_id}/stream).
     """
-    from app.engines.ingest_job_manager import ingest_job_manager
 
     if not req.tables:
         raise HTTPException(
@@ -686,21 +685,18 @@ async def trigger_batch_ingest_async(
 @router.get("/jobs/active")
 async def get_active_ingest_jobs():
     """Returns all currently active running ingestion jobs."""
-    from app.engines.ingest_job_manager import ingest_job_manager
     return ingest_job_manager.get_active_jobs()
 
 
 @router.get("/jobs/recent")
 async def get_recent_ingest_jobs(limit: int = 20):
     """Returns recent ingestion jobs with completion status and metrics."""
-    from app.engines.ingest_job_manager import ingest_job_manager
     return ingest_job_manager.get_recent_jobs(limit=limit)
 
 
 @router.get("/jobs/{job_id}")
 async def get_ingest_job_status(job_id: str):
     """Returns the current state, progress metrics, and log buffer of an ingestion job."""
-    from app.engines.ingest_job_manager import ingest_job_manager
     job = ingest_job_manager.get_job(job_id)
     if not job:
         raise HTTPException(
@@ -717,7 +713,6 @@ async def stream_ingest_job_events(job_id: str):
     Streams progress updates and timestamped log lines in real-time.
     Flushes catch-up buffer on connect, making client reconnects and tab-switches completely seamless.
     """
-    from app.engines.ingest_job_manager import ingest_job_manager
     job = ingest_job_manager.get_job(job_id)
     if not job:
         raise HTTPException(
@@ -739,7 +734,6 @@ async def stream_ingest_job_events(job_id: str):
 @router.post("/jobs/{job_id}/cancel")
 async def cancel_ingest_job(job_id: str):
     """Gracefully aborts a running ingestion job."""
-    from app.engines.ingest_job_manager import ingest_job_manager
     success = ingest_job_manager.cancel_job(job_id)
     if not success:
         raise HTTPException(

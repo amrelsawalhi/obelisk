@@ -47,7 +47,7 @@ def test_duckdb_memory_limit_recommendation():
     assert gb_val >= 1
 
 def test_vault_encryption_and_decryption():
-    """Verifies AES-256 Fernet encryption and decryption."""
+    """Verifies AES-128 Fernet encryption and decryption."""
     secret = "super_confidential_db_token_999"
     ciphertext = encrypt(secret)
     

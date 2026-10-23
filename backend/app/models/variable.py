@@ -1,5 +1,5 @@
 """
-Variable Model: Persistent Key-Value store for environment configuration and AES-256 encrypted secrets.
+Variable Model: Persistent Key-Value store for environment configuration and AES-128 encrypted secrets.
 Usable across Notebooks (via obelisk SDK), dbt pipelines, and ingestion jobs.
 """
 

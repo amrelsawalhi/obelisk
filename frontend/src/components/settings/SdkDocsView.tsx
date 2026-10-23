@@ -80,7 +80,7 @@ export const SdkDocsView: React.FC = () => {
       category: 'var',
       icon: Key,
       badge: 'Zero-Knowledge Vault',
-      desc: 'Retrieves plaintext configuration or automatically decrypts AES-256 secrets in-memory from the centralized SQLite vault.',
+      desc: 'Retrieves plaintext configuration or automatically decrypts AES-128 secrets in-memory from the centralized SQLite vault.',
       snippetTitle: 'DEVELOPER QUICKSTART: CONSUMING VARIABLES IN NOTEBOOKS & PIPELINES',
       code: `import obelisk
 
@@ -88,7 +88,7 @@ export const SdkDocsView: React.FC = () => {
 env_mode = obelisk.var("ENV", default="production")
 batch_chunk = int(obelisk.var("BATCH_SIZE", default="1000"))
 
-# Retrieve zero-knowledge AES-256 secrets (auto-decrypted in memory)
+# Retrieve zero-knowledge AES-128 secrets (auto-decrypted in memory)
 slack_webhook = obelisk.var("SLACK_WEBHOOK_URL")
 api_key = obelisk.var("OPENAI_API_KEY")
 
@@ -411,7 +411,7 @@ obelisk.save(df_aggregated, "gold.aggregated_events")`,
                 </div>
                 <h4 className="text-sm font-bold text-slate-900 font-mono">Security &amp; Connection Vault</h4>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Enterprise credentials and API keys are protected by an in-memory AES-256 Fernet crypto vault keyed by <code className="font-mono text-rose-700 bg-rose-50 px-1 py-0.5 rounded">OBELISK_MASTER_KEY</code>. Secrets are never exposed in plaintext logs or serialized into git commits.
+                  Enterprise credentials and API keys are protected by an in-memory AES-128 Fernet crypto vault keyed by <code className="font-mono text-rose-700 bg-rose-50 px-1 py-0.5 rounded">OBELISK_MASTER_KEY</code>. Secrets are never exposed in plaintext logs or serialized into git commits.
                 </p>
               </div>
               <div className="pt-2 text-[11px] font-mono text-rose-600 font-semibold flex items-center gap-1">

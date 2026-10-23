@@ -23,7 +23,7 @@ pyarrow>=15.0.0
 fsspec>=2024.2.0
 s3fs>=2024.2.0
 
-# Zero-Knowledge Cryptography Vault (AES-256 Fernet)
+# Zero-Knowledge Cryptography Vault (Fernet: AES-128-CBC + HMAC-SHA256)
 cryptography>=42.0.5
 
 # Host Telemetry & Hardware Resource Advisor
@@ -39,7 +39,7 @@ pymysql>=1.1.0
 oracledb>=2.1.0
 
 # Reactive Notebook Engine & Cron Scheduler
-marimo>=0.3.0
+marimo>=0.9.0
 croniter>=2.0.0
 dagster-graphql>=1.6.0
 dagster-webserver==1.13.26  # host-process Dagster service (pinned to installed dagster)
