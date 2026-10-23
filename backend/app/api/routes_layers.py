@@ -248,6 +248,9 @@ async def update_layer(path: str, req: UpdateLayerRequest):
             session.expunge_all()
             layer = await session.get(Layer, new_path)
             await session.refresh(layer)
+            # `path` is the identity and `name` is the leaf shown in the tree; they
+            # move together or the row would display the old name forever.
+            layer.name = new_path.rsplit(".", 1)[-1]
 
         for field in ("description", "color", "icon", "position"):
             value = getattr(req, field)
@@ -317,8 +320,12 @@ async def delete_layer(path: str):
 
         promoted = None
         if was_default:
+            # Promote the oldest surviving layer: that is the one closest to what the
+            # workspace started with, rather than whatever sorts first alphabetically.
             promoted = (
-                await session.execute(select(Layer).order_by(Layer.path.asc()).limit(1))
+                await session.execute(
+                    select(Layer).order_by(Layer.created_at.asc(), Layer.path.asc()).limit(1)
+                )
             ).scalars().first()
             if promoted is not None:
                 promoted.is_default = True

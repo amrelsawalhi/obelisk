@@ -50,6 +50,10 @@ async def lifespan(app: FastAPI):
     # restart no longer erases every job and dbt run (audit M3/H10).
     from app.services.state import restore_task_history
     await asyncio.to_thread(restore_task_history)
+    # A layer can be deleted while the catalog still points at it; restore the rows so
+    # the tree always describes what exists.
+    from app.services.layers import reconcile_layers_from_assets
+    await asyncio.to_thread(reconcile_layers_from_assets)
     from app.engines.cron_engine import cron_engine
     cron_engine.start()
     yield

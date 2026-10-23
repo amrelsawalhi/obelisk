@@ -80,6 +80,32 @@ def layer_schemas(paths: Optional[list[str]] = None) -> dict[str, str]:
     return mapping
 
 
+def reconcile_layers_from_assets() -> int:
+    """Gives a layer row to every layer name the catalog still uses.
+
+    A layer can be deleted while rows still point at it, and an old database can
+    arrive with names that predate the tree. Running this at startup keeps the
+    promise that the tree describes what exists, rather than relying on every code
+    path to have created the row in the first place.
+    """
+    try:
+        with sqlite3.connect(settings.sqlite_db_path, timeout=10.0) as conn:
+            conn.execute("PRAGMA busy_timeout=15000;")
+            rows = conn.execute(
+                "SELECT DISTINCT layer FROM assets"
+                " WHERE layer IS NOT NULL AND TRIM(layer) <> ''"
+                "   AND layer NOT IN (SELECT path FROM layers)"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning("Could not reconcile layers from the catalog: %s", exc)
+        return 0
+
+    for (layer,) in rows:
+        ensure_layer(layer, description="Discovered from existing tables")
+        logger.info("Restored missing layer %r from the catalog", layer)
+    return len(rows)
+
+
 def ensure_layer(path: str, *, description: Optional[str] = None) -> str:
     """Creates a layer row, plus any missing parents, for a path data lands in.
 

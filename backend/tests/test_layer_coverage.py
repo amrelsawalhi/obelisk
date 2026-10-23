@@ -14,7 +14,12 @@ import pytest
 from app.config import settings
 from app.core.layers import resolve_layer
 from app.sdk import obelisk
-from app.services.layers import default_layer_path, ensure_layer, layer_paths
+from app.services.layers import (
+    default_layer_path,
+    ensure_layer,
+    layer_paths,
+    reconcile_layers_from_assets,
+)
 
 
 def _cleanup(layer: str, name: str) -> None:
@@ -123,6 +128,10 @@ def test_save_splits_on_the_last_dot() -> None:
 
 def test_catalogued_tables_only_name_existing_layers() -> None:
     """The invariant the backfill and the write paths exist to keep true."""
+    # Startup reconciles; run the same repair here so the assertion tests the repair
+    # rather than whatever the previous test happened to leave behind.
+    reconcile_layers_from_assets()
+
     with sqlite3.connect(settings.sqlite_db_path) as con:
         orphans = con.execute(
             "SELECT DISTINCT layer FROM assets WHERE layer IS NOT NULL AND layer <> ''"

@@ -28,7 +28,7 @@ from app.core.host_resolver import resolve_connection_host
 from app.core.dsn import build_pg_dsn, sql_ident, sql_string, validate_alias
 from app.core.layers import InvalidLayerPath, LayerLocation, resolve_layer
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
-from app.services.layers import default_layer_path, layer_paths, layer_schemas
+from app.services.layers import default_layer_path, ensure_layer, layer_paths, layer_schemas
 from app.services.state import task_history
 
 class DbtRunner:
@@ -546,6 +546,9 @@ class DbtRunner:
             models_dir = self.dbt_project_dir / "models" / folder
             if not models_dir.exists():
                 continue
+            # The layer must exist as a row too: a dbt run writes into whichever layer
+            # the project configures, and the tree has to describe what exists.
+            ensure_layer(layer_path, description=f"Written by the dbt project ({folder})")
             try:
                 schema = resolve_layer(layer_path).warehouse_schema
             except InvalidLayerPath:

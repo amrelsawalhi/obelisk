@@ -274,6 +274,8 @@ async def test_layers_roundtrip_and_subtree_rename() -> None:
         leaf = await client.patch(f"/api/layers/{child}", json={"name": "refined"})
         assert leaf.status_code == 200, leaf.text
         assert leaf.json()["path"] == renamed_child
+        # path and name move together; a stale name would show the old leaf in the tree
+        assert leaf.json()["name"] == "refined"
 
         # Renaming the parent must carry the whole subtree with it.
         parent = await client.patch(f"/api/layers/{root}", json={"name": new_root})
@@ -346,21 +348,36 @@ async def test_layer_with_objects_cannot_be_renamed_or_deleted() -> None:
 async def test_default_layer_moves_and_is_never_lost() -> None:
     probe = _probe_name()
     async with _client() as client:
-        assert (await client.post("/api/layers", json={"path": probe})).status_code == 201
+        original = next(
+            (
+                layer["path"]
+                for layer in (await client.get("/api/layers")).json()
+                if layer["is_default"]
+            ),
+            None,
+        )
 
-        promoted = await client.patch(f"/api/layers/{probe}", json={"is_default": True})
-        assert promoted.status_code == 200
-        assert promoted.json()["is_default"] is True
+        try:
+            assert (await client.post("/api/layers", json={"path": probe})).status_code == 201
 
-        listing = (await client.get("/api/layers")).json()
-        assert [layer["path"] for layer in listing if layer["is_default"]] == [probe]
+            promoted = await client.patch(f"/api/layers/{probe}", json={"is_default": True})
+            assert promoted.status_code == 200
+            assert promoted.json()["is_default"] is True
 
-        removed = await client.delete(f"/api/layers/{probe}")
-        assert removed.status_code == 200
-        assert removed.json()["default_layer"] is not None
+            listing = (await client.get("/api/layers")).json()
+            assert [layer["path"] for layer in listing if layer["is_default"]] == [probe]
 
-        listing = (await client.get("/api/layers")).json()
-        assert len([layer for layer in listing if layer["is_default"]]) == 1
+            removed = await client.delete(f"/api/layers/{probe}")
+            assert removed.status_code == 200
+            assert removed.json()["default_layer"] is not None
+
+            listing = (await client.get("/api/layers")).json()
+            assert len([layer for layer in listing if layer["is_default"]]) == 1
+        finally:
+            # The delete promotes an arbitrary survivor; put the workspace back the way
+            # it was so later tests and the dbt landing layer are unaffected.
+            if original:
+                await client.patch(f"/api/layers/{original}", json={"is_default": True})
 
 
 @pytest.mark.asyncio
