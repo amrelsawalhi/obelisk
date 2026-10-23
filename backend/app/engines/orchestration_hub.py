@@ -1,7 +1,12 @@
 """
 Orchestration Hub Engine:
-Pluggable registry for orchestration engines (Obelisk Built-in Cron, Dagster, Apache Airflow).
+Pluggable registry for orchestration engines (Obelisk Built-in Cron, Dagster).
 Probes active services and provides unified metadata for the frontend Pipelines tab.
+
+An engine is registered here only when the platform can actually deploy or reach
+it, so the Pipelines tab never advertises a capability that cannot be fulfilled.
+Third-party orchestrators, if ever added, must be remote-only: a REST client plus
+a live status probe with ``can_deploy_local=False`` -- never a local container.
 """
 
 from typing import List, Dict, Any, Optional
@@ -14,9 +19,9 @@ from app.core.service_blueprints import get_blueprint
 
 
 class OrchestrationEngineInfo(BaseModel):
-    id: str  # "cron", "dagster", "airflow", "prefect"
-    name: str  # "Obelisk Built-in Cron", "Dagster Engine", "Apache Airflow"
-    icon: str  # "clock", "dagster", "airflow"
+    id: str  # "cron", "dagster"
+    name: str  # "Obelisk Built-in Cron", "Dagster Engine"
+    icon: str  # "clock", "dagster"
     status: str  # "running", "offline", "not_configured"
     web_url: Optional[str] = None
     description: str
@@ -56,7 +61,7 @@ class OrchestrationHub:
             )
         )
 
-        # 2. Query configured services in SQLite (Dagster, Airflow)
+        # 2. Query configured services in SQLite (Dagster)
         services_map: Dict[str, ServiceConfig] = {}
         try:
             async with AsyncSessionLocal() as session:
@@ -94,27 +99,6 @@ class OrchestrationHub:
                 description="Asset orchestrator: webserver + daemon running Obelisk's real workspace",
                 is_builtin=False,
                 can_deploy_local=bool(dagster_bp and dagster_bp.deployable),
-            )
-        )
-
-        # 4. Apache Airflow Orchestrator
-        airflow_svc = services_map.get("airflow")
-        airflow_status = "offline"
-        airflow_url = "/airflow"
-        if airflow_svc:
-            airflow_status = airflow_svc.status.lower()
-            if airflow_svc.deployment_type == "remote":
-                airflow_url = f"http://{airflow_svc.host}:{airflow_svc.port or 8080}"
-
-        engines.append(
-            OrchestrationEngineInfo(
-                id="airflow",
-                name="Apache Airflow",
-                icon="airflow",
-                status=airflow_status,
-                web_url=airflow_url,
-                description="Enterprise workflow platform with task DAGs and operators",
-                is_builtin=False,
             )
         )
 

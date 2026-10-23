@@ -16,7 +16,6 @@ import {
   Power,
   BookOpen,
   Code2,
-  Sparkles,
   Maximize2,
   Minimize2,
 } from 'lucide-react';
@@ -321,28 +320,6 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
             {engines.find((e) => e.id === 'dagster')?.status === 'running' ? (
               <span className="flex items-center gap-1 text-[10px] text-emerald-600 font-mono">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                Live
-              </span>
-            ) : (
-              <span className="px-1.5 py-0.2 bg-slate-200 text-slate-600 text-[10px] font-mono rounded">
-                Offline
-              </span>
-            )}
-          </button>
-
-          <button
-            onClick={() => setSelectedEngineId('airflow')}
-            className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-              selectedEngineId === 'airflow'
-                ? 'bg-white text-indigo-700 shadow-xs border border-slate-200/50'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
-            }`}
-          >
-            <Sparkles className="w-3.5 h-3.5 text-sky-600" />
-            <span>Apache Airflow</span>
-            {engines.find((e) => e.id === 'airflow')?.status === 'running' ? (
-              <span className="flex items-center gap-1 text-[10px] text-emerald-600 font-mono">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                 Live
               </span>
             ) : (
@@ -679,7 +656,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
         </div>
       )}
 
-      {/* VIEW: DAGSTER OR AIRFLOW (EMBEDDED OR OFFLINE SERVICE CARD) */}
+      {/* VIEW: DAGSTER (NATIVE PANEL OR OFFLINE SERVICE CARD) */}
       {selectedEngineId !== 'cron' && (
         <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
           {selectedEngine?.status === 'running' && selectedEngineId === 'dagster' ? (
@@ -697,11 +674,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
             <div className="flex-1 flex items-center justify-center p-8">
               <div className="max-w-xl w-full bg-white rounded-2xl border border-slate-200 p-8 shadow-sm text-center">
                 <div className="w-16 h-16 rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 mx-auto mb-4">
-                  {selectedEngineId === 'dagster' ? (
-                    <RefreshCw className="w-8 h-8 text-violet-600" />
-                  ) : (
-                    <Sparkles className="w-8 h-8 text-sky-600" />
-                  )}
+                  <RefreshCw className="w-8 h-8 text-violet-600" />
                 </div>
 
                 <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-slate-100 text-slate-600 border border-slate-200 mb-3">

@@ -474,7 +474,7 @@ export interface CreateVariableRequest {
 
 // Mirrors OrchestrationEngineInfo in backend/app/engines/orchestration_hub.py.
 export interface OrchestrationEngineInfo {
-  id: 'cron' | 'dagster' | 'airflow' | string;
+  id: 'cron' | 'dagster' | string;
   name: string;
   icon?: string;
   status: 'running' | 'stopped' | 'offline' | string;

@@ -98,7 +98,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const activeCronCount = cronJobs.filter((j) => j.is_enabled).length;
   const totalCronCount = cronJobs.length;
   const dagsterEngine = orchestratorEngines.find((e) => e.id === 'dagster');
-  const airflowEngine = orchestratorEngines.find((e) => e.id === 'airflow');
 
   const silverModels = assetNodes.filter((n) => n.layer === 'silver');
   const goldModels = assetNodes.filter((n) => n.layer === 'gold');
@@ -383,15 +382,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                   }`}
                 />
                 <span>Dagster: {dagsterEngine?.status === 'running' ? 'Live (:3000)' : 'Offline'}</span>
-              </span>
-              <span className="text-slate-300">•</span>
-              <span className="flex items-center gap-1">
-                <span
-                  className={`w-1.5 h-1.5 rounded-full ${
-                    airflowEngine?.status === 'running' ? 'bg-emerald-500' : 'bg-slate-300'
-                  }`}
-                />
-                <span>Airflow: {airflowEngine?.status === 'running' ? 'Live' : 'Offline'}</span>
               </span>
             </div>
           </div>

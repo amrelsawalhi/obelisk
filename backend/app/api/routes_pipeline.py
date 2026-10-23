@@ -357,7 +357,7 @@ class CreateCronJobRequest(BaseModel):
 
 @router.get("/engines")
 async def list_orchestration_engines():
-    """Returns available orchestration engines (Built-in Cron, Dagster, Apache Airflow) with live status."""
+    """Returns available orchestration engines (Built-in Cron, Dagster) with live status."""
     from app.engines.orchestration_hub import orchestration_hub
     engines = await orchestration_hub.get_engines()
     # Preferred engine for new pipelines: Dagster when it is actually reachable,

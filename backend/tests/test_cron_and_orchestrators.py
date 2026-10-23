@@ -11,7 +11,6 @@ async def test_orchestration_engines_registry():
     Verifies the pluggable Orchestrator Hub discovers:
     - Built-in Cron (always active, in-process)
     - Dagster Engine (running or offline)
-    - Apache Airflow (running or offline)
     """
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -22,7 +21,9 @@ async def test_orchestration_engines_registry():
         engine_ids = [e["id"] for e in data["engines"]]
         assert "cron" in engine_ids
         assert "dagster" in engine_ids
-        assert "airflow" in engine_ids
+        # Exact set: the hub must not advertise engines the platform cannot
+        # deploy or reach, so adding one has to be a deliberate, tested decision.
+        assert engine_ids == ["cron", "dagster"]
 
         cron_engine = next(e for e in data["engines"] if e["id"] == "cron")
         assert cron_engine["status"] == "running"

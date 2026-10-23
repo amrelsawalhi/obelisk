@@ -9,7 +9,7 @@ iframe, surfacing curated data with consistent Obelisk styling.
 Why a separate router (rather than extending `routes_pipeline.py`):
 - `routes_pipeline.py` is focused on the Ingest-event pipeline definitions
   plus the Obelisk Cron scheduler — different audience.
-- Lets us add a future ``/orchestration/airflow`` mirror without coupling.
+- Lets us add mirrors for other orchestration engines later without coupling.
 """
 import threading
 import time

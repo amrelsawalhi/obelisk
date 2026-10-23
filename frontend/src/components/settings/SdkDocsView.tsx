@@ -395,7 +395,7 @@ obelisk.save(df_aggregated, "gold.aggregated_events")`,
                 </div>
                 <h4 className="text-sm font-bold text-slate-900 font-mono">Pipelines &amp; Cron Engine</h4>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Define automated recurring ingestion and transformation schedules using standard 5-part cron expressions. Or discover Airflow/Prefect-style Python DAGs in <code className="font-mono text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded">git_repo/dags/</code> with live streaming run logs.
+                  Define automated recurring ingestion and transformation schedules using standard 5-part cron expressions. Or discover Python DAGs in <code className="font-mono text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded">git_repo/dags/</code> with live streaming run logs.
                 </p>
               </div>
               <div className="pt-2 text-[11px] font-mono text-emerald-600 font-semibold flex items-center gap-1">
