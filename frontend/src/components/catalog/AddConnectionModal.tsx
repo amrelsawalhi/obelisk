@@ -179,7 +179,7 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
                 {isEditing ? `Edit Connection: ${initialConnection.name}` : 'Connect External Data Source'}
               </h3>
               <p className="text-xs text-slate-500">
-                Encrypted via AES-256 Vault in data/obelisk.db
+                Encrypted via AES-128 Vault in data/obelisk.db
               </p>
             </div>
           </div>

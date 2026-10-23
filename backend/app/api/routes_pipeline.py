@@ -12,6 +12,7 @@ from app.database import AsyncSessionLocal
 from app.models.pipeline_definition import PipelineDefinition
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 from app.engines.dbt_runner import dbt_runner
+from app.engines.dag_loader import dag_loader
 
 router = APIRouter(prefix="/api/pipelines", tags=["Pipelines"])
 
@@ -196,14 +197,12 @@ class UpdateDagCodeRequest(BaseModel):
 @router.get("/dags")
 async def list_custom_dags():
     """Returns all discovered DAG files in git_repo/dags/."""
-    from app.engines.dag_loader import dag_loader
     return dag_loader.list_dag_files()
 
 
 @router.post("/dags")
 async def create_custom_dag(req: CreateDagRequest):
     """Creates a new DAG asset file in git_repo/dags/ from a boilerplate template."""
-    from app.engines.dag_loader import dag_loader
     clean_name = req.name.strip().lower().replace(" ", "_").replace("-", "_").replace(".py", "")
     if not clean_name:
         raise HTTPException(status_code=400, detail="DAG name cannot be empty.")
@@ -290,7 +289,7 @@ def {clean_name}(context: AssetExecutionContext) -> MaterializeResult:
 
     # Read upstream Gold marts using obelisk SDK
     try:
-        df = obelisk.query("SELECT * FROM gold.fct_orders_enriched").to_polars()
+        df = obelisk.query("SELECT * FROM gold.fct_orders_enriched")
         row_count = len(df)
     except Exception:
         row_count = 0
@@ -318,7 +317,6 @@ def {clean_name}(context: AssetExecutionContext) -> MaterializeResult:
 @router.get("/dags/{dag_name}/code")
 async def get_custom_dag_code(dag_name: str):
     """Returns the raw Python code of a DAG file."""
-    from app.engines.dag_loader import dag_loader
     code = dag_loader.get_dag_code(dag_name)
     if code is None:
         raise HTTPException(status_code=404, detail=f"DAG '{dag_name}' not found.")
@@ -328,7 +326,6 @@ async def get_custom_dag_code(dag_name: str):
 @router.put("/dags/{dag_name}/code")
 async def update_custom_dag_code(dag_name: str, req: UpdateDagCodeRequest):
     """Updates the Python code of a DAG file."""
-    from app.engines.dag_loader import dag_loader
     file_path = dag_loader.save_dag_code(dag_name, req.code)
     return {"status": "saved", "name": dag_name, "path": file_path}
 
@@ -336,7 +333,6 @@ async def update_custom_dag_code(dag_name: str, req: UpdateDagCodeRequest):
 @router.delete("/dags/{dag_name}")
 async def delete_custom_dag(dag_name: str):
     """Deletes a DAG file from git_repo/dags/."""
-    from app.engines.dag_loader import dag_loader
     deleted = dag_loader.delete_dag_file(dag_name)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"DAG '{dag_name}' not found.")

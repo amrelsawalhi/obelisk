@@ -33,9 +33,23 @@ if exist "backend\.venv\Scripts\python.exe" (
     )
 )
 
-:: 4. Start Backend Server in a new window
+:: 4. Guard the API port. A stale `uvicorn --reload` parent can keep the port
+::    listening while its worker is dead, which makes the UI load with no data.
+echo [*] Checking port 8000 ...
+"%~dp0!PYTHON_EXE!" "%~dp0backend\scripts\preflight_port.py" --port 8000
+if errorlevel 1 (
+    echo [!] Aborting: port 8000 is not available. See the message above.
+    pause
+    exit /b 1
+)
+
+:: 5. Start Backend Server in a new window.
+::    --reload is opt-in (set OBELISK_DEV_RELOAD=1); the reloader is what leaves
+::    orphaned socket holders behind on Windows.
+set "RELOAD_FLAG="
+if /I "%OBELISK_DEV_RELOAD%"=="1" set "RELOAD_FLAG=--reload"
 echo [*] Starting FastAPI Backend on http://localhost:8000 ...
-start "Obelisk Backend (FastAPI)" cmd /k "cd /d "%~dp0backend" && "%~dp0!PYTHON_EXE!" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+start "Obelisk Backend (FastAPI)" cmd /k "cd /d "%~dp0backend" && "%~dp0!PYTHON_EXE!" -m uvicorn app.main:app --host 0.0.0.0 --port 8000 !RELOAD_FLAG!"
 
 :: 5. Brief pause to allow backend initialization
 timeout /t 2 /nobreak >nul

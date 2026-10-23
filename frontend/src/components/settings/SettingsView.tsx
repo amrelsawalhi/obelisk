@@ -203,7 +203,7 @@ export const SettingsView: React.FC = () => {
       <div className="flex-1 flex flex-col items-center justify-center p-12 bg-slate-50">
         <RefreshCw className="w-8 h-8 text-sky-600 animate-spin mb-3" />
         <div className="text-sm font-semibold text-slate-700">Loading Obelisk Settings...</div>
-        <div className="text-xs text-slate-400 font-mono mt-1">Reading database configuration & AES-256 vault</div>
+        <div className="text-xs text-slate-400 font-mono mt-1">Reading database configuration & AES-128 vault</div>
       </div>
     );
   }
@@ -301,7 +301,7 @@ export const SettingsView: React.FC = () => {
                 </h4>
               </div>
               <p className="text-xs text-slate-600 max-w-2xl">
-                Define plaintext configuration and AES-256 encrypted secrets. Access them effortlessly across Marimo reactive notebooks using <code className="font-mono text-sky-800 bg-sky-100/70 px-1.5 py-0.5 rounded font-semibold">obelisk.var("KEY")</code> or within dbt models and ingestion pipelines.
+                Define plaintext configuration and AES-128 encrypted secrets. Access them effortlessly across Marimo reactive notebooks using <code className="font-mono text-sky-800 bg-sky-100/70 px-1.5 py-0.5 rounded font-semibold">obelisk.var("KEY")</code> or within dbt models and ingestion pipelines.
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -359,7 +359,7 @@ export const SettingsView: React.FC = () => {
                           {isSecret ? (
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 font-mono">
                               <Lock className="w-3 h-3 text-emerald-600" />
-                              AES-256 Vault
+                              AES-128 Vault
                             </span>
                           ) : (
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-100 text-slate-600 border border-slate-200 font-mono">
@@ -438,7 +438,7 @@ export const SettingsView: React.FC = () => {
             <div className="flex items-center gap-2">
               <Shield className="w-4 h-4 text-emerald-600" />
               <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider font-mono">
-                AES-256 Connection Vault (External Data Sources)
+                AES-128 Connection Vault (External Data Sources)
               </h3>
             </div>
             <button
@@ -454,7 +454,7 @@ export const SettingsView: React.FC = () => {
           </div>
 
           <p className="text-xs text-slate-500 font-normal">
-            Enterprise database and API credentials are encrypted at rest with Fernet AES-256 tokens in <code className="font-mono text-slate-700 bg-slate-100 px-1 py-0.5 rounded">data/obelisk.db</code>.
+            Enterprise database and API credentials are encrypted at rest with Fernet AES-128 tokens in <code className="font-mono text-slate-700 bg-slate-100 px-1 py-0.5 rounded">data/obelisk.db</code>.
           </p>
 
           {connections.length === 0 ? (
@@ -657,7 +657,7 @@ export const SettingsView: React.FC = () => {
                 <div className="flex items-center justify-between text-xs">
                   <span className="font-bold text-slate-700">Cryptography Vault</span>
                   <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                    Fernet AES-256
+                    Fernet AES-128
                   </span>
                 </div>
                 <div className="text-[11px] text-slate-500 font-sans">
@@ -759,7 +759,7 @@ export const SettingsView: React.FC = () => {
                     }`}
                   >
                     <Lock className="w-3.5 h-3.5 text-emerald-600" />
-                    <span>AES-256 Secret</span>
+                    <span>AES-128 Secret</span>
                   </button>
                 </div>
               </div>

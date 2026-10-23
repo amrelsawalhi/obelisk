@@ -40,8 +40,9 @@ async def test_lakehouse_catalog_tree_and_preview():
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # A. Fetch catalog tree
-        res = await client.get("/api/catalog/tree")
+        # A. Fetch catalog tree (refresh bypasses the module-level tree cache so
+        # this test is order-independent).
+        res = await client.get("/api/catalog/tree?refresh=true")
         assert res.status_code == 200
         tree = res.json()
         assert isinstance(tree, list)

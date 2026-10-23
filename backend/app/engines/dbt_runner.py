@@ -20,6 +20,7 @@ from typing import Dict, Any, List, Optional
 import duckdb
 from app.config import settings
 from app.core.host_resolver import resolve_connection_host
+from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 
 class DbtRunner:
@@ -34,11 +35,12 @@ class DbtRunner:
 
     def _ensure_core_bronze_tables(self) -> None:
         """
-        Ensures orders.parquet and customers.parquet exist in Bronze lakehouse
-        so dbt models never fail on missing relations.
+        Ensures orders.parquet and customers.parquet exist in the lakehouse
+        landing root so dbt models never fail on missing relations.
         """
-        storage_path = Path(settings.duckdb_storage_path)
-        storage_path.mkdir(parents=True, exist_ok=True)
+        # lakehouse_root_path creates the directory and rejects remote schemes;
+        # no local mkdir logic belongs here (audit B1).
+        storage_path = settings.lakehouse_root_path
 
         orders_file = storage_path / "orders.parquet"
         if not orders_file.exists():
@@ -105,10 +107,18 @@ class DbtRunner:
         synced_info = []
 
         try:
-            conn.execute("INSTALL postgres; LOAD postgres;")
-            conn_str = f"dbname={database} host={host} port={port} user={user} password={password} sslmode={sslmode} connect_timeout=10"
-            alias = f"pg_sync_{uuid.uuid4().hex[:6]}"
-            conn.execute(f"ATTACH '{conn_str}' AS {alias} (TYPE POSTGRES);")
+            conn.execute("LOAD postgres;")
+            conn_str = build_pg_dsn(
+                dbname=database,
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                sslmode=sslmode,
+                connect_timeout=10,
+            )
+            alias = validate_alias(f"pg_sync_{uuid.uuid4().hex[:6]}")
+            conn.execute(f"ATTACH {sql_string(conn_str)} AS {alias} (TYPE POSTGRES);")
 
             # Ensure bronze schema exists in PostgreSQL
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.bronze;")
@@ -299,7 +309,7 @@ class DbtRunner:
         medallion location, whereas the storage root only holds the seed
         fallbacks written by _ensure_core_bronze_tables().
         """
-        storage_path = Path(settings.duckdb_storage_path)
+        storage_path = settings.lakehouse_root_path
         if not storage_path.exists():
             return []
 

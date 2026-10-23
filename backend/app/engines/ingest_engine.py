@@ -18,6 +18,7 @@ import httpx
 from app.config import settings
 from app.engines.duckdb_engine import duckdb_engine
 from app.core.host_resolver import resolve_connection_host
+from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 
 logger = logging.getLogger(__name__)
 
@@ -49,14 +50,17 @@ class IngestEngine:
     """
 
     def _ensure_storage_dir(self, target_folder: Optional[str] = None) -> Path:
-        base_path = Path(settings.duckdb_storage_path)
+        """Resolves a lakehouse sub-directory, creating it when needed.
+
+        Scheme handling lives in Settings.lakehouse_root_path: remote URIs raise
+        there instead of being silently treated as local paths (audit B1/B2).
+        """
+        base_path = settings.lakehouse_root_path
         if target_folder:
             resolved = base_path / target_folder.strip("/\\")
         else:
             resolved = base_path
-        # Guard local directory creation against remote cloud URIs (s3://, gs://, abfss://)
-        if not settings.STORAGE_URI.startswith(("s3://", "gs://", "abfss://")):
-            resolved.mkdir(parents=True, exist_ok=True)
+        resolved.mkdir(parents=True, exist_ok=True)
         return resolved
 
     def _record_asset_in_db(
@@ -105,12 +109,20 @@ class IngestEngine:
         Deduplicates records on primary_key if write_strategy == 'upsert',
         preserving the newest record ordered by watermark_column.
         """
-        if write_strategy != "upsert" or not primary_key or primary_key not in table.column_names:
+        if write_strategy != "upsert":
             return table
-        try:
-            dconn = duckdb.connect()
-        except Exception:
-            return table
+        if not primary_key:
+            raise ValueError(
+                "write_strategy='upsert' requires a primary_key; refusing to write rows "
+                "that cannot be deduplicated."
+            )
+        if primary_key not in table.column_names:
+            raise ValueError(
+                f"primary_key {primary_key!r} is not one of the extracted columns "
+                f"({', '.join(table.column_names)}); cannot deduplicate."
+            )
+
+        dconn = duckdb.connect()
         try:
             dconn.register("raw_batch", table)
             order_sql = f'ORDER BY "{watermark_column}" DESC' if watermark_column and watermark_column in table.column_names else ""
@@ -118,16 +130,38 @@ class IngestEngine:
                 SELECT * FROM raw_batch
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY "{primary_key}" {order_sql}) = 1
             '''
-            deduped = dconn.execute(dedup_sql).arrow().read_all()
-            return deduped
-        except Exception as e:
-            logger.warning("Upsert deduplication failed, falling back to raw batch: %s", e)
-            return table
+            return dconn.execute(dedup_sql).arrow().read_all()
         finally:
             # Always close: a lingering DuckDB connection retains OS-level file
             # locks on Parquet files and triggers [WinError 32] on Windows when
             # ingestion later swaps files via os.replace().
             dconn.close()
+
+    def _combine_for_write(
+        self,
+        new_table: pa.Table,
+        existing_table: Optional[pa.Table],
+        mode: str,
+        write_strategy: str,
+        primary_key: Optional[str],
+        watermark_column: Optional[str],
+    ) -> pa.Table:
+        """Combines a freshly extracted batch with the existing table.
+
+        Incremental runs append and then deduplicate; snapshot runs replace the
+        table but still honour an explicit upsert, so a requested deduplication
+        is never silently skipped (audit M2).
+        """
+        if mode == "incremental" and existing_table is not None:
+            if new_table.num_rows == 0:
+                return existing_table
+            combined = pa.concat_tables([existing_table, new_table], promote_options="default")
+            return self._apply_write_strategy(
+                combined, write_strategy, primary_key, watermark_column
+            )
+        return self._apply_write_strategy(
+            new_table, write_strategy, primary_key, watermark_column
+        )
 
     def ingest_entity(
         self,
@@ -151,9 +185,7 @@ class IngestEngine:
             target_dir = settings.lakehouse_root_path / clean_folder
         else:
             target_dir = settings.lakehouse_root_path
-
-        if not settings.STORAGE_URI.startswith(("s3://", "gs://", "abfss://")):
-            target_dir.mkdir(parents=True, exist_ok=True)
+        target_dir.mkdir(parents=True, exist_ok=True)
 
         # Default clean table stem without database/schema prefixes
         if target_name and target_name.strip():
@@ -324,6 +356,12 @@ class IngestEngine:
         delta_posix = delta_file.as_posix()
         output_posix = output_file.as_posix()
 
+        if write_strategy == "upsert" and not primary_key:
+            raise ValueError(
+                "write_strategy='upsert' requires a primary_key; refusing to merge the "
+                "delta without deduplication."
+            )
+
         union_sql = (
             f"SELECT * FROM read_parquet('{existing_posix}') "
             f"UNION ALL BY NAME SELECT * FROM read_parquet('{delta_posix}')"
@@ -343,8 +381,12 @@ class IngestEngine:
                 try:
                     dconn.execute(f"COPY ({dedup_sql}) TO {copy_target}")
                 except Exception as e:
-                    logger.warning("Upsert deduplication failed in DuckDB, writing the raw union: %s", e)
-                    dconn.execute(f"COPY ({union_sql}) TO {copy_target}")
+                    # Never fall back to the raw union: that silently writes
+                    # duplicate primary keys into the live file (audit H1).
+                    raise RuntimeError(
+                        f"Upsert deduplication failed for {output_file.name} on primary key "
+                        f"{primary_key!r}; the existing file was left untouched. Cause: {e}"
+                    ) from e
             else:
                 dconn.execute(f"COPY ({union_sql}) TO {copy_target}")
             return dconn.execute(f"SELECT COUNT(*) FROM read_parquet('{output_posix}')").fetchone()[0]
@@ -369,6 +411,12 @@ class IngestEngine:
         Attaches the PostgreSQL database and streams directly to Snappy Parquet.
         Incremental merges stay inside DuckDB so large histories never load into RAM.
         """
+        if write_strategy == "upsert" and not primary_key:
+            raise ValueError(
+                "write_strategy='upsert' requires a primary_key; refusing to write rows "
+                "that cannot be deduplicated."
+            )
+
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
         port = connection_params["port"]
         database = connection_params["database"]
@@ -390,12 +438,49 @@ class IngestEngine:
         conn = duckdb_engine.get_connection()
         try:
             conn.execute("LOAD postgres;")
-            dsn = f"host={host} port={port} dbname={database} user={user} password={password} sslmode={sslmode}"
-            conn.execute(f"ATTACH '{dsn}' AS {alias} (TYPE POSTGRES, READ_ONLY);")
+            dsn = build_pg_dsn(
+                host=host,
+                port=port,
+                dbname=database,
+                user=user,
+                password=password,
+                sslmode=sslmode,
+            )
+            conn.execute(
+                f"ATTACH {sql_string(dsn)} AS {validate_alias(alias)} "
+                f"(TYPE POSTGRES, READ_ONLY);"
+            )
 
-            if mode == "snapshot" or existing_file is None:
-                # Direct C++ streaming snapshot straight to Snappy Parquet
-                query = f'COPY (SELECT * FROM {alias}."{schema_name}"."{table_name}"{limit_clause}) TO \'{temp_file_posix}\' (FORMAT PARQUET, COMPRESSION SNAPPY);'
+            # A full refresh runs for a snapshot, for a first run, or when the
+            # existing file has no usable incremental cursor. That last case used
+            # to fall through to `WHERE col > 'None'`, which crashed on timestamp
+            # columns or filtered string columns against the literal "None"
+            # (audit H2).
+            full_refresh = (
+                mode == "snapshot"
+                or existing_file is None
+                or not watermark_column
+                or watermark_value is None
+            )
+            if full_refresh:
+                if mode == "incremental" and existing_file is not None:
+                    logger.warning(
+                        "Incremental ingest of %s has no usable watermark "
+                        "(column=%r, value=%r); falling back to a full refresh.",
+                        entity,
+                        watermark_column,
+                        watermark_value,
+                    )
+
+                select_sql = f'SELECT * FROM {alias}."{schema_name}"."{table_name}"{limit_clause}'
+                if write_strategy == "upsert" and primary_key:
+                    order_sql = f'ORDER BY "{watermark_column}" DESC' if watermark_column else ""
+                    select_sql = (
+                        f'SELECT * FROM ({select_sql}) '
+                        f'QUALIFY ROW_NUMBER() OVER (PARTITION BY "{primary_key}" {order_sql}) = 1'
+                    )
+                # Direct C++ streaming straight to Snappy Parquet
+                query = f"COPY ({select_sql}) TO '{temp_file_posix}' (FORMAT PARQUET, COMPRESSION SNAPPY);"
                 conn.execute(query)
 
                 meta = pq.read_metadata(str(temp_file))
@@ -475,12 +560,15 @@ class IngestEngine:
         auth_db = connection_params.get("auth_db", "admin")
         db_name = connection_params["database"]
 
-        if user and pw:
-            uri = f"mongodb://{user}:{pw}@{host}:{port}/?authSource={auth_db}"
-        else:
-            uri = f"mongodb://{host}:{port}/"
-
-        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        # Kwargs avoid URI escaping problems in passwords (audit H5).
+        client = MongoClient(
+            host=host,
+            port=port,
+            username=user or None,
+            password=pw or None,
+            authSource=auth_db if (user and pw) else None,
+            serverSelectionTimeoutMS=5000,
+        )
         temp_file = target_file.with_name(f"{target_file.stem}_{uuid.uuid4().hex[:8]}.tmp.parquet")
 
         try:
@@ -524,14 +612,9 @@ class IngestEngine:
 
             new_table = pa.Table.from_pydict(col_data) if docs else pa.Table.from_pydict({})
 
-            if mode == "incremental" and existing_table is not None:
-                if new_table.num_rows > 0:
-                    final_table = pa.concat_tables([existing_table, new_table], promote_options="default")
-                    final_table = self._apply_write_strategy(final_table, write_strategy, primary_key, watermark_column)
-                else:
-                    final_table = existing_table
-            else:
-                final_table = new_table
+            final_table = self._combine_for_write(
+                new_table, existing_table, mode, write_strategy, primary_key, watermark_column
+            )
 
             # Atomic write
             pq.write_table(final_table, str(temp_file), compression="SNAPPY")
@@ -608,14 +691,9 @@ class IngestEngine:
 
             new_table = pa.Table.from_pydict(col_data)
 
-            if mode == "incremental" and existing_table is not None:
-                if new_table.num_rows > 0:
-                    final_table = pa.concat_tables([existing_table, new_table], promote_options="default")
-                    final_table = self._apply_write_strategy(final_table, write_strategy, primary_key, watermark_column)
-                else:
-                    final_table = existing_table
-            else:
-                final_table = new_table
+            final_table = self._combine_for_write(
+                new_table, existing_table, mode, write_strategy, primary_key, watermark_column
+            )
 
             pq.write_table(final_table, str(temp_file), compression="SNAPPY")
             os.replace(temp_file, target_file)
@@ -682,14 +760,9 @@ class IngestEngine:
             # still produces a readable (0-row) Parquet schema.
             new_table = pa.Table.from_pydict(col_data)
 
-            if mode == "incremental" and existing_table is not None:
-                if new_table.num_rows > 0:
-                    final_table = pa.concat_tables([existing_table, new_table], promote_options="default")
-                    final_table = self._apply_write_strategy(final_table, write_strategy, primary_key, watermark_column)
-                else:
-                    final_table = existing_table
-            else:
-                final_table = new_table
+            final_table = self._combine_for_write(
+                new_table, existing_table, mode, write_strategy, primary_key, watermark_column
+            )
 
             pq.write_table(final_table, str(temp_file), compression="SNAPPY")
             os.replace(temp_file, target_file)
@@ -774,14 +847,9 @@ class IngestEngine:
 
         new_table = pa.Table.from_pydict(col_data) if records else pa.Table.from_pydict({})
 
-        if mode == "incremental" and existing_table is not None:
-            if new_table.num_rows > 0:
-                final_table = pa.concat_tables([existing_table, new_table], promote_options="default")
-                final_table = self._apply_write_strategy(final_table, write_strategy, primary_key, watermark_column)
-            else:
-                final_table = existing_table
-        else:
-            final_table = new_table
+        final_table = self._combine_for_write(
+            new_table, existing_table, mode, write_strategy, primary_key, watermark_column
+        )
 
         temp_file = target_file.with_name(f"{target_file.stem}_{uuid.uuid4().hex[:8]}.tmp.parquet")
         try:

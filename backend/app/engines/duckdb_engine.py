@@ -30,11 +30,13 @@ class DuckDBEngine:
         self._ensure_storage()
 
     def _ensure_storage(self) -> str:
-        storage_path = settings.duckdb_storage_path
-        # Guard local directory creation against remote cloud URIs
-        if not settings.STORAGE_URI.startswith(("s3://", "gs://", "abfss://")):
-            Path(storage_path).mkdir(parents=True, exist_ok=True)
-        return storage_path
+        """Returns the resolved lakehouse root.
+
+        Path resolution (and the remote-scheme rejection) lives in Settings so
+        every caller agrees on a single answer; this method no longer re-derives
+        it from the raw URI (audit B1).
+        """
+        return settings.duckdb_storage_path
 
     def get_connection(self) -> duckdb.DuckDBPyConnection:
         """
@@ -92,12 +94,26 @@ class DuckDBEngine:
             logger.debug("DuckDB postgres extension load failed: %s", e)
 
         from app.core.host_resolver import resolve_connection_host
+        from app.core.dsn import build_pg_dsn, sql_string, validate_alias
+
         host = resolve_connection_host(host, port)
-        dsn = f"host={host} port={port} dbname={database} user={username} password={password} sslmode={sslmode} connect_timeout={connect_timeout}"
+        dsn = build_pg_dsn(
+            host=host,
+            port=port,
+            dbname=database,
+            user=username,
+            password=password,
+            sslmode=sslmode,
+            connect_timeout=connect_timeout,
+        )
+        safe_alias = validate_alias(alias)
         if schema and schema.lower() != "all":
-            conn.execute(f"ATTACH '{dsn}' AS {alias} (TYPE POSTGRES, SCHEMA '{schema}');")
+            conn.execute(
+                f"ATTACH {sql_string(dsn)} AS {safe_alias} "
+                f"(TYPE POSTGRES, SCHEMA {sql_string(schema)});"
+            )
         else:
-            conn.execute(f"ATTACH '{dsn}' AS {alias} (TYPE POSTGRES);")
+            conn.execute(f"ATTACH {sql_string(dsn)} AS {safe_alias} (TYPE POSTGRES);")
 
     def _get_lakehouse_files(self, lakehouse_root: Path) -> List[Path]:
         """Returns all visible Parquet files under lakehouse_root, TTL-cached for 5 seconds."""

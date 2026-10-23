@@ -8,3 +8,19 @@
 *.toml text eol=lf
 *.json text eol=lf
 *.md text eol=lf
+*.svg text eol=lf
+
+# Binary assets must never be EOL-normalised (audit L5)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.parquet binary
+*.duckdb binary
+*.db binary

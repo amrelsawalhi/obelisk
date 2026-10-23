@@ -55,7 +55,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand }) => {
     },
     settings: {
       title: 'Settings & Security',
-      subtitle: 'Manage environment variables, AES-256 encrypted secrets, connection vault, lakehouse storage & diagnostics',
+      subtitle: 'Manage environment variables, AES-128 encrypted secrets, connection vault, lakehouse storage & diagnostics',
     },
   };
 

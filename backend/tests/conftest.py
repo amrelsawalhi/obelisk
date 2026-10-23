@@ -1,7 +1,10 @@
 import os
 import sys
 import ast
+import atexit
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 import pytest
 import docker
@@ -19,8 +22,17 @@ git_repo_dir = backend_dir.parent / "git_repo"
 if git_repo_dir.is_dir() and str(git_repo_dir) not in sys.path:
     sys.path.insert(0, str(git_repo_dir))
 
-# Configure test environment
-os.environ.setdefault("STORAGE_URI", "file:///data/lakehouse/bronze")
+# Configure test environment.
+#
+# STORAGE_URI must never point at the operator's real lakehouse: the suite
+# writes and deletes Parquet files, and the previous value
+# ("file:///data/lakehouse/bronze") made every tier-aware caller append another
+# /bronze, leaving nested data/lakehouse/bronze/bronze/ directories behind.
+# Each test session gets a private temporary lakehouse root instead.
+_TEST_STORAGE_ROOT = Path(tempfile.mkdtemp(prefix="obelisk-test-lakehouse-"))
+atexit.register(shutil.rmtree, _TEST_STORAGE_ROOT, ignore_errors=True)
+os.environ["STORAGE_URI"] = _TEST_STORAGE_ROOT.as_uri()
+
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///data/obelisk.db")
 os.environ.setdefault("OBELISK_MASTER_KEY", "dGhpcy1pcy1hLXNhbXBsZS0zMi1ieXRlLWtleS0xMjM0NTY=")
 
@@ -119,8 +131,15 @@ def cleanup_test_artifacts():
     from app.config import settings
     import sqlite3
 
-    storage_path = Path(settings.duckdb_storage_path)
-    if storage_path.exists():
+    # A test may deliberately set an unservable STORAGE_URI (e.g. s3://) to
+    # prove it is rejected. Resolution then raises by design, and that must not
+    # turn every later teardown into an error.
+    try:
+        storage_path = Path(settings.duckdb_storage_path)
+    except Exception:
+        storage_path = None
+
+    if storage_path is not None and storage_path.exists():
         for f in storage_path.glob("*.parquet"):
             if f.name.startswith((
                 "bronze_api_orders_",

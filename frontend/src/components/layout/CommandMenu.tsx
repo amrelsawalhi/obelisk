@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { tableSizeLabel } from '../../lib/format';
 import { useNavigate } from 'react-router-dom';
 import type { NavigateFunction } from 'react-router-dom';
 import {
@@ -78,7 +79,8 @@ function collectSqlFiles(node: DbtTreeNode | null | undefined, acc: DbtTreeNode[
 
 function makeTableItem(node: CatalogNode, table: CatalogTable, fqn: string, navigate: NavigateFunction): CommandItem {
   const sql = `-- Query Table\nSELECT * FROM ${fqn} LIMIT 50;\n`;
-  const rows = table.row_count != null ? ` • ${table.row_count.toLocaleString()} rows` : '';
+  const sizeLabel = tableSizeLabel(table);
+  const rows = sizeLabel ? ` • ${sizeLabel}` : '';
   return {
     id: `table:${node.id}:${table.name}`,
     kind: 'table',
