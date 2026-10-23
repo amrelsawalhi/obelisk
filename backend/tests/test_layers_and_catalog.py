@@ -127,6 +127,13 @@ def _alembic_config(db_path: Path):
     return cfg
 
 
+def _head(db_path: Path) -> str:
+    """Current head revision, so these tests survive every new migration."""
+    from alembic.script import ScriptDirectory
+
+    return ScriptDirectory.from_config(_alembic_config(db_path)).get_current_head()
+
+
 def test_baseline_then_backfill_preserves_assets(tmp_path: Path) -> None:
     """0001 builds the legacy schema, 0002 moves its rows into the registry."""
     from alembic import command
@@ -156,7 +163,7 @@ def test_baseline_then_backfill_preserves_assets(tmp_path: Path) -> None:
         layers = con.execute("SELECT path, is_default FROM layers").fetchall()
         revision = con.execute("SELECT version_num FROM alembic_version").fetchone()[0]
 
-    assert revision == "0002_catalog_and_layers"
+    assert revision == _head(db)
     assert layers == [("raw", 1)]
     assert len(rows) == 2
     by_name = {row[1]: row for row in rows}
@@ -177,22 +184,27 @@ def test_migrations_are_idempotent_and_reversible(tmp_path: Path) -> None:
 
     db = tmp_path / "brain.db"
     cfg = _alembic_config(db)
+    head = _head(db)
     command.upgrade(cfg, "head")
     command.upgrade(cfg, "head")  # a second start must be a no-op
 
     with sqlite3.connect(db) as con:
         assert con.execute("SELECT COUNT(*) FROM layers").fetchone()[0] == 1
-        assert con.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
-            "0002_catalog_and_layers"
-        )
+        assert con.execute("SELECT version_num FROM alembic_version").fetchone()[0] == head
+        assert "driver" in {
+            r[1] for r in con.execute("PRAGMA table_info(connections)")
+        }
 
     command.downgrade(cfg, "0001_baseline")
     with sqlite3.connect(db) as con:
         tables = {
             r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
+        connection_columns = {r[1] for r in con.execute("PRAGMA table_info(connections)")}
     assert "catalog_objects" not in tables and "layers" not in tables
     assert "assets" in tables
+    # 0003 rolled back cleanly as well (SQLite needs batch mode for DROP COLUMN).
+    assert "driver" not in connection_columns
 
 
 # --------------------------------------------------------------------------- #

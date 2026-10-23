@@ -15,6 +15,7 @@ from app.engines.duckdb_engine import duckdb_engine
 from app.engines.native_query_engine import native_query_engine
 from app.core.docker_manager import docker_mgr
 from app.core.host_resolver import resolve_connection_host
+from app.core.sources import UnsupportedSource, resolve_source
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 
 router = APIRouter(prefix="/api/query", tags=["query"])
@@ -73,15 +74,25 @@ def _is_connection_referenced(sql: str, alias: str, db_name: Optional[str] = Non
 
 async def _get_default_pg_attachments(db: AsyncSession, sql: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Fetches registered PostgreSQL sources to auto-attach in DuckDB.
+    Fetches every source Obelisk can attach live in DuckDB.
     If sql is provided, only attaches sources that are actually referenced in the query.
+
+    Attachability is a property of the connection's recipe (app.core.sources), not a
+    hardcoded source type, so a new attachable driver works here without an edit.
     """
     attachments = []
     try:
-        stmt = select(Connection).where(Connection.source_type == "postgres")
+        stmt = select(Connection)
         conns = (await db.execute(stmt)).scalars().all()
         for c in conns:
-            alias = re.sub(r"[^a-zA-Z0-9_]", "_", c.name.lower())
+            try:
+                recipe = resolve_source(c)
+            except UnsupportedSource:
+                continue
+            if not recipe.is_attachable:
+                continue
+
+            alias = recipe.alias
             if sql is not None and not _is_connection_referenced(sql, alias, c.database):
                 continue
             pw = decrypt(c.encrypted_credentials)

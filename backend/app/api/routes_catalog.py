@@ -17,6 +17,15 @@ from app.models.connection import Connection
 from app.models.asset import Asset
 from app.engines.introspector import introspector
 from app.engines.duckdb_engine import duckdb_engine
+from app.core.sources import (
+    DRIVERS,
+    UnsupportedSource,
+    capabilities_for,
+    connection_alias,
+    infer_driver,
+    resolve_source,
+)
+from app.services.catalog import catalog_service
 
 router = APIRouter(prefix="/api/catalog", tags=["catalog"])
 
@@ -38,6 +47,11 @@ class CreateConnectionRequest(BaseModel):
     username: str
     password: Optional[str] = ""
     options: Optional[Dict[str, Any]] = None
+    driver: Optional[str] = Field(
+        default=None,
+        description="attach | sdk | http. Inferred from source_type when omitted.",
+    )
+    read_only: Optional[bool] = None
 
 class UpdateConnectionRequest(BaseModel):
     name: Optional[str] = None
@@ -48,6 +62,8 @@ class UpdateConnectionRequest(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
     options: Optional[Dict[str, Any]] = None
+    driver: Optional[str] = None
+    read_only: Optional[bool] = None
 
 class ConnectionResponse(BaseModel):
     id: str
@@ -58,7 +74,59 @@ class ConnectionResponse(BaseModel):
     database: str
     username: str
     options: Optional[Dict[str, Any]] = None
+    driver: str
+    capabilities: List[str] = Field(default_factory=list)
+    read_only: bool = True
     created_at: str
+
+
+def _connection_response(conn: Connection) -> ConnectionResponse:
+    """Serialises a connection together with the recipe describing how to reach it.
+
+    The driver is reported as stored; capabilities come from the code, so a source
+    type that this build cannot reach shows ``driver='unknown'`` instead of
+    pretending to have capabilities it does not.
+    """
+    try:
+        recipe = resolve_source(conn)
+        driver: str = recipe.driver
+        capabilities = list(recipe.capabilities)
+        read_only = recipe.read_only
+    except UnsupportedSource:
+        driver = conn.driver or "unknown"
+        capabilities = []
+        read_only = bool(conn.read_only)
+
+    return ConnectionResponse(
+        id=conn.id,
+        name=conn.name,
+        source_type=conn.source_type,
+        host=conn.host,
+        port=conn.port,
+        database=conn.database,
+        username=conn.username,
+        options=conn.options,
+        driver=driver,
+        capabilities=capabilities,
+        read_only=read_only,
+        created_at=conn.created_at.isoformat(),
+    )
+
+
+def _resolve_driver_or_400(source_type: str, driver: Optional[str]) -> str:
+    """Pins a driver when given, infers one otherwise, and rejects nonsense."""
+    chosen = (driver or "").lower().strip()
+    if chosen and chosen not in DRIVERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"driver must be one of {list(DRIVERS)}, got {driver!r}.",
+        )
+    if chosen:
+        return chosen
+    try:
+        return infer_driver(source_type)
+    except UnsupportedSource as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
 @router.post("/connections", response_model=ConnectionResponse)
 async def create_connection(
@@ -76,15 +144,24 @@ async def create_connection(
         )
 
     encrypted_pw = encrypt(req.password or "")
+    source_type = req.source_type.lower().strip()
+    driver = _resolve_driver_or_400(source_type, req.driver)
+    # An attached source is read live, so it is read-only unless an operator says
+    # otherwise; a pulled one defaults to writable-into-the-lakehouse.
+    read_only = req.read_only if req.read_only is not None else (driver == "attach")
+
     new_conn = Connection(
         name=clean_name,
-        source_type=req.source_type.lower().strip(),
+        source_type=source_type,
         host=req.host.strip(),
         port=req.port,
         database=req.database.strip(),
         username=req.username.strip(),
         encrypted_credentials=encrypted_pw,
         options=req.options,
+        driver=driver,
+        capabilities_json=list(capabilities_for(driver)),
+        read_only=read_only,
     )
     db.add(new_conn)
     try:
@@ -98,17 +175,7 @@ async def create_connection(
             detail=f"Failed to register connection: {str(e)}"
         )
 
-    return ConnectionResponse(
-        id=new_conn.id,
-        name=new_conn.name,
-        source_type=new_conn.source_type,
-        host=new_conn.host,
-        port=new_conn.port,
-        database=new_conn.database,
-        username=new_conn.username,
-        options=new_conn.options,
-        created_at=new_conn.created_at.isoformat(),
-    )
+    return _connection_response(new_conn)
 
 @router.get("/connections", response_model=List[ConnectionResponse])
 async def list_connections(db: AsyncSession = Depends(get_db)):
@@ -116,20 +183,7 @@ async def list_connections(db: AsyncSession = Depends(get_db)):
     stmt = select(Connection)
     result = await db.execute(stmt)
     conns = result.scalars().all()
-    return [
-        ConnectionResponse(
-            id=c.id,
-            name=c.name,
-            source_type=c.source_type,
-            host=c.host,
-            port=c.port,
-            database=c.database,
-            username=c.username,
-            options=c.options,
-            created_at=c.created_at.isoformat(),
-        )
-        for c in conns
-    ]
+    return [_connection_response(c) for c in conns]
 
 def _execute_live_test(
     source_type: str,
@@ -303,21 +357,31 @@ async def update_connection(
     if req.options is not None:
         conn.options = req.options
 
+    previous_driver = conn.driver
+    if req.driver is not None:
+        conn.driver = _resolve_driver_or_400(conn.source_type, req.driver)
+    elif req.source_type is not None:
+        # Re-infer for the new type instead of keeping a driver pinned to the old one.
+        conn.driver = _resolve_driver_or_400(conn.source_type, None)
+
+    if req.read_only is not None:
+        conn.read_only = req.read_only
+
+    try:
+        conn.capabilities_json = list(resolve_source(conn).capabilities)
+    except UnsupportedSource as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    if conn.driver != previous_driver:
+        # Kind depends on the driver (shortcut vs external), so rows recorded under
+        # the old driver would be lies; drop them and let the next reconcile rebuild.
+        await catalog_service.delete_for_connection(db, conn.id)
+
     await db.commit()
     await db.refresh(conn)
     invalidate_catalog_cache()
 
-    return ConnectionResponse(
-        id=conn.id,
-        name=conn.name,
-        source_type=conn.source_type,
-        host=conn.host,
-        port=conn.port,
-        database=conn.database,
-        username=conn.username,
-        options=conn.options,
-        created_at=conn.created_at.isoformat(),
-    )
+    return _connection_response(conn)
 
 @router.delete("/connections/{conn_id}")
 async def delete_connection(
@@ -334,10 +398,75 @@ async def delete_connection(
             detail=f"Connection '{conn_id}' not found."
         )
 
+    # Remove the connection's catalogued objects in one statement, then the row:
+    # a detached shortcut would otherwise outlive the connection it points at (M7).
+    await catalog_service.delete_for_connection(db, conn_id)
     await db.delete(conn)
     await db.commit()
     invalidate_catalog_cache()
     return {"status": "deleted", "id": conn_id}
+
+
+@router.post("/connections/{conn_id}/reconcile")
+async def reconcile_connection_objects(
+    conn_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Introspects one source and refreshes its rows in ``catalog_objects``.
+
+    This is the exit gate of Phase 1: registering a connection is enough for its
+    tables to show up in the catalog, with no per-source code.
+    """
+    conn = (
+        await db.execute(select(Connection).where(Connection.id == conn_id))
+    ).scalar_one_or_none()
+    if not conn:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Connection '{conn_id}' not found.",
+        )
+
+    tables = await _introspect_connection(conn)
+    if tables is None:
+        # Refuse loudly: pruning on "could not look" would erase a healthy catalog
+        # because of one failed TCP connection.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not introspect '{conn.name}'; the catalog was left unchanged.",
+        )
+    result = await catalog_service.reconcile_connection(db, conn, tables)
+    invalidate_catalog_cache()
+    return result
+
+
+@router.get("/objects")
+async def list_catalog_objects(
+    kind: Optional[str] = None,
+    connection_id: Optional[str] = None,
+    layer_path: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Lists registry rows — the catalog's own view, independent of the filesystem."""
+    objects = await catalog_service.list_objects(
+        db, kind=kind, connection_id=connection_id, layer_path=layer_path
+    )
+    return [
+        {
+            "id": obj.id,
+            "fqn": obj.fqn,
+            "name": obj.name,
+            "kind": obj.kind,
+            "backend": obj.backend,
+            "layer_path": obj.layer_path,
+            "connection_id": obj.connection_id,
+            "location": obj.location,
+            "size_bytes": obj.size_bytes,
+            "row_count": obj.row_count,
+            "version": obj.version,
+            "capabilities": obj.capabilities_json or [],
+        }
+        for obj in objects
+    ]
 
 class CreateLakehouseDirectoryRequest(BaseModel):
     path: Optional[str] = Field(None, description="Directory name or nested relative path (e.g. 'bronze/events')")
@@ -599,6 +728,75 @@ async def move_lakehouse_table(
     invalidate_catalog_cache()
     return {"status": "moved", "source": src_folder, "target": dst_folder, "table": table_name}
 
+async def _introspect_connection(conn: Connection) -> Optional[List[Dict[str, Any]]]:
+    """Live table list for one connection, dispatched by source type.
+
+    Returns ``None`` — not an empty list — when the source cannot be reached or its
+    type is unknown. The distinction matters: ``[]`` means "the source is empty, so
+    its catalog rows should go", while ``None`` means "we could not look, so leave
+    the catalog exactly as it was". A transient network blip must not erase what the
+    registry knows.
+
+    Shared by the catalog tree and the explicit reconcile endpoint so the two can
+    never disagree about what a source contains.
+    """
+    plaintext_pw = decrypt(conn.encrypted_credentials)
+    st = (conn.source_type or "").lower()
+    try:
+        if st == "postgres":
+            sslmode = (conn.options or {}).get("sslmode", "disable")
+            return await asyncio.to_thread(
+                introspector.introspect_postgres,
+                host=conn.host,
+                port=conn.port,
+                database=conn.database,
+                username=conn.username,
+                password=plaintext_pw,
+                sslmode=sslmode,
+            )
+        if st == "mongodb":
+            auth_source = (conn.options or {}).get("auth_source", "admin")
+            return await asyncio.to_thread(
+                introspector.introspect_mongodb,
+                host=conn.host,
+                port=conn.port,
+                username=conn.username,
+                password=plaintext_pw,
+                auth_db=auth_source,
+                database_name=conn.database,
+            )
+        if st in ("mysql", "mariadb"):
+            return await asyncio.to_thread(
+                introspector.introspect_mysql,
+                host=conn.host,
+                port=conn.port,
+                database=conn.database,
+                username=conn.username,
+                password=plaintext_pw,
+            )
+        if st == "oracle":
+            return await asyncio.to_thread(
+                introspector.introspect_oracle,
+                host=conn.host,
+                port=conn.port,
+                database=conn.database,
+                username=conn.username,
+                password=plaintext_pw,
+            )
+        if st in ("api", "rest", "rest_api", "erp"):
+            return await asyncio.to_thread(
+                introspector.introspect_api,
+                base_url=conn.host,
+                endpoint=conn.database if conn.database else "",
+                token=plaintext_pw,
+                headers=(conn.options or {}).get("headers"),
+                data_key=(conn.options or {}).get("data_key"),
+            )
+    except Exception:
+        return None
+    return None
+
+
 @router.get("/tree")
 async def get_catalog_tree(
     refresh: bool = False,
@@ -681,64 +879,9 @@ async def get_catalog_tree(
     conns = result.scalars().all()
 
     async def _introspect_single_conn(conn: Connection) -> Dict[str, Any]:
-        plaintext_pw = decrypt(conn.encrypted_credentials)
-        source_tables: List[Dict[str, Any]] = []
-        try:
-            st = conn.source_type.lower()
-            if st == "postgres":
-                sslmode = (conn.options or {}).get("sslmode", "disable")
-                source_tables = await asyncio.to_thread(
-                    introspector.introspect_postgres,
-                    host=conn.host,
-                    port=conn.port,
-                    database=conn.database,
-                    username=conn.username,
-                    password=plaintext_pw,
-                    sslmode=sslmode,
-                )
-            elif st == "mongodb":
-                auth_source = (conn.options or {}).get("auth_source", "admin")
-                source_tables = await asyncio.to_thread(
-                    introspector.introspect_mongodb,
-                    host=conn.host,
-                    port=conn.port,
-                    username=conn.username,
-                    password=plaintext_pw,
-                    auth_db=auth_source,
-                    database_name=conn.database,
-                )
-            elif st in ("mysql", "mariadb"):
-                source_tables = await asyncio.to_thread(
-                    introspector.introspect_mysql,
-                    host=conn.host,
-                    port=conn.port,
-                    database=conn.database,
-                    username=conn.username,
-                    password=plaintext_pw,
-                )
-            elif st == "oracle":
-                source_tables = await asyncio.to_thread(
-                    introspector.introspect_oracle,
-                    host=conn.host,
-                    port=conn.port,
-                    database=conn.database,
-                    username=conn.username,
-                    password=plaintext_pw,
-                )
-            elif st in ("api", "rest", "rest_api", "erp"):
-                source_tables = await asyncio.to_thread(
-                    introspector.introspect_api,
-                    base_url=conn.host,
-                    endpoint=conn.database if conn.database else "",
-                    token=plaintext_pw,
-                    headers=(conn.options or {}).get("headers"),
-                    data_key=(conn.options or {}).get("data_key"),
-                )
-        except Exception:
-            source_tables = []
-
-        import re
-        source_alias = re.sub(r'[^a-zA-Z0-9_]', '_', conn.name.lower()).strip('_') or 'external'
+        fetched = await _introspect_connection(conn)
+        source_tables = list(fetched or [])
+        source_alias = connection_alias(conn.name)
         for t in source_tables:
             s_name = t.get("schema_name") or "public"
             raw_name = t.get("name") or "table"
@@ -747,19 +890,40 @@ async def get_catalog_tree(
             t["schema_name"] = s_name
             t["fqn"] = f"{source_alias}.{s_name}.{clean_tname}"
 
-        return {
+        try:
+            driver = resolve_source(conn).driver
+        except UnsupportedSource:
+            driver = conn.driver or "unknown"
+
+        node = {
             "id": conn.id,
             "name": conn.name,
             "type": conn.source_type,
+            "driver": driver,
             "host": conn.host,
             "port": conn.port,
             "database": conn.database,
             "tables": source_tables,
         }
+        if fetched is None:
+            # Unreachable is not the same as empty: say so, and change nothing.
+            node["catalog_error"] = "source unreachable — catalog rows left untouched"
+        return node
 
     if conns:
         conn_nodes = await asyncio.gather(*[_introspect_single_conn(c) for c in conns])
         tree.extend(conn_nodes)
+
+        # The tree refresh doubles as the reconcile: the tables are already in hand,
+        # so recording them costs no extra round trip. A failure is reported on the
+        # node rather than silently leaving the registry stale.
+        for conn, node in zip(conns, conn_nodes):
+            if node.get("catalog_error"):
+                continue
+            try:
+                await catalog_service.reconcile_connection(db, conn, node["tables"])
+            except Exception as exc:  # one broken source must not break the tree
+                node["catalog_error"] = str(exc)
 
     _catalog_tree_cache = tree
     _catalog_tree_cache_time = time.time()
