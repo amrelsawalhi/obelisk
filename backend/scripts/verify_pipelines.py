@@ -381,6 +381,103 @@ class Verifier:
         )
 
 
+    def check_materialize_and_outputs(self) -> None:
+        """A raw SQL step materialises a table; a child reads it by bound name."""
+        table_name = f"zz_verify_{int(time.time())}"
+        pipeline = self.create(
+            {
+                "name": "Demo - materialise and bind",
+                "description": "Writes a table, then reads it through a step output.",
+                "cron_expression": "0 7 * * *",
+                "timezone": "UTC",
+                "is_enabled": False,
+                "graph": {
+                    "steps": [
+                        step(
+                            "ingest",
+                            "ingest",
+                            "raw_sql",
+                            "select 1 as id union all select 2 as id",
+                            x=40,
+                            y=120,
+                            args={"materialize": {"layer": "bronze", "name": table_name}},
+                        ),
+                        step(
+                            "read",
+                            "read",
+                            "raw_sql",
+                            "select count(*) as n from {{steps.ingest.table}}",
+                            x=330,
+                            y=120,
+                        ),
+                    ],
+                    "edges": [edge("ingest", "read")],
+                    "params": [],
+                },
+            }
+        )
+        if not pipeline:
+            return
+        run = self.run(pipeline["id"])
+        if not run:
+            return
+        steps = self.by_name(run)
+        ingest_logs = self.logs(steps["ingest"]["id"])
+        read_logs = self.logs(steps["read"]["id"])
+        detail = self.client.get(f"/api/pipeline-runs/{run['id']}").json()
+        ingest_run = next(
+            (item for item in detail["step_runs"] if item["step_name"] == "ingest"), {}
+        )
+        outputs = ingest_run.get("outputs") or {}
+        self.report.add(
+            "raw SQL materialised a lakehouse table",
+            "Materialized 2 row(s)" in ingest_logs,
+            table_name,
+        )
+        self.report.add(
+            "the table name was published as a step output",
+            outputs.get("table", {}).get("value") == f"bronze.{table_name}",
+            str(outputs.get("table")),
+        )
+        self.report.add(
+            "the child resolved the parent's table binding",
+            f"from bronze.{table_name}" in read_logs.lower()
+            and steps["read"]["status"] == "success",
+            f"read={steps['read']['status']}",
+        )
+
+        rejected = self.client.put(
+            f"/api/pipelines/{pipeline['id']}/graph",
+            json={
+                "steps": [
+                    step(
+                        "read",
+                        "read",
+                        "raw_sql",
+                        "select * from {{steps.ghost.table}}",
+                        x=40,
+                        y=120,
+                    )
+                ],
+                "edges": [],
+                "params": [],
+            },
+        )
+        payload = rejected.json().get("detail") if rejected.status_code == 400 else {}
+        self.report.add(
+            "an unresolvable step reference is refused with a named reason",
+            rejected.status_code == 400
+            and isinstance(payload, dict)
+            and "ghost" in str(payload.get("message", ""))
+            and bool(payload.get("steps")),
+            str(payload)[:120],
+        )
+        # The graph was left as the rejected one only if the API had accepted it, so
+        # there is nothing to restore; drop the scratch table and pipeline.
+        self.client.delete(
+            "/api/lakehouse/tables", params={"folder": "bronze", "name": table_name}
+        )
+
     def check_schedule_and_history(self, pipeline_id: str) -> None:
         preview = self.client.get(
             "/api/pipelines/preview",
@@ -457,6 +554,7 @@ class Verifier:
             self.check_failure_branch(receiver)
         self.check_params_and_retries()
         self.check_dbt_pipeline()
+        self.check_materialize_and_outputs()
 
         pipelines = self.client.get("/api/pipelines").json()
         etl = next((p for p in pipelines if p["name"] == "Demo · lakehouse ETL"), None)

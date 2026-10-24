@@ -89,7 +89,12 @@ async def test_graph_validation_rejects_impossible_pipelines():
             },
         )
         assert cycle.status_code == 400
-        assert "Cycle detected" in cycle.json()["detail"]
+        # The detail is structured so the canvas can highlight the offending nodes
+        # and the message can name them instead of printing uuids.
+        cycle_detail = cycle.json()["detail"]
+        assert "Cycle detected" in cycle_detail["message"]
+        assert sorted(cycle_detail["steps"]) == ["a", "b"]
+        assert len(cycle_detail["edges"]) == 2
 
         dangling = await client.post(
             "/api/pipelines",
@@ -99,7 +104,9 @@ async def test_graph_validation_rejects_impossible_pipelines():
             },
         )
         assert dangling.status_code == 400
-        assert "unknown step" in dangling.json()["detail"]
+        dangling_detail = dangling.json()["detail"]
+        assert "ghost" in dangling_detail["message"]
+        assert dangling_detail["edges"] == [{"from_key": "a", "to_key": "ghost"}]
 
         no_target = await client.post(
             "/api/pipelines",
@@ -109,7 +116,7 @@ async def test_graph_validation_rejects_impossible_pipelines():
             },
         )
         assert no_target.status_code == 400
-        assert "requires a target" in no_target.json()["detail"]
+        assert "needs a target" in no_target.json()["detail"]["message"]
 
         bad_cron = await client.post(
             "/api/pipelines",

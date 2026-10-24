@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -43,6 +44,7 @@ from app.models.pipeline import (
     PipelineEdge,
     PipelineParam,
     PipelineRun,
+    PipelineState,
     PipelineStep,
     StepRun,
 )
@@ -62,6 +64,97 @@ OVERLAP_POLICIES = ("skip", "queue", "kill")
 STEP_TERMINAL = frozenset({"success", "failed", "skipped", "cancelled", "interrupted"})
 RUN_ACTIVE = frozenset({"pending", "waiting", "running"})
 RUN_TERMINAL = frozenset({"success", "failed", "cancelled", "interrupted", "skipped"})
+
+
+OUTPUT_MAX_CHARS = 4096
+
+# {{steps.<step>.<output>}} in a raw SQL target, {steps.<step>.<output>} in a webhook
+# template. Both are validated at save time against declared outputs and real edges.
+STEP_REF = re.compile(r"\{\{\s*steps\.([A-Za-z0-9_\-]+)\.([A-Za-z0-9_]+)\s*\}\}")
+STEP_REF_PLAIN = re.compile(r"(?<!\{)\{steps\.([A-Za-z0-9_\-]+)\.([A-Za-z0-9_]+)\}(?!\})")
+
+
+def _sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def declared_outputs(step_type: str, args: Dict[str, Any]) -> Dict[str, str]:
+    """Output name → type for a step, including the ones the engine derives.
+
+    A step may declare ``outputs: {name: {type: scalar}}``. Two outputs need no
+    declaration because the engine knows they exist: ``table`` when the step
+    materialises (its value is the produced table name) and ``dbt_summary`` for dbt
+    steps. Validation and the runtime use this same function, so what a graph may
+    reference is exactly what the engine can deliver.
+    """
+    declared: Dict[str, str] = {}
+    raw = args.get("outputs")
+    if isinstance(raw, dict):
+        for name, spec in raw.items():
+            kind = "scalar"
+            if isinstance(spec, dict):
+                kind = str(spec.get("type", "scalar"))
+            elif isinstance(spec, str):
+                kind = spec
+            if kind not in ("scalar", "table"):
+                kind = "scalar"
+            declared[str(name)] = kind
+    if isinstance(args.get("materialize"), dict):
+        declared.setdefault("table", "table")
+    if step_type in ("dbt_run", "dbt_test"):
+        declared.setdefault("dbt_summary", "scalar")
+    return declared
+
+
+def render_step_refs(text: str, parents: Dict[str, Dict[str, Dict[str, Any]]]) -> str:
+    """Substitutes ``{{steps.x.y}}`` using the parents' captured outputs.
+
+    A ``table`` output is inserted as a bare identifier (``bronze.orders_delta``) so
+    it can be used in ``FROM``; a scalar becomes a proper SQL literal.
+    """
+    def _replace(match: "re.Match[str]") -> str:
+        step_name, output = match.group(1), match.group(2)
+        entry = parents.get(step_name, {}).get(output)
+        if entry is None:
+            return match.group(0)
+        if entry.get("type") == "table":
+            return str(entry.get("value"))
+        return _sql_literal(entry.get("value"))
+
+    return STEP_REF.sub(_replace, text)
+
+
+def render_plain_step_refs(text: str, parents: Dict[str, Dict[str, Dict[str, Any]]]) -> str:
+    """Substitutes ``{steps.x.y}`` for non-SQL context (webhook bodies, script args)."""
+    def _replace(match: "re.Match[str]") -> str:
+        entry = parents.get(match.group(1), {}).get(match.group(2))
+        if entry is None:
+            return match.group(0)
+        value = entry.get("value")
+        return "" if value is None else str(value)
+
+    return STEP_REF_PLAIN.sub(_replace, text)
+
+
+def slug_name(name: str) -> str:
+    """Template-safe form of a step name.
+
+    Step names are free-form ('Load orders'), but a reference has to be one token.
+    Both the reference and the environment variable use this slug, so a name with a
+    space is still reachable as ``steps.Load_orders.table``.
+    """
+    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
+
+
+def output_env_name(step_name: str, output: str) -> str:
+    clean = f"{slug_name(step_name)}_{output}".upper()
+    return f"OBELISK_STEP_{clean}"
 
 
 class StepCancelled(Exception):
@@ -937,7 +1030,13 @@ class PipelineEngine:
             step_run.started_at = utcnow()
             params = json.loads(run.params_json or "{}")
             prior_logs = step_run.logs or ""
+            step_args = json.loads(step.args_json) if step.args_json else {}
+            declared = declared_outputs(step.step_type, step_args)
+            parents = await self._parent_outputs(session, run, step)
             await session.commit()
+
+        # Where a script/notebook may drop its declared values as JSON.
+        output_path = self._output_path(step_run_id)
 
         # Attempts append: the log of attempt 1 survives attempt 2, which is the only
         # way a retry can be diagnosed after the fact.
@@ -950,13 +1049,20 @@ class PipelineEngine:
         status = "success"
         error: Optional[str] = None
         started = time.time()
+        produced: Dict[str, Dict[str, Any]] = {}
 
         try:
             if run.id in self._cancel_runs:
                 # Cancelled between the claim and this task starting: the child must
                 # never be spawned at all.
                 raise StepCancelled()
-            await self._dispatch(step, params, pipeline, step_run.id, run.id, log, timeout)
+            produced = (
+                await self._dispatch(
+                    step, step_args, params, pipeline, step_run.id, run.id,
+                    parents, output_path, log, timeout,
+                )
+                or {}
+            )
         except StepCancelled:
             status = "cancelled"
             log.append("Cancelled before the child produced a result.")
@@ -979,6 +1085,14 @@ class PipelineEngine:
             error = None
             log.append("Cancelled by operator.")
         log.append(f"Step finished: {status} ({duration}s)")
+
+        # Outputs are published only on success: a failed or retried attempt must not
+        # leave a value that a child could consume.
+        captured: Dict[str, Dict[str, Any]] = {}
+        if status == "success":
+            captured = self._collect_outputs(declared, produced, output_path, log)
+        if output_path.exists():
+            output_path.unlink(missing_ok=True)
 
         retry_cap = step.max_retries if step.max_retries is not None else pipeline.max_retries
         retry_delay = (
@@ -1010,8 +1124,13 @@ class PipelineEngine:
                 row.duration_seconds = duration
                 row.error = error
                 row.next_retry_at = None
+                if status == "success":
+                    row.output_json = json.dumps(captured) if captured else None
             await session.commit()
             run_id = row.run_id
+
+        if captured:
+            await self._publish_state(run.pipeline_id, run_id, step.name, captured)
 
         self._flushed.pop(step_run_id, None)
         # Promote dependents immediately instead of waiting for the next tick.
@@ -1021,36 +1140,40 @@ class PipelineEngine:
     async def _dispatch(
         self,
         step: PipelineStep,
+        args: Dict[str, Any],
         params: Dict[str, Any],
         pipeline: Pipeline,
         step_run_id: str,
         run_id: str,
+        parents: Dict[str, Dict[str, Dict[str, Any]]],
+        output_path: Path,
         log: List[str],
         timeout: int,
-    ) -> None:
-        args = json.loads(step.args_json) if step.args_json else {}
+    ) -> Dict[str, Dict[str, Any]]:
+        """Runs the step and returns the outputs the engine derived itself."""
         if step.step_type in ("dbt_run", "dbt_test"):
-            await self._run_dbt(step, params, log, timeout)
-        elif step.step_type == "script":
+            return await self._run_dbt(step, params, log, timeout)
+        if step.step_type == "script":
             await self._run_python_file(
                 self.scripts_dir, step.target, args, params, step_run_id, run_id,
-                log, timeout, "script"
+                parents, output_path, log, timeout, "script",
             )
         elif step.step_type == "notebook":
             await self._run_python_file(
                 self.notebooks_dir, step.target, args, params, step_run_id, run_id,
-                log, timeout, "notebook"
+                parents, output_path, log, timeout, "notebook",
             )
         elif step.step_type == "webhook":
-            await self._run_webhook(step, args, params, log, timeout)
+            await self._run_webhook(step, args, params, parents, log, timeout)
         elif step.step_type == "raw_sql":
-            await self._run_raw_sql(step, params, log, timeout)
+            return await self._run_raw_sql(step, args, params, parents, log, timeout)
         else:
             raise ValueError(f"Unsupported step type '{step.step_type}'.")
+        return {}
 
     async def _run_dbt(
         self, step: PipelineStep, params: Dict[str, Any], log: List[str], timeout: int
-    ) -> None:
+    ) -> Dict[str, Dict[str, Any]]:
         from app.engines.dbt_runner import dbt_runner
 
         command = "test" if step.step_type == "dbt_test" else "run"
@@ -1085,6 +1208,47 @@ class PipelineEngine:
             raise RuntimeError(
                 f"dbt {command} failed with exit code {(result or {}).get('exit_code')}."
             )
+        summary = self._dbt_summary(command, log)
+        return {"dbt_summary": {"type": "scalar", "value": summary}} if summary else {}
+
+    def _dbt_summary(self, command: str, log: List[str]) -> Optional[Dict[str, Any]]:
+        """Reads dbt's own run_results.json into a small, bounded summary.
+
+        A step's log is a wall of text; the summary is the part an operator needs on
+        the run screen ("9 models, 27 tests, 0 failures") and the part a downstream
+        webhook can act on. dbt writes the file next to the project's target dir.
+        """
+        import json as _json
+
+        path = self.workspace_root / "git_repo" / "dbt_project" / "target" / "run_results.json"
+        if not path.is_file():
+            return None
+        try:
+            payload = _json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        results = payload.get("results") or []
+        counts: Dict[str, int] = {}
+        failures: List[str] = []
+        for entry in results:
+            status = str(entry.get("status", "unknown")).lower()
+            counts[status] = counts.get(status, 0) + 1
+            if status in ("fail", "error", "skipped") and len(failures) < 5:
+                unique_id = str(entry.get("unique_id", ""))
+                failures.append(unique_id.split(".")[-1] if unique_id else "unnamed")
+        summary = {
+            "command": command,
+            "total": len(results),
+            "ok": counts.get("success", 0) + counts.get("pass", 0),
+            "failed": counts.get("fail", 0) + counts.get("error", 0),
+            "skipped": counts.get("skipped", 0) + counts.get("warn", 0),
+            "failures": failures,
+        }
+        log.append(
+            f"dbt summary: {summary['total']} node(s) · {summary['ok']} ok · "
+            f"{summary['failed']} failed · {summary['skipped']} skipped"
+        )
+        return summary
 
     async def _run_python_file(
         self,
@@ -1094,6 +1258,8 @@ class PipelineEngine:
         params: Dict[str, Any],
         step_run_id: str,
         run_id: str,
+        parents: Dict[str, Dict[str, Dict[str, Any]]],
+        output_path: Path,
         log: List[str],
         timeout: int,
         label: str,
@@ -1106,8 +1272,9 @@ class PipelineEngine:
         if not path.exists():
             raise FileNotFoundError(f"{label.capitalize()} '{target}' not found in {root}.")
 
-        env = self._child_env(params)
-        cmd = [_interpreter_path(), "-u", str(path), *[str(a) for a in args.get("args", [])]]
+        env = self._child_env(params, parents, output_path)
+        raw_args = [render_plain_step_refs(str(a), parents) for a in args.get("args", [])]
+        cmd = [_interpreter_path(), "-u", str(path), *raw_args]
         log.append(f"$ {' '.join(cmd)}")
         code = await self._run_child(cmd, env, step_run_id, run_id, log, timeout)
         if code != 0:
@@ -1119,6 +1286,7 @@ class PipelineEngine:
         step: PipelineStep,
         args: Dict[str, Any],
         params: Dict[str, Any],
+        parents: Dict[str, Dict[str, Dict[str, Any]]],
         log: List[str],
         timeout: int,
     ) -> None:
@@ -1132,7 +1300,7 @@ class PipelineEngine:
             if isinstance(value, str):
                 for key, val in params.items():
                     value = value.replace("{" + key + "}", "" if val is None else str(val))
-                return value
+                return render_plain_step_refs(value, parents)
             if isinstance(value, dict):
                 return {k: render(v) for k, v in value.items()}
             if isinstance(value, list):
@@ -1141,22 +1309,34 @@ class PipelineEngine:
 
         body = render(args.get("body"))
         headers = render(args.get("headers") or {})
-        log.append(f"$ {method} {step.target}")
+        url = render_plain_step_refs(step.target, parents)
+        log.append(f"$ {method} {url}")
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.request(method, step.target, json=body, headers=headers)
+            response = await client.request(method, url, json=body, headers=headers)
         log.append(f"HTTP {response.status_code}: {response.text[:2000]}")
         if response.status_code >= 400:
             raise RuntimeError(f"Webhook returned HTTP {response.status_code}.")
 
     async def _run_raw_sql(
-        self, step: PipelineStep, params: Dict[str, Any], log: List[str], timeout: int
-    ) -> None:
+        self,
+        step: PipelineStep,
+        args: Dict[str, Any],
+        params: Dict[str, Any],
+        parents: Dict[str, Dict[str, Dict[str, Any]]],
+        log: List[str],
+        timeout: int,
+    ) -> Dict[str, Dict[str, Any]]:
         from app.engines.duckdb_engine import duckdb_engine
 
-        sql = render_sql_params(step.target or "", params).strip()
+        sql = render_step_refs(render_sql_params(step.target or "", params), parents).strip()
         if not sql:
             raise ValueError("Raw SQL step has no SQL.")
         log.append(f"$ {sql[:500]}")
+
+        materialize = args.get("materialize")
+        if isinstance(materialize, dict) and materialize.get("name"):
+            return await self._materialize_sql(sql, materialize, log, timeout)
+
         result = await asyncio.wait_for(
             asyncio.to_thread(duckdb_engine.execute_query, sql), timeout=timeout
         )
@@ -1165,6 +1345,40 @@ class PipelineEngine:
         log.append(f"Query OK: {rows} row(s), columns={columns}")
         for row in (result or {}).get("rows", [])[:25]:
             log.append(str(row))
+        return {}
+
+    async def _materialize_sql(
+        self, sql: str, materialize: Dict[str, Any], log: List[str], timeout: int
+    ) -> Dict[str, Dict[str, Any]]:
+        """Writes the query's rows to a lakehouse table and publishes its name.
+
+        DuckDB here is in-memory, so a table cannot outlive the query. The durable
+        result is a Parquet dataset in a layer — the same atomic write the SDK does —
+        which the SQL rewriter already resolves when a later step says
+        ``FROM bronze.orders_delta``. That is how rows move between steps: through
+        the lakehouse, never through orchestration memory.
+        """
+        from app.sdk import obelisk as sdk
+
+        layer = str(materialize.get("layer") or "bronze").strip().strip("/")
+        name = str(materialize.get("name") or "").strip()
+        table = f"{layer}.{name}"
+        if not re.fullmatch(r"[A-Za-z0-9_]+", name) or not re.fullmatch(
+            r"[A-Za-z0-9_./]+", layer
+        ):
+            raise ValueError(f"Invalid materialize target '{table}'.")
+
+        def _write() -> Dict[str, Any]:
+            arrow = sdk.query_arrow(sql)
+            saved = sdk.save(arrow, table, sync_postgres=False)
+            return {"rows": int(arrow.num_rows), "saved": saved}
+
+        outcome = await asyncio.wait_for(asyncio.to_thread(_write), timeout=timeout)
+        log.append(
+            f"Materialized {outcome['rows']} row(s) -> {table} "
+            f"({outcome['saved'].get('file_path', '?')})"
+        )
+        return {"table": {"type": "table", "value": table}}
 
     # ---------------------------------------------------------- child process
 
@@ -1290,7 +1504,153 @@ class PipelineEngine:
             return text
         return "…[earlier output truncated]…\n" + text[-MAX_LOG_CHARS:]
 
-    def _child_env(self, params: Dict[str, Any]) -> Dict[str, str]:
+    # ------------------------------------------------------------- outputs
+
+    def _output_path(self, step_run_id: str) -> Path:
+        directory = self.workspace_root / "data" / "tmp"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"step_{step_run_id}.json"
+        path.unlink(missing_ok=True)
+        return path
+
+    async def _parent_outputs(
+        self, session, run: PipelineRun, step: PipelineStep
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Outputs of this step's direct parents, for template substitution.
+
+        Prefers the value this run produced; falls back to ``pipeline_state`` so a
+        re-run of a subtree (or a run after history pruning) still has its parents'
+        values. Only declared outputs are ever present — that is all the engine stores.
+        """
+        edge_rows = (
+            await session.execute(
+                select(PipelineEdge).where(PipelineEdge.to_step == step.id)
+            )
+        ).scalars().all()
+        if not edge_rows:
+            return {}
+        parent_ids = [edge.from_step for edge in edge_rows]
+        parents = (
+            await session.execute(
+                select(PipelineStep).where(PipelineStep.id.in_(parent_ids))
+            )
+        ).scalars().all()
+        by_id = {parent.id: parent for parent in parents}
+
+        resolved: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for parent_id in parent_ids:
+            parent = by_id.get(parent_id)
+            if not parent:
+                continue
+            from_run = (
+                await session.execute(
+                    select(StepRun)
+                    .where(StepRun.run_id == run.id, StepRun.step_id == parent_id)
+                    .order_by(StepRun.attempt.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            values: Optional[Dict[str, Dict[str, Any]]] = None
+            if from_run and from_run.output_json:
+                try:
+                    values = json.loads(from_run.output_json)
+                except ValueError:
+                    values = None
+            if values is None:
+                state_rows = (
+                    await session.execute(
+                        select(PipelineState).where(
+                            PipelineState.pipeline_id == run.pipeline_id,
+                            PipelineState.key.startswith(f"{parent.name}."),
+                        )
+                    )
+                ).scalars().all()
+                if state_rows:
+                    values = {
+                        row.key[len(parent.name) + 1:]: json.loads(row.value_json)
+                        for row in state_rows
+                    }
+            if values:
+                resolved[parent.name] = values
+                resolved.setdefault(slug_name(parent.name), values)
+        return resolved
+
+    def _collect_outputs(
+        self,
+        declared: Dict[str, str],
+        produced: Dict[str, Dict[str, Any]],
+        output_path: Path,
+        log: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Merges engine-derived outputs with the values the child wrote down."""
+        values: Dict[str, Dict[str, Any]] = dict(produced)
+        if output_path.is_file():
+            try:
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    for name, kind in declared.items():
+                        if kind == "scalar" and name in payload:
+                            values[name] = {"type": "scalar", "value": payload[name]}
+            except (OSError, ValueError) as exc:
+                log.append(f"WARNING: could not read declared outputs: {exc}")
+
+        values = {name: entry for name, entry in values.items() if name in declared}
+        if not values:
+            return {}
+        if len(json.dumps(values)) > OUTPUT_MAX_CHARS:
+            log.append(
+                f"WARNING: outputs exceed {OUTPUT_MAX_CHARS} characters and were dropped; "
+                "pass data through the lakehouse instead."
+            )
+            return {}
+        for name, entry in values.items():
+            shown = entry.get("value")
+            if isinstance(shown, (dict, list)):
+                shown = json.dumps(shown)
+            log.append(f"output {name} = {shown}")
+        return values
+
+    async def _publish_state(
+        self,
+        pipeline_id: str,
+        run_id: str,
+        step_name: str,
+        values: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Remembers the last value per (pipeline, step.output), outside run history."""
+        try:
+            async with AsyncSessionLocal() as session:
+                for name, entry in values.items():
+                    key = f"{step_name}.{name}"
+                    row = await session.get(PipelineState, (pipeline_id, key))
+                    payload = json.dumps(entry)
+                    if row:
+                        row.value_json = payload
+                        row.updated_at = utcnow()
+                        row.updated_by_run = run_id
+                    else:
+                        session.add(
+                            PipelineState(
+                                pipeline_id=pipeline_id,
+                                key=key,
+                                value_json=payload,
+                                updated_at=utcnow(),
+                                updated_by_run=run_id,
+                            )
+                        )
+                await session.commit()
+        except Exception:
+            # State is a convenience for later runs; never fail a step over it.
+            logger.exception(
+                "Could not persist pipeline state for %s.%s", pipeline_id, step_name
+            )
+
+    def _child_env(
+        self,
+        params: Dict[str, Any],
+        parents: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+        output_path: Optional[Path] = None,
+    ) -> Dict[str, str]:
         env = os.environ.copy()
         backend_dir = str(self.workspace_root / "backend")
         # The notebooks directory carries the `obelisk` SDK shim that notebooks and
@@ -1309,6 +1669,14 @@ class PipelineEngine:
         env["PYTHONUTF8"] = "1"
         for name, value in params.items():
             env[f"OBELISK_PARAM_{name.upper()}"] = "" if value is None else str(value)
+        # Declared outputs of the direct parents, one env var per value, and the
+        # file a child writes its own declared values to.
+        for step_name, values in (parents or {}).items():
+            for output, entry in values.items():
+                value = entry.get("value")
+                env[output_env_name(step_name, output)] = "" if value is None else str(value)
+        if output_path is not None:
+            env["OBELISK_OUTPUT_FILE"] = str(output_path)
         return env
 
 

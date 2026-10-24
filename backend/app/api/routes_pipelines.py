@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -29,10 +30,14 @@ from app.engines.pipeline_engine import (
     OVERLAP_POLICIES,
     RUN_ACTIVE,
     RUN_TERMINAL,
+    STEP_REF,
+    STEP_REF_PLAIN,
     STEP_TERMINAL,
     STEP_TYPES,
     compute_next_run,
+    declared_outputs,
     pipeline_engine,
+    slug_name,
     preview_runs,
     validate_timezone,
 )
@@ -121,6 +126,11 @@ class RunNowRequest(BaseModel):
 
 # ------------------------------------------------------------------ validation
 
+# A materialise target becomes a directory name and a catalog key, so it is held to
+# the same rules as any other table: letters, digits, underscores (layers may nest).
+STEP_NODE_NAME = re.compile(r"[A-Za-z0-9_]+")
+STEP_LAYER_NAME = re.compile(r"[A-Za-z0-9_./]+")
+
 
 def _validate_schedule(cron_expression: str, timezone_name: str) -> None:
     try:
@@ -145,37 +155,74 @@ def _validate_policy(overlap_policy: str) -> None:
         )
 
 
-def _validate_graph(graph: GraphIn) -> None:
-    """Rejects everything the engine could not execute, with a precise message."""
-    if not graph.steps:
-        raise HTTPException(status_code=400, detail="A pipeline needs at least one step.")
+def _invalid(message: str, steps: Optional[List[str]] = None, edges: Optional[List[Dict[str, str]]] = None):
+    """A validation failure the canvas can act on, not just read.
 
-    keys: set = set()
-    names: set = set()
+    The detail is a structured object: the message uses human names, and ``steps`` /
+    ``edges`` carry the graph keys so the UI can paint the offending node or edge red
+    and offer to remove it. A plain string would force the operator to decode UUIDs.
+    """
+    return HTTPException(
+        status_code=400,
+        detail={
+            "message": message,
+            "steps": steps or [],
+            "edges": edges or [],
+        },
+    )
+
+
+def _declared_for(step_type: str, args: Dict[str, Any]) -> Dict[str, str]:
+    return declared_outputs(step_type, args)
+
+
+def _iter_refs(text: str):
+    """Yields (step_name, output) for every declared-output reference in *text*."""
+    seen = set()
+    for pattern in (STEP_REF, STEP_REF_PLAIN):
+        for match in pattern.finditer(text or ""):
+            pair = (match.group(1), match.group(2))
+            if pair not in seen:
+                seen.add(pair)
+                yield pair
+
+
+def _validate_graph(graph: GraphIn) -> None:
+    """Rejects everything the engine could not execute, naming what is wrong."""
+    if not graph.steps:
+        raise _invalid("A pipeline needs at least one step.")
+
+    names_by_key: Dict[str, str] = {}
+    by_key: Dict[str, StepIn] = {}
+    seen_names: set = set()
     for step in graph.steps:
         if not step.key:
-            raise HTTPException(status_code=400, detail="Every step needs a key.")
-        if step.key in keys:
-            raise HTTPException(status_code=400, detail=f"Duplicate step key '{step.key}'.")
-        keys.add(step.key)
+            raise _invalid("Every step needs a key (the canvas node id).")
         clean_name = (step.name or "").strip()
         if not clean_name:
-            raise HTTPException(status_code=400, detail="Every step needs a name.")
-        if clean_name.lower() in names:
-            raise HTTPException(status_code=400, detail=f"Duplicate step name '{clean_name}'.")
-        names.add(clean_name.lower())
+            raise _invalid("Every step needs a name.", steps=[step.key])
+        if step.key in names_by_key:
+            raise _invalid(
+                f"Two steps share the same node id ('{step.key}'); reload the pipeline and retry.",
+                steps=[step.key],
+            )
+        if clean_name.lower() in seen_names:
+            raise _invalid(f"Step name '{clean_name}' is used twice.", steps=[step.key])
+        names_by_key[step.key] = clean_name
+        by_key[step.key] = step
+        seen_names.add(clean_name.lower())
+
         if step.step_type not in STEP_TYPES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Step '{clean_name}' has unknown type '{step.step_type}'. "
-                f"Expected one of {list(STEP_TYPES)}.",
+            raise _invalid(
+                f"Step '{clean_name}' has unknown type '{step.step_type}'. "
+                f"Expected one of {', '.join(STEP_TYPES)}.",
+                steps=[step.key],
             )
         if step.step_type in ("script", "notebook", "webhook", "raw_sql") and not (
             step.target or ""
         ).strip():
-            raise HTTPException(
-                status_code=400,
-                detail=f"Step '{clean_name}' ({step.step_type}) requires a target.",
+            raise _invalid(
+                f"Step '{clean_name}' ({step.step_type}) needs a target.", steps=[step.key]
             )
         for limit_name, value in (
             ("timeout_seconds", step.timeout_seconds),
@@ -183,40 +230,98 @@ def _validate_graph(graph: GraphIn) -> None:
             ("retry_delay_seconds", step.retry_delay_seconds),
         ):
             if value is not None and value < 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Step '{clean_name}' has a negative {limit_name}.",
+                raise _invalid(
+                    f"Step '{clean_name}' has a negative {limit_name}.", steps=[step.key]
                 )
 
+        args = step.args or {}
+        materialize = args.get("materialize")
+        if materialize is not None:
+            if step.step_type != "raw_sql":
+                raise _invalid(
+                    f"Step '{clean_name}' can only materialize from a raw SQL step.",
+                    steps=[step.key],
+                )
+            if not isinstance(materialize, dict) or not materialize.get("name"):
+                raise _invalid(
+                    f"Step '{clean_name}' has an incomplete materialize target.",
+                    steps=[step.key],
+                )
+            layer = str(materialize.get("layer") or "bronze")
+            name = str(materialize.get("name"))
+            if not STEP_NODE_NAME.fullmatch(name) or not STEP_LAYER_NAME.fullmatch(layer):
+                raise _invalid(
+                    f"Step '{clean_name}' materializes to an invalid table name "
+                    f"'{layer}.{name}'. Use letters, digits and underscores.",
+                    steps=[step.key],
+                )
+
+        outputs = args.get("outputs")
+        if outputs is not None:
+            if not isinstance(outputs, dict):
+                raise _invalid(
+                    f"Step '{clean_name}' has malformed outputs; expected an object.",
+                    steps=[step.key],
+                )
+            for output_name, spec in outputs.items():
+                if not STEP_NODE_NAME.fullmatch(str(output_name)):
+                    raise _invalid(
+                        f"Step '{clean_name}' declares output '{output_name}'; use letters, "
+                        "digits and underscores.",
+                        steps=[step.key],
+                    )
+                kind = spec.get("type", "scalar") if isinstance(spec, dict) else spec
+                if kind not in ("scalar", "table"):
+                    raise _invalid(
+                        f"Step '{clean_name}' declares output '{output_name}' as '{kind}'; "
+                        "use 'scalar' or 'table'.",
+                        steps=[step.key],
+                    )
+                if kind == "table" and not isinstance(materialize, dict):
+                    raise _invalid(
+                        f"Step '{clean_name}' declares a table output but does not "
+                        "materialize anything.",
+                        steps=[step.key],
+                    )
+
+
     pairs: set = set()
-    children: Dict[str, List[str]] = {key: [] for key in keys}
+    children: Dict[str, List[str]] = {key: [] for key in names_by_key}
+    parents: Dict[str, List[str]] = {key: [] for key in names_by_key}
     for edge in graph.edges:
-        if edge.from_key not in keys or edge.to_key not in keys:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Edge {edge.from_key!r} → {edge.to_key!r} references an unknown step.",
+        if edge.from_key not in names_by_key or edge.to_key not in names_by_key:
+            unknown = edge.from_key if edge.from_key not in names_by_key else edge.to_key
+            raise _invalid(
+                f"An edge points at '{unknown}', which is not a step in this graph. "
+                "Reload the pipeline and retry.",
+                edges=[{"from_key": edge.from_key, "to_key": edge.to_key}],
             )
+        source, target = names_by_key[edge.from_key], names_by_key[edge.to_key]
         if edge.from_key == edge.to_key:
-            raise HTTPException(
-                status_code=400, detail=f"Step '{edge.from_key}' cannot depend on itself."
+            raise _invalid(
+                f"Step '{source}' cannot depend on itself.",
+                edges=[{"from_key": edge.from_key, "to_key": edge.to_key}],
             )
         if edge.condition not in EDGE_CONDITIONS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Edge condition must be one of {list(EDGE_CONDITIONS)}.",
+            raise _invalid(
+                f"The edge '{source}' -> '{target}' uses condition '{edge.condition}'; "
+                f"expected one of {', '.join(EDGE_CONDITIONS)}.",
+                edges=[{"from_key": edge.from_key, "to_key": edge.to_key}],
             )
         pair = (edge.from_key, edge.to_key)
         if pair in pairs:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Duplicate edge {edge.from_key!r} → {edge.to_key!r}.",
+            raise _invalid(
+                f"'{source}' -> '{target}' is connected twice. Set the condition on the "
+                "existing edge instead.",
+                edges=[{"from_key": edge.from_key, "to_key": edge.to_key}],
             )
         pairs.add(pair)
         children[edge.from_key].append(edge.to_key)
+        parents[edge.to_key].append(edge.from_key)
 
     # DFS colouring: a cycle makes dependency resolution undefined.
     WHITE, GREY, BLACK = 0, 1, 2
-    colour = {key: WHITE for key in keys}
+    colour = {key: WHITE for key in names_by_key}
     path: List[str] = []
 
     def visit(node: str) -> None:
@@ -224,16 +329,64 @@ def _validate_graph(graph: GraphIn) -> None:
         path.append(node)
         for child in children.get(node, []):
             if colour[child] == GREY:
-                cycle = " → ".join(path[path.index(child):] + [child])
-                raise HTTPException(status_code=400, detail=f"Cycle detected: {cycle}.")
+                cycle_keys = path[path.index(child):] + [child]
+                names = [names_by_key[key] for key in cycle_keys]
+                raise _invalid(
+                    "Cycle detected: " + " -> ".join(names) + ".",
+                    steps=sorted(set(cycle_keys)),
+                    edges=[
+                        {"from_key": cycle_keys[i], "to_key": cycle_keys[i + 1]}
+                        for i in range(len(cycle_keys) - 1)
+                    ],
+                )
             if colour[child] == WHITE:
                 visit(child)
         path.pop()
         colour[node] = BLACK
 
-    for key in keys:
+    for key in names_by_key:
         if colour[key] == WHITE:
             visit(key)
+
+    # Output references must point at a parent's *declared* output, so a renamed or
+    # disconnected step fails at save time instead of at three in the morning.
+    for step in graph.steps:
+        declared_parents = {
+            parent_key: _declared_for(by_key[parent_key].step_type, by_key[parent_key].args or {})
+            for parent_key in parents.get(step.key, [])
+        }
+        # A name such as 'load orders' is reachable as 'load_orders': the engine
+        # publishes the slug next to the name, so both spellings resolve.
+        key_by_ref: Dict[str, str] = {}
+        for key, name in names_by_key.items():
+            key_by_ref[name] = key
+            key_by_ref.setdefault(slug_name(name), key)
+        haystack = " ".join(
+            [step.target or "", json.dumps(step.args or {})]
+        )
+        for ref_step, ref_output in _iter_refs(haystack):
+            ref_key = key_by_ref.get(ref_step)
+            if ref_key is None:
+                raise _invalid(
+                    f"Step '{names_by_key[step.key]}' references 'steps.{ref_step}.{ref_output}', "
+                    "but no step has that name.",
+                    steps=[step.key],
+                )
+            if ref_key not in declared_parents:
+                raise _invalid(
+                    f"Step '{names_by_key[step.key]}' references 'steps.{ref_step}.{ref_output}' "
+                    f"but '{ref_step}' is not one of its direct parents. Connect the edge "
+                    "first.",
+                    steps=[step.key, ref_key],
+                )
+            if ref_output not in declared_parents[ref_key]:
+                available = ", ".join(sorted(declared_parents[ref_key])) or "none"
+                raise _invalid(
+                    f"Step '{names_by_key[step.key]}' references output '{ref_output}' of "
+                    f"'{ref_step}', which declares {available}.",
+                    steps=[step.key, ref_key],
+                )
+
 
 
 # ---------------------------------------------------------------- serializing
@@ -338,6 +491,7 @@ def _step_run_out(
         "next_retry_at": _iso(step_run.next_retry_at),
         "error": step_run.error,
         "logs_size": len(step_run.logs or ""),
+        "outputs": json.loads(step_run.output_json) if step_run.output_json else {},
     }
     if include_logs:
         payload["logs"] = step_run.logs or ""
@@ -506,8 +660,27 @@ async def list_pipelines():
                 )
             ).scalars().all()
         )
+        # The rail shows a dot per recent run. One query for the last few runs of every
+        # pipeline keeps that to a single round trip instead of one per row.
+        recent: Dict[str, List[str]] = {}
+        rows = (
+            await session.execute(
+                select(PipelineRun.pipeline_id, PipelineRun.status)
+                .where(PipelineRun.started_at.isnot(None))
+                .order_by(PipelineRun.started_at.desc())
+                .limit(400)
+            )
+        ).all()
+        for pipeline_id, status in rows:
+            bucket = recent.setdefault(pipeline_id, [])
+            if len(bucket) < 6:
+                bucket.append(status)
         return [
-            _pipeline_out(p, int(counts.get(p.id, 0)), p.id in active) for p in pipelines
+            {
+                **_pipeline_out(p, int(counts.get(p.id, 0)), p.id in active),
+                "recent_statuses": recent.get(p.id, []),
+            }
+            for p in pipelines
         ]
 
 

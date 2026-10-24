@@ -11,6 +11,7 @@ from app.models.pipeline import (
     PipelineEdge,
     PipelineParam,
     PipelineRun,
+    PipelineState,
     PipelineStep,
     StepRun,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "Pipeline",
     "PipelineParam",
     "PipelineStep",
+    "PipelineState",
     "PipelineEdge",
     "PipelineRun",
     "StepRun",

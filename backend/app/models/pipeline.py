@@ -165,4 +165,30 @@ class StepRun(Base):
     next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
     logs: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Declared outputs captured from this attempt (scalars, a materialized table
+    # name, the dbt summary), JSON-encoded and capped. Only names the step declares
+    # (or the engine derives from materialize) ever land here.
+    output_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class PipelineState(Base):
+    """The pipeline's last known output values, kept outside run history.
+
+    ``step_runs`` are pruned with their run (``keep_runs``), so a value a step
+    published months ago would vanish with the run that produced it — and
+    "re-run from this step" would lose its parents' outputs. This table holds one
+    row per ``pipeline_id`` + ``step.output`` and is never pruned; a run lookup
+    prefers the value from its own run and falls back to this row.
+    """
+
+    __tablename__ = "pipeline_state"
+
+    pipeline_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("pipelines.id", ondelete="CASCADE"), primary_key=True
+    )
+    key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    value_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    updated_by_run: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
 
