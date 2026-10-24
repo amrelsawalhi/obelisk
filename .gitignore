@@ -107,3 +107,5 @@ Thumbs.db
 # Internal Design Documents (working notes, not shipped with the platform)
 docs/architecture.md
 docs/implementation-plan.md
+docs/pipeline-orchestrator-plan.md
+

@@ -2,9 +2,9 @@ import sys
 from pathlib import Path
 
 # Ensure backend/, project root and git_repo/ are on sys.path for uvicorn reloader
-# child processes. git_repo/ must be importable so the in-process Dagster fallback
-# (used whenever no Dagster service is deployed) can resolve
-# `from dagster_workspace.repository import create_ingest_asset`.
+# child processes. git_repo/ must be importable so notebooks can `import obelisk`
+# (the SDK adapter at git_repo/notebooks/obelisk.py) exactly as they do when run
+# from the Pipelines tab.
 _current_file = Path(__file__).resolve()
 _backend_dir = _current_file.parents[1]
 _project_root = _current_file.parents[2]
@@ -22,8 +22,10 @@ for _p in (
 
 from contextlib import asynccontextmanager
 import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.database import init_db
 from app.api.routes_services import router as services_router
@@ -31,13 +33,15 @@ from app.api.routes_catalog import router as catalog_router
 from app.api.routes_ingest import router as ingest_router
 from app.api.routes_query import router as query_router
 from app.api.routes_notebook import router as notebook_router
-from app.api.routes_pipeline import router as pipeline_router
+# dbt-facing pipeline endpoints first: their static paths (/api/pipelines/assets,
+# /api/pipelines/model/...) must win over the orchestrator's /{pipeline_id}.
+from app.api.routes_pipeline import router as dbt_pipeline_router
+from app.api.routes_pipelines import router as pipelines_router
 from app.api.routes_auth import router as auth_router
 from app.api.routes_variables import router as variables_router
 from app.api.routes_files import router as files_router
 from app.api.routes_terminal import router as terminal_router
 from app.api.routes_dbt import router as dbt_router
-from app.api.routes_orchestration import router as orchestration_router
 from app.api.routes_layers import router as layers_router
 from app.core.resource_advisor import advisor
 from app.core.docker_manager import docker_mgr
@@ -54,10 +58,11 @@ async def lifespan(app: FastAPI):
     # the tree always describes what exists.
     from app.services.layers import reconcile_layers_from_assets
     await asyncio.to_thread(reconcile_layers_from_assets)
-    from app.engines.cron_engine import cron_engine
-    cron_engine.start()
+    # The orchestrator heals interrupted rows itself on its first tick.
+    from app.engines.pipeline_engine import pipeline_engine
+    pipeline_engine.start()
     yield
-    cron_engine.stop()
+    await pipeline_engine.stop()
     # Terminate the headless Marimo subprocess so no orphan holds port 2718.
     from app.engines.marimo_service import marimo_service
     marimo_service.stop()
@@ -85,12 +90,12 @@ app.include_router(catalog_router)
 app.include_router(ingest_router)
 app.include_router(query_router)
 app.include_router(notebook_router)
-app.include_router(pipeline_router)
+app.include_router(dbt_pipeline_router)
+app.include_router(pipelines_router)
 app.include_router(variables_router)
 app.include_router(files_router)
 app.include_router(terminal_router)
 app.include_router(dbt_router)
-app.include_router(orchestration_router)
 app.include_router(layers_router)
 
 
@@ -162,4 +167,32 @@ async def websocket_events(websocket: WebSocket):
     except (WebSocketDisconnect, Exception):
         pass
 
+
+
+# ---------------------------------------------------------------------------
+# Single-process deployment: the backend serves the built SPA.
+#
+# Vite stays the development server, but a Linux install has no Node at all — the
+# systemd unit starts uvicorn and nothing else, and this mount is what makes that
+# possible. Registered last so every API route and websocket above wins the match,
+# and a deep client route (/pipelines, /dbt) still returns index.html.
+# ---------------------------------------------------------------------------
+_frontend_dist = (_project_root / "frontend" / "dist").resolve()
+if (_frontend_dist / "index.html").is_file():
+    if (_frontend_dist / "assets").is_dir():
+        app.mount(
+            "/assets",
+            StaticFiles(directory=str(_frontend_dist / "assets")),
+            name="spa-assets",
+        )
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str):
+        if full_path.startswith(("api/", "ws/")):
+            raise HTTPException(status_code=404, detail="Not found")
+        candidate = (_frontend_dist / full_path).resolve()
+        # Path traversal guard: FileResponse must only ever read inside dist/.
+        if candidate.is_file() and str(candidate).startswith(str(_frontend_dist)):
+            return FileResponse(candidate)
+        return FileResponse(_frontend_dist / "index.html")
 

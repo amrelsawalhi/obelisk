@@ -19,18 +19,9 @@ import type {
   NotebookServerStatus,
   AssetGraphResponse,
   PipelineRun,
-  PipelineDefinition,
-  CreatePipelineRequest,
   TriggerPipelineRequest,
   VariableItem,
   CreateVariableRequest,
-  CustomDagItem,
-  CreateDagRequest,
-  OrchestrationEnginesResponse,
-  CronJob,
-  CreateCronJobRequest,
-  CronTargetsResponse,
-  RunCronJobResponse,
   DbtTreeNode,
   DbtFileResponse,
   DbtCompileResponse,
@@ -41,8 +32,14 @@ import type {
   ServiceCatalogEntry,
   ServiceEngineStatus,
   DeployProgressResponse,
-  DagsterSchedule,
-  DagsterRun,
+  PipelineSummary,
+  PipelineDetail,
+  PipelineExecution,
+  PipelineExecutionDetail,
+  PipelineTargets,
+  CreatePipelinePayload,
+  GraphPayload,
+  ExecutionStatus,
 } from './types';
 
 export const apiClient = axios.create({
@@ -293,17 +290,104 @@ export const api = {
     return res.data;
   },
 
-  // Pipelines
-  getPipelines: async (): Promise<PipelineDefinition[]> => {
-    const res = await apiClient.get<PipelineDefinition[]>('/pipelines');
+  // Pipelines (orchestrator)
+  listPipelines: async (): Promise<PipelineSummary[]> => {
+    const res = await apiClient.get<PipelineSummary[]>('/pipelines');
     return res.data;
   },
-  createPipeline: async (payload: CreatePipelineRequest): Promise<PipelineDefinition> => {
-    const res = await apiClient.post<PipelineDefinition>('/pipelines', payload);
+  getPipeline: async (id: string): Promise<PipelineDetail> => {
+    const res = await apiClient.get<PipelineDetail>(`/pipelines/${id}`);
+    return res.data;
+  },
+  createPipeline: async (payload: CreatePipelinePayload): Promise<PipelineSummary> => {
+    const res = await apiClient.post<PipelineSummary>('/pipelines', payload);
+    return res.data;
+  },
+  updatePipeline: async (
+    id: string,
+    payload: Partial<CreatePipelinePayload>,
+  ): Promise<PipelineSummary> => {
+    const res = await apiClient.patch<PipelineSummary>(`/pipelines/${id}`, payload);
+    return res.data;
+  },
+  replacePipelineGraph: async (
+    id: string,
+    graph: GraphPayload,
+  ): Promise<{ status: string; pipeline_id: string; step_count: number }> => {
+    const res = await apiClient.put<{ status: string; pipeline_id: string; step_count: number }>(
+      `/pipelines/${id}/graph`,
+      graph,
+    );
     return res.data;
   },
   deletePipeline: async (id: string): Promise<{ status: string; id: string }> => {
     const res = await apiClient.delete<{ status: string; id: string }>(`/pipelines/${id}`);
+    return res.data;
+  },
+  togglePipeline: async (
+    id: string,
+  ): Promise<{ id: string; is_enabled: boolean; next_run_at: string | null }> => {
+    const res = await apiClient.post<{ id: string; is_enabled: boolean; next_run_at: string | null }>(
+      `/pipelines/${id}/toggle`,
+    );
+    return res.data;
+  },
+  runPipelineNow: async (
+    id: string,
+    params?: Record<string, unknown>,
+  ): Promise<{ run_id: string }> => {
+    const res = await apiClient.post<{ run_id: string }>(`/pipelines/${id}/run`, {
+      params: params ?? null,
+    });
+    return res.data;
+  },
+  previewSchedule: async (
+    cronExpression: string,
+    timezone: string,
+    count = 5,
+  ): Promise<{ next_runs: string[] }> => {
+    const res = await apiClient.get<{ next_runs: string[] }>('/pipelines/preview', {
+      params: { cron_expression: cronExpression, timezone, count },
+    });
+    return res.data;
+  },
+  getPipelineTargets: async (): Promise<PipelineTargets> => {
+    const res = await apiClient.get<PipelineTargets>('/pipelines/targets');
+    return res.data;
+  },
+  listPipelineExecutions: async (params?: {
+    pipeline_id?: string;
+    status?: ExecutionStatus;
+    limit?: number;
+  }): Promise<PipelineExecution[]> => {
+    const res = await apiClient.get<PipelineExecution[]>('/pipeline-runs', { params });
+    return res.data;
+  },
+  getPipelineExecution: async (runId: string): Promise<PipelineExecutionDetail> => {
+    const res = await apiClient.get<PipelineExecutionDetail>(`/pipeline-runs/${runId}`);
+    return res.data;
+  },
+  cancelPipelineExecution: async (runId: string): Promise<{ status: string }> => {
+    const res = await apiClient.post<{ status: string }>(`/pipeline-runs/${runId}/cancel`);
+    return res.data;
+  },
+  rerunFromStep: async (runId: string, stepId: string): Promise<{ run_id: string }> => {
+    const res = await apiClient.post<{ run_id: string }>(
+      `/pipeline-runs/${runId}/rerun-from/${stepId}`,
+    );
+    return res.data;
+  },
+  getStepRunLogs: async (
+    stepRunId: string,
+    after = 0,
+  ): Promise<{ id: string; status: string; size: number; offset: number; logs: string }> => {
+    const res = await apiClient.get<{
+      id: string;
+      status: string;
+      size: number;
+      offset: number;
+      logs: string;
+    }>(`/step-runs/${stepRunId}/logs`, { params: { after } });
     return res.data;
   },
   getAssetGraph: async (selector?: string): Promise<AssetGraphResponse> => {
@@ -347,57 +431,7 @@ export const api = {
     return res.data;
   },
 
-  // Custom DAGs (git_repo/dags/)
-  listDags: async (): Promise<CustomDagItem[]> => {
-    const res = await apiClient.get<CustomDagItem[]>('/pipelines/dags');
-    return res.data;
-  },
-  createDag: async (payload: CreateDagRequest): Promise<{ status: string; name: string; filename: string; path: string; code: string }> => {
-    const res = await apiClient.post<{ status: string; name: string; filename: string; path: string; code: string }>('/pipelines/dags', payload);
-    return res.data;
-  },
-  getDagCode: async (name: string): Promise<{ name: string; code: string }> => {
-    const res = await apiClient.get<{ name: string; code: string }>(`/pipelines/dags/${name}/code`);
-    return res.data;
-  },
-  updateDagCode: async (name: string, code: string): Promise<{ status: string; name: string; path: string }> => {
-    const res = await apiClient.put<{ status: string; name: string; path: string }>(`/pipelines/dags/${name}/code`, { code });
-    return res.data;
-  },
-  deleteDag: async (name: string): Promise<{ status: string; name: string }> => {
-    const res = await apiClient.delete<{ status: string; name: string }>(`/pipelines/dags/${name}`);
-    return res.data;
-  },
 
-  // Orchestration Hub & Cron Scheduler
-  getOrchestrationEngines: async (): Promise<OrchestrationEnginesResponse> => {
-    const res = await apiClient.get<OrchestrationEnginesResponse>('/pipelines/engines');
-    return res.data;
-  },
-  getCronTargets: async (): Promise<CronTargetsResponse> => {
-    const res = await apiClient.get<CronTargetsResponse>('/pipelines/cron/targets');
-    return res.data;
-  },
-  getCronJobs: async (): Promise<CronJob[]> => {
-    const res = await apiClient.get<CronJob[]>('/pipelines/cron/jobs');
-    return res.data;
-  },
-  createCronJob: async (payload: CreateCronJobRequest): Promise<CronJob> => {
-    const res = await apiClient.post<CronJob>('/pipelines/cron/jobs', payload);
-    return res.data;
-  },
-  runCronJobNow: async (id: string): Promise<RunCronJobResponse> => {
-    const res = await apiClient.post<RunCronJobResponse>(`/pipelines/cron/jobs/${id}/run`);
-    return res.data;
-  },
-  toggleCronJob: async (id: string): Promise<CronJob> => {
-    const res = await apiClient.patch<CronJob>(`/pipelines/cron/jobs/${id}/toggle`);
-    return res.data;
-  },
-  deleteCronJob: async (id: string): Promise<{ status: string; id: string }> => {
-    const res = await apiClient.delete<{ status: string; id: string }>(`/pipelines/cron/jobs/${id}`);
-    return res.data;
-  },
 
   // File Manager (git_repo/)
   getFileTree: async (): Promise<import('./types').FileTreeResponse> => {
@@ -507,18 +541,5 @@ export const api = {
     return res.data;
   },
 
-  // Dagster Native Panel — fabric-over-Dagster view for the Pipelines tab.
-  // Each call returns [] when Dagster is unreachable; the panel renders an
-  // empty state in that case (no 502 cascade).
-  getDagsterSchedules: async (): Promise<DagsterSchedule[]> => {
-    const res = await apiClient.get<DagsterSchedule[]>('/orchestration/dagster/schedules');
-    return res.data;
-  },
-  getDagsterRuns: async (limit: number = 20): Promise<DagsterRun[]> => {
-    const res = await apiClient.get<DagsterRun[]>('/orchestration/dagster/runs', {
-      params: { limit },
-    });
-    return res.data;
-  },
 };
 

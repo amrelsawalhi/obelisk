@@ -1,20 +1,19 @@
-"""Regression tests for the shipped notebook shim and sample DAG (audit B5, B6).
+"""Regression tests for the shipped notebook shim (audit B5, B6).
 
 B5: notebooks run with cwd=git_repo/notebooks, so `import obelisk` resolves to the
     shim there. It omitted `var`, which made obelisk.var() raise AttributeError
     inside every Marimo notebook.
 B6: obelisk.query() already returns a Polars DataFrame, so calling .to_polars()
-    on it raised AttributeError. The shipped DAG and the pipeline template did
-    exactly that, and the pipeline caught the error and silently reported 0 rows.
+    on it raised AttributeError.
 """
 import importlib.util
+import re
 from pathlib import Path
 
 import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 NOTEBOOK_DIR = PROJECT_ROOT / "git_repo" / "notebooks"
-DAG_DIR = PROJECT_ROOT / "git_repo" / "dags"
 SCRIPT_DIR = PROJECT_ROOT / "git_repo" / "scripts"
 
 
@@ -45,23 +44,19 @@ def test_query_returns_a_polars_frame():
 
 
 def test_shipped_samples_do_not_call_to_polars_on_query_results():
-    """B6: no shipped DAG or script may re-introduce the broken chain."""
+    """B6: `obelisk.query()` already returns Polars; `.to_polars()` on it raises.
+
+    `obelisk.table()` returns a ``TableWrapper`` whose ``to_polars()`` is legit —
+    only the query result chain is forbidden.
+    """
+    pattern = re.compile(r"obelisk\.query\([^\n]*\)\.to_polars\(\)")
     offenders = []
-    for directory in (DAG_DIR, SCRIPT_DIR):
+    for directory in (SCRIPT_DIR, NOTEBOOK_DIR):
         if not directory.is_dir():
             continue
         for path in directory.glob("*.py"):
-            if ".to_polars()" in path.read_text(encoding="utf-8"):
+            if pattern.search(path.read_text(encoding="utf-8")):
                 offenders.append(path.name)
 
     assert offenders == [], f".to_polars() on a query result in: {offenders}"
 
-
-def test_pipeline_template_does_not_call_to_polars():
-    """B6: the generated Dagster/KPI template had the same bug."""
-    source = (
-        PROJECT_ROOT / "backend" / "app" / "api" / "routes_pipeline.py"
-    ).read_text(encoding="utf-8")
-
-    assert "obelisk.query(" in source
-    assert ".to_polars()" not in source

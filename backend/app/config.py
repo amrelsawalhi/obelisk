@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     def sqlite_db_path(self) -> str:
         """Resolves the canonical absolute filesystem path for the SQLite database.
 
-        Subprocesses (dagster workspace, dbt project) run with different working
+        Subprocesses (pipeline steps, dbt project) run with different working
         directories, so a relative DATABASE_URL would resolve to different files
         (split-brain). Always returns an absolute POSIX path, normalized for
         3-slash relative URIs, 4-slash absolute URIs, and Windows drive letters.

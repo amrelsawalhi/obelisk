@@ -27,7 +27,7 @@ def test_resource_advisor_hardware_specs():
 
 def test_resource_advisor_recommendations():
     """Validates dynamic memory sizing for catalog services."""
-    services = ["postgres", "dagster", "superset", "clickhouse", "redpanda", "gitea"]
+    services = ["postgres", "superset", "clickhouse", "redpanda", "gitea"]
     specs = advisor.get_host_specs()
 
     for svc in services:

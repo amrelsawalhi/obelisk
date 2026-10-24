@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 from app.config import settings
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -33,7 +34,7 @@ def _resolve_engine_url() -> str:
     """Returns the SQLAlchemy URL for the internal brain database.
 
     For SQLite the URL is rebuilt from ``settings.sqlite_db_path`` so that the
-    engine, the SDK and every subprocess (dagster workspace, dbt project) open
+    engine, the SDK and every subprocess (pipeline steps, dbt project) open
     the exact same file. A relative DATABASE_URL would otherwise be resolved
     against each process's own cwd, producing split-brain empty databases.
     """
@@ -49,6 +50,13 @@ engine = create_async_engine(
     _resolve_engine_url(),
     echo=settings.DEBUG,
     future=True,
+    # NullPool for SQLite on purpose. A pooled aiosqlite connection is bound to the
+    # event loop that created it and to a live transaction; if a request or an engine
+    # task is cancelled mid-transaction the rollback may never run, and the zombie
+    # connection keeps SQLite's single write lock forever — every later writer then
+    # stalls on busy_timeout. Opening per session costs microseconds and cannot leak a
+    # lock. (Pooling is right for a networked database, not for a local file.)
+    poolclass=NullPool if settings.is_sqlite else None,
 )
 
 @event.listens_for(engine.sync_engine, "connect")
@@ -61,7 +69,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA synchronous=NORMAL;")
     cursor.execute("PRAGMA foreign_keys=ON;")
     # Commit connections wait for a writer instead of failing immediately.
-    # Several processes (API, SDK, Dagster workspace) share this file.
+    # Several processes (API, SDK, step children) share this file.
     cursor.execute("PRAGMA busy_timeout=15000;")
     cursor.close()
 
@@ -83,7 +91,7 @@ async def seed_defaults(session: AsyncSession) -> None:
     """
     from sqlalchemy import select
     from app.models.variable import Variable
-    from app.models.pipeline_definition import PipelineDefinition
+    from app.models.pipeline import Pipeline, PipelineEdge, PipelineStep
 
     # Seed default variables if table is empty
     v_res = await session.execute(select(Variable.id).limit(1))
@@ -109,37 +117,57 @@ async def seed_defaults(session: AsyncSession) -> None:
             ),
         ])
 
-    # Seed default pipeline definitions if table is empty. These are examples, not a
-    # fixed set of layers: rename them, retarget the selectors, or delete them.
-    p_res = await session.execute(select(PipelineDefinition.id).limit(1))
+    # Seed one starter pipeline if the table is empty. It is disabled: a fresh install
+    # should not run dbt at 02:00 because a row was seeded. Enable it, retarget the
+    # selectors, or delete it — the orchestrator has no privileged pipelines.
+    p_res = await session.execute(select(Pipeline.id).limit(1))
     if not p_res.scalars().first():
-        session.add_all([
-            PipelineDefinition(
-                name="Everything",
-                description="Runs every model in the project",
-                selector="*",
-            ),
-            PipelineDefinition(
-                name="Orders & Revenue",
-                description="Builds the order staging models and the revenue marts that depend on them",
-                selector="stg_orders+",
-            ),
-            PipelineDefinition(
-                name="Customer Analytics",
-                description="Builds the customer staging models and the lifetime-value marts",
-                selector="stg_customers+",
-            ),
-            PipelineDefinition(
-                name="Staging Models Only",
-                description="Materialises and tests the staging folder without building marts",
-                selector="models/staging",
-            ),
-            PipelineDefinition(
-                name="Marts Only",
-                description="Rebuilds the marts from already-materialised staging models",
-                selector="models/marts",
-            ),
-        ])
+        starter = Pipeline(
+            id=str(__import__("uuid").uuid4()),
+            name="Nightly dbt build",
+            description="Runs every dbt model, then tests the project. Disabled until you enable it.",
+            cron_expression="0 2 * * *",
+            timezone="UTC",
+            is_enabled=False,
+            next_run_at=None,
+        )
+        run_step_id = str(__import__("uuid").uuid4())
+        test_step_id = str(__import__("uuid").uuid4())
+        session.add(starter)
+        session.add_all(
+            [
+                PipelineStep(
+                    id=run_step_id,
+                    pipeline_id=starter.id,
+                    name="dbt run",
+                    step_type="dbt_run",
+                    target="*",
+                    position_x=80,
+                    position_y=120,
+                ),
+                PipelineStep(
+                    id=test_step_id,
+                    pipeline_id=starter.id,
+                    name="dbt test",
+                    step_type="dbt_test",
+                    target="*",
+                    position_x=400,
+                    position_y=120,
+                ),
+            ]
+        )
+        # Flush the foreign-key side first: these mappers declare no relationships,
+        # so the unit of work would otherwise be free to insert the edge before the
+        # steps it points at.
+        await session.flush()
+        session.add(
+            PipelineEdge(
+                pipeline_id=starter.id,
+                from_step=run_step_id,
+                to_step=test_step_id,
+                condition="success",
+            )
+        )
 
     await session.commit()
 

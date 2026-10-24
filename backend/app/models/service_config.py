@@ -8,7 +8,7 @@ class ServiceConfig(Base):
     __tablename__ = "service_configs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    service_name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True) # postgres, dagster, superset, clickhouse, redpanda, gitea
+    service_name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True) # postgres, superset, clickhouse, redpanda, gitea
     deployment_type: Mapped[str] = mapped_column(String(20), nullable=False, default="local") # "local" or "remote"
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="stopped") # stopped, running, connected, error
     container_id: Mapped[str | None] = mapped_column(String(100), nullable=True)

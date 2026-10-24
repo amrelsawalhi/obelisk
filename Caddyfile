@@ -14,11 +14,6 @@
         reverse_proxy obelisk_superset:8088
     }
 
-    # Dagster Orchestration Webserver (Configured with --path-prefix /dagster)
-    handle /dagster/* {
-        reverse_proxy obelisk_dagster:3000
-    }
-
     # Reactive Marimo Notebook Server (Configured with --base-url /notebooks)
     handle /notebooks/* {
         reverse_proxy obelisk-core:2718

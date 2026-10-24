@@ -27,15 +27,11 @@ def test_docker_manager_service_blueprints():
     rec_pg = advisor.recommend_allocation("postgres")
     assert rec_pg["recommended_ram_mb"] >= 512
 
-    # 2. Dagster Engine
-    rec_dag = advisor.recommend_allocation("dagster")
-    assert rec_dag["recommended_ram_mb"] >= 512
-
-    # 3. Superset BI
+    # 2. Superset BI
     rec_sup = advisor.recommend_allocation("superset")
     assert rec_sup["recommended_ram_mb"] >= 512
 
-    # 4. ClickHouse OLAP
+    # 3. ClickHouse OLAP
     rec_ch = advisor.recommend_allocation("clickhouse")
     assert rec_ch["recommended_ram_mb"] >= 512
 
@@ -260,67 +256,4 @@ async def test_pipelines_api_flow(source_postgres_params):
         assert "runs" in history_data
         assert history_data["total"] >= 1
 
-
-@pytest.mark.asyncio
-async def test_multi_pipeline_definitions_and_scoping():
-    """
-    Verifies multi-pipeline capabilities:
-    1. Default enterprise pipelines seeded on empty query.
-    2. Dynamic DAG lineage calculation scoped to selectors.
-    3. Custom pipeline definition creation, retrieval, and deletion.
-    """
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. Fetch pipelines (verifies auto-seeding)
-        res = await client.get("/api/pipelines")
-        assert res.status_code == 200
-        pipelines = res.json()
-        assert len(pipelines) >= 5
-        assert all(entry["selector"] for entry in pipelines)
-        # The seeded examples are ordinary editable rows, not a fixed vocabulary:
-        # nothing in them should still be named after a tier.
-        lowered = {entry["name"].lower() for entry in pipelines}
-        assert "all medallion assets" not in lowered
-        assert "gold marts only" not in lowered
-
-        # 2. Test Scoped DAG retrieval for Orders Flow
-        scoped_graph_resp = await client.get("/api/pipelines/assets?selector=stg_orders%2B")
-        assert scoped_graph_resp.status_code == 200
-        scoped_graph = scoped_graph_resp.json()
-        assert scoped_graph["active_pipeline_selector"] == "stg_orders+"
-        assert scoped_graph["active_node_count"] > 0
-        # Orders node must be active in this pipeline
-        orders_node = next((n for n in scoped_graph["nodes"] if n["name"] == "orders"), None)
-        assert orders_node is not None
-        assert orders_node["is_in_pipeline"] is True
-
-        # 3. Create a custom pipeline definition
-        new_pipeline_payload = {
-            "name": f"Test Custom Marts {uuid.uuid4().hex[:6]}",
-            "description": "Scoped run for gold analytics marts",
-            "selector": "models/marts",
-            "schedule": "0 2 * * *",
-        }
-        create_resp = await client.post("/api/pipelines", json=new_pipeline_payload)
-        assert create_resp.status_code == 200
-        created_p = create_resp.json()
-        assert created_p["name"] == new_pipeline_payload["name"]
-        assert created_p["selector"] == "models/marts"
-        custom_id = created_p["id"]
-
-        # 4. Verify custom pipeline exists in listing
-        updated_list_resp = await client.get("/api/pipelines")
-        assert updated_list_resp.status_code == 200
-        updated_list = updated_list_resp.json()
-        assert any(p["id"] == custom_id for p in updated_list)
-
-        # 5. Delete custom pipeline
-        del_resp = await client.delete(f"/api/pipelines/{custom_id}")
-        assert del_resp.status_code == 200
-        assert del_resp.json()["status"] == "deleted"
-
-        # 6. Verify pipeline was removed
-        final_list_resp = await client.get("/api/pipelines")
-        final_list = final_list_resp.json()
-        assert not any(p["id"] == custom_id for p in final_list)
 

@@ -81,8 +81,8 @@ def test_scanner_ignores_pure_computation(tmp_path: Path) -> None:
         textwrap.dedent(
             """
             async def handler():
-                from app.engines.cron_engine import cron_engine
-                return cron_engine.compute_next_run("* * * * *")
+                from app.engines.pipeline_engine import compute_next_run
+                return compute_next_run("* * * * *")
             """
         ),
         encoding="utf-8",

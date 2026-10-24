@@ -33,7 +33,16 @@ _TEST_STORAGE_ROOT = Path(tempfile.mkdtemp(prefix="obelisk-test-lakehouse-"))
 atexit.register(shutil.rmtree, _TEST_STORAGE_ROOT, ignore_errors=True)
 os.environ["STORAGE_URI"] = _TEST_STORAGE_ROOT.as_uri()
 
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///data/obelisk.db")
+# The suite must never touch the operator's real brain database. Earlier it ran
+# against `data/obelisk.db`, so catalog_objects rows pointing at
+# `%obelisk-test-lakehouse%` and `zz*` test layers accumulated in the production
+# file. Each session gets a throwaway SQLite file instead, migrated on first use by
+# the `prepare_test_db` fixture below.
+_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="obelisk-test-db-"))
+atexit.register(shutil.rmtree, _TEST_DB_DIR, ignore_errors=True)
+os.environ["DATABASE_URL"] = (
+    f"sqlite+aiosqlite:///{(_TEST_DB_DIR / 'obelisk.db').as_posix()}"
+)
 os.environ.setdefault("OBELISK_MASTER_KEY", "dGhpcy1pcy1hLXNhbXBsZS0zMi1ieXRlLWtleS0xMjM0NTY=")
 
 # On Windows, configure DOCKER_HOST if needed so docker.from_env() reaches WSL daemon

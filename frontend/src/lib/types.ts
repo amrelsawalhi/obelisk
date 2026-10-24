@@ -220,8 +220,6 @@ export interface IngestTriggerRequest {
   limit?: number;
   write_strategy?: 'append' | 'upsert';
   primary_key?: string;
-  schedule?: string;
-  schedule_engine?: 'cron' | 'dagster';
 }
 
 export interface IngestTriggerResponse {
@@ -242,8 +240,6 @@ export interface BatchIngestRequest {
   limit?: number;
   write_strategy?: 'append' | 'upsert';
   primary_key?: string;
-  schedule?: string;
-  schedule_engine?: 'cron' | 'dagster';
 }
 
 export interface BatchIngestResultItem {
@@ -408,22 +404,6 @@ export interface AssetGraphNode {
   description?: string;
 }
 
-export interface CustomDagItem {
-  filename: string;
-  name: string;
-  path: string;
-  size_bytes: number;
-  modified_at: number;
-}
-
-export interface CreateDagRequest {
-  name: string;
-  template?: 'kpi' | 'notebook' | 'blank';
-  deps?: string[];
-  description?: string;
-  notebook_name?: string;
-}
-
 export interface SaveModelRequest {
   layer: string;
   name: string;
@@ -455,22 +435,6 @@ export interface PipelineRun {
   logs: string;
 }
 
-export interface PipelineDefinition {
-  id: string;
-  name: string;
-  description?: string;
-  selector: string;
-  schedule?: string | null;
-  created_at?: string | null;
-}
-
-export interface CreatePipelineRequest {
-  name: string;
-  description?: string;
-  selector: string;
-  schedule?: string;
-}
-
 export interface TriggerPipelineRequest {
   postgres_params?: Record<string, unknown>;
   table_names?: string[];
@@ -493,67 +457,6 @@ export interface CreateVariableRequest {
   value: string;
   is_secret: boolean;
   description?: string;
-}
-
-// ==========================================
-// Orchestration Engines & Obelisk Cron Types
-// ==========================================
-
-// Mirrors OrchestrationEngineInfo in backend/app/engines/orchestration_hub.py.
-export interface OrchestrationEngineInfo {
-  id: 'cron' | 'dagster' | string;
-  name: string;
-  icon?: string;
-  status: 'running' | 'stopped' | 'offline' | string;
-  web_url?: string | null;
-  description: string;
-  is_builtin?: boolean;
-  can_deploy_local?: boolean;
-  active_jobs_count?: number;
-}
-
-export interface OrchestrationEnginesResponse {
-  engines: OrchestrationEngineInfo[];
-  default_engine?: string;
-}
-
-export interface CronJob {
-  id: string;
-  name: string;
-  description: string;
-  target_type: 'dbt' | 'script' | 'notebook';
-  target: string;
-  cron_expression: string;
-  is_enabled: boolean;
-  last_run_at: string | null;
-  last_status: 'success' | 'failed' | 'running' | null;
-  last_duration_seconds: number | null;
-  last_logs: string | null;
-  next_run_at: string | null;
-  created_at: string | null;
-  updated_at: string | null;
-}
-
-export interface CreateCronJobRequest {
-  name: string;
-  description?: string;
-  target_type: 'dbt' | 'script' | 'notebook';
-  target: string;
-  cron_expression: string;
-}
-
-export interface CronTargetsResponse {
-  scripts: Array<{ filename: string; name: string; size_bytes: number }>;
-  notebooks: Array<{ filename: string; name: string; size_bytes: number }>;
-  dbt_selectors: Array<{ label: string; value: string; description: string }>;
-}
-
-export interface RunCronJobResponse {
-  job_id: string;
-  status: 'success' | 'failed';
-  duration_seconds: number;
-  logs: string;
-  next_run_at: string | null;
 }
 
 export interface FileNode {
@@ -697,36 +600,177 @@ export interface SaveQueryTabPayload {
   tab_order?: number;
 }
 
+
 // ==========================================
-// Dagster Native Panel (fabric over Dagster)
+// Pipeline Orchestrator
 // ==========================================
 
-export interface DagsterJob {
+export type StepType = 'dbt_run' | 'dbt_test' | 'script' | 'notebook' | 'webhook' | 'raw_sql';
+export type EdgeCondition = 'success' | 'failure' | 'completion' | 'skipped';
+export type OverlapPolicy = 'skip' | 'queue' | 'kill';
+export type ExecutionStatus =
+  | 'pending'
+  | 'waiting'
+  | 'running'
+  | 'success'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+  | 'skipped';
+export type StepRunStatus =
+  | 'pending'
+  | 'waiting_deps'
+  | 'running'
+  | 'success'
+  | 'failed'
+  | 'skipped'
+  | 'cancelled'
+  | 'interrupted';
+
+export interface PipelineParamDef {
   name: string;
-  description?: string;
+  type: 'string' | 'int' | 'float' | 'bool';
+  default_value?: string | null;
+  required: boolean;
 }
 
-export interface DagsterSchedule {
+export interface PipelineStepDef {
+  id: string;
+  key: string;
+  name: string;
+  step_type: StepType;
+  target: string;
+  args: Record<string, unknown>;
+  timeout_seconds: number | null;
+  max_retries: number | null;
+  retry_delay_seconds: number | null;
+  position_x: number;
+  position_y: number;
+}
+
+export interface PipelineEdgeDef {
+  id: string;
+  from_step: string;
+  to_step: string;
+  from_key: string;
+  to_key: string;
+  condition: EdgeCondition;
+}
+
+export interface PipelineSummary {
   id: string;
   name: string;
-  cron: string;
-  timezone?: string;
-  state: string; // "RUNNING" | "STOPPED" | "PAUSED"
-  description?: string;
+  description: string;
+  cron_expression: string;
+  timezone: string;
+  is_enabled: boolean;
+  overlap_policy: OverlapPolicy;
+  max_parallel: number;
+  keep_runs: number;
+  timeout_seconds: number;
+  max_retries: number;
+  retry_delay_seconds: number;
+  auto_rerun_interrupted: boolean;
+  next_run_at: string | null;
+  last_status: string;
+  last_run_at: string | null;
+  step_count: number;
+  is_running: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
-export interface DagsterRun {
+export interface PipelineExecution {
   id: string;
-  job: string;
-  status: string; // "SUCCESS" | "FAILURE" | "CANCELED" | "STARTED" | "QUEUED" | etc
-  started_at?: string | null;
-  ended_at?: string | null;
-  duration_seconds?: number | null;
-  dagster_url: string;
+  pipeline_id: string;
+  pipeline_name?: string | null;
+  kind: 'scheduled' | 'manual' | 'rerun';
+  triggered_by?: string | null;
+  status: ExecutionStatus;
+  params: Record<string, unknown>;
+  scheduled_for: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_seconds: number | null;
+  error: string | null;
+  step_counts: Record<string, number>;
 }
 
-export interface DagsterLaunchResponse {
+export interface StepRunItem {
+  id: string;
   run_id: string;
+  step_id: string;
+  step_name: string;
+  attempt: number;
+  status: StepRunStatus;
+  claimed_at: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  duration_seconds: number | null;
+  next_retry_at: string | null;
+  error: string | null;
+  logs_size: number;
+  logs?: string;
 }
 
+export interface PipelineExecutionDetail extends PipelineExecution {
+  step_runs: StepRunItem[];
+}
+
+export interface PipelineDetail extends PipelineSummary {
+  steps: PipelineStepDef[];
+  edges: PipelineEdgeDef[];
+  params: PipelineParamDef[];
+  last_run: PipelineExecution | null;
+}
+
+export interface PipelineTargets {
+  scripts: string[];
+  notebooks: string[];
+  dbt_models: string[];
+  dbt_directories: string[];
+  step_types: StepType[];
+  edge_conditions: EdgeCondition[];
+}
+
+export interface StepPayload {
+  key: string;
+  name: string;
+  step_type: StepType;
+  target: string;
+  args?: Record<string, unknown> | null;
+  timeout_seconds?: number | null;
+  max_retries?: number | null;
+  retry_delay_seconds?: number | null;
+  position_x: number;
+  position_y: number;
+}
+
+export interface EdgePayload {
+  from_key: string;
+  to_key: string;
+  condition: EdgeCondition;
+}
+
+export interface GraphPayload {
+  steps: StepPayload[];
+  edges: EdgePayload[];
+  params: PipelineParamDef[];
+}
+
+export interface CreatePipelinePayload {
+  name: string;
+  description?: string;
+  cron_expression: string;
+  timezone: string;
+  is_enabled: boolean;
+  overlap_policy: OverlapPolicy;
+  max_parallel: number;
+  keep_runs: number;
+  timeout_seconds: number;
+  max_retries: number;
+  retry_delay_seconds: number;
+  auto_rerun_interrupted: boolean;
+  graph?: GraphPayload;
+}
 

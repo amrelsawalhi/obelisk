@@ -5,10 +5,7 @@ import {
   RefreshCw,
   AlertCircle,
   Folder,
-  Clock,
   Filter,
-  Sparkles,
-  Layers,
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import type { CatalogTable } from '../../lib/types';
@@ -70,10 +67,6 @@ export const IngestModal: React.FC<IngestModalProps> = ({
   const [sampleLimit, setSampleLimit] = useState<number>(1000);
 
   // Scheduling option
-  const [isScheduled, setIsScheduled] = useState(false);
-  const [scheduleEngine, setScheduleEngine] = useState<'cron' | 'dagster'>('cron');
-  const [scheduleCadence, setScheduleCadence] = useState<'hourly' | 'daily' | '15min' | 'custom'>('daily');
-  const [customCron, setCustomCron] = useState('0 0 * * *');
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -81,19 +74,6 @@ export const IngestModal: React.FC<IngestModalProps> = ({
   const { startJob } = useIngestTracker();
 
   if (!isOpen) return null;
-
-  const getEffectiveCron = (): string => {
-    switch (scheduleCadence) {
-      case '15min':
-        return '*/15 * * * *';
-      case 'hourly':
-        return '0 * * * *';
-      case 'daily':
-        return '0 0 * * *';
-      case 'custom':
-        return customCron.trim() || '0 0 * * *';
-    }
-  };
 
   const handleTrigger = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -112,8 +92,6 @@ export const IngestModal: React.FC<IngestModalProps> = ({
         target_name: targetFileName,
         target_folder: targetFolder.trim(),
         limit: isSample ? Number(sampleLimit) : undefined,
-        schedule: isScheduled ? getEffectiveCron() : undefined,
-        schedule_engine: isScheduled ? scheduleEngine : undefined,
       });
 
       // Hand off directly to global activity tray in the bottom right corner
@@ -356,110 +334,6 @@ export const IngestModal: React.FC<IngestModalProps> = ({
                   className="w-24 text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1 font-mono text-slate-800 outline-hidden focus:border-indigo-500"
                 />
                 <span className="text-xs text-slate-600">rows</span>
-              </div>
-            )}
-          </div>
-
-          {/* Recurring Schedule */}
-          <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-            <div className="flex items-center justify-between">
-              <label
-                htmlFor="schedule-toggle"
-                className="text-xs font-semibold text-slate-700 flex items-center gap-1.5 cursor-pointer"
-              >
-                <Clock className="w-3.5 h-3.5 text-indigo-600" />
-                <span>Schedule Recurring Ingestion</span>
-              </label>
-              <input
-                id="schedule-toggle"
-                type="checkbox"
-                checked={isScheduled}
-                onChange={(e) => setIsScheduled(e.target.checked)}
-                className="w-4 h-4 text-indigo-600 rounded-sm border-slate-300 focus:ring-indigo-500 cursor-pointer"
-              />
-            </div>
-
-            {isScheduled && (
-              <div className="space-y-3 pt-1 border-t border-slate-200">
-                <div>
-                  <label className="block text-[11px] text-slate-600 mb-1">
-                    Orchestration Engine
-                  </label>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setScheduleEngine('cron')}
-                      className={`p-2 rounded-lg border text-left text-xs transition-colors ${
-                        scheduleEngine === 'cron'
-                          ? 'border-indigo-600 bg-white text-indigo-900 font-semibold'
-                          : 'border-slate-200 bg-white/60 text-slate-600 hover:bg-white'
-                      }`}
-                    >
-                      <div className="flex items-center gap-1">
-                        <Sparkles className="w-3 h-3 text-indigo-500" />
-                        <span>Built-in Cron</span>
-                      </div>
-                      <div className="text-[10px] text-slate-400 mt-0.5">Lightweight in-process</div>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setScheduleEngine('dagster')}
-                      className={`p-2 rounded-lg border text-left text-xs transition-colors ${
-                        scheduleEngine === 'dagster'
-                          ? 'border-indigo-600 bg-white text-indigo-900 font-semibold'
-                          : 'border-slate-200 bg-white/60 text-slate-600 hover:bg-white'
-                      }`}
-                    >
-                      <div className="flex items-center gap-1">
-                        <Layers className="w-3 h-3 text-indigo-500" />
-                        <span>Dagster Engine</span>
-                      </div>
-                      <div className="text-[10px] text-slate-400 mt-0.5">Air-gapped daemon</div>
-                    </button>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-[11px] text-slate-600 mb-1">
-                    Ingestion Frequency
-                  </label>
-                  <div className="grid grid-cols-4 gap-1.5">
-                    {[
-                      { id: '15min', label: '15 Min' },
-                      { id: 'hourly', label: 'Hourly' },
-                      { id: 'daily', label: 'Daily' },
-                      { id: 'custom', label: 'Custom' },
-                    ].map((c) => (
-                      <button
-                        key={c.id}
-                        type="button"
-                        onClick={() => setScheduleCadence(c.id as typeof scheduleCadence)}
-                        className={`py-1 text-center text-xs rounded-md border transition-colors ${
-                          scheduleCadence === c.id
-                            ? 'bg-indigo-600 border-indigo-600 text-white font-semibold'
-                            : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-100'
-                        }`}
-                      >
-                        {c.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {scheduleCadence === 'custom' && (
-                  <div>
-                    <label className="block text-[11px] text-slate-600 mb-1 font-mono">
-                      Cron Expression
-                    </label>
-                    <input
-                      type="text"
-                      value={customCron}
-                      onChange={(e) => setCustomCron(e.target.value)}
-                      placeholder="0 0 * * *"
-                      className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-1.5 font-mono text-slate-800 outline-hidden focus:border-indigo-500"
-                    />
-                  </div>
-                )}
               </div>
             )}
           </div>

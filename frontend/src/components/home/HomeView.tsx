@@ -9,7 +9,6 @@ import {
   Clock,
   BookOpen,
   Terminal,
-  X,
   Plus,
   Activity,
 } from 'lucide-react';
@@ -23,8 +22,7 @@ import type {
   Notebook,
   NotebookServerStatus,
   AssetGraphNode,
-  CronJob,
-  OrchestrationEngineInfo,
+  PipelineSummary,
   ServiceCatalogEntry,
 } from '../../lib/types';
 import type { NavigationTab } from '../layout/Sidebar';
@@ -44,9 +42,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const [notebooks, setNotebooks] = useState<Notebook[]>([]);
   const [notebookStatus, setNotebookStatus] = useState<NotebookServerStatus | null>(null);
   const [assetNodes, setAssetNodes] = useState<AssetGraphNode[]>([]);
-  const [cronJobs, setCronJobs] = useState<CronJob[]>([]);
-  const [orchestratorEngines, setOrchestratorEngines] = useState<OrchestrationEngineInfo[]>([]);
-  const [activeLogModalJob, setActiveLogModalJob] = useState<CronJob | null>(null);
+  const [pipelines, setPipelines] = useState<PipelineSummary[]>([]);
 
   const loadData = async () => {
     try {
@@ -58,8 +54,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         nbData,
         nbStatus,
         assetGraphData,
-        cronData,
-        enginesData,
+        pipelineData,
       ] = await Promise.all([
         api.listServices().catch(() => []),
         api.getServiceCatalog().catch(() => []),
@@ -68,8 +63,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         api.listNotebooks().catch(() => ({ notebooks: [], total: 0 })),
         api.getNotebookServerStatus().catch(() => null),
         api.getAssetGraph().catch(() => ({ nodes: [], edges: [] })),
-        api.getCronJobs().catch(() => []),
-        api.getOrchestrationEngines().catch(() => ({ engines: [] })),
+        api.listPipelines().catch(() => []),
       ]);
       setServices(svcData);
       setServiceCatalog(svcCatalogData);
@@ -78,8 +72,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
       setNotebooks(nbData.notebooks || []);
       setNotebookStatus(nbStatus);
       setAssetNodes(assetGraphData.nodes || []);
-      setCronJobs(cronData);
-      setOrchestratorEngines(enginesData.engines || []);
+      setPipelines(pipelineData);
     } catch (err) {
       console.error('Failed to load home view metrics:', err);
     }
@@ -94,9 +87,8 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const sourceTypes = Array.from(new Set(connections.map((c) => c.source_type.toUpperCase())));
   const sourceTypesSummary = sourceTypes.length > 0 ? sourceTypes.join(', ') : 'Vault Connected';
 
-  const activeCronCount = cronJobs.filter((j) => j.is_enabled).length;
-  const totalCronCount = cronJobs.length;
-  const dagsterEngine = orchestratorEngines.find((e) => e.id === 'dagster');
+  const activePipelineCount = pipelines.filter((p) => p.is_enabled).length;
+  const totalPipelineCount = pipelines.length;
 
   const stagingModels = assetNodes.filter((n) => n.folder === 'staging');
   const martModels = assetNodes.filter((n) => n.folder === 'marts');
@@ -105,12 +97,12 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const notebooksCount = notebooks.length;
   const isMarimoRunning = notebookStatus?.is_running ?? false;
 
-  // Real latest executed cron job run (if any exist)
-  const jobsWithRuns = cronJobs.filter((j) => j.last_run_at);
-  jobsWithRuns.sort(
-    (a, b) => new Date(b.last_run_at!).getTime() - new Date(a.last_run_at!).getTime()
-  );
-  const latestCronRun = jobsWithRuns.length > 0 ? jobsWithRuns[0] : null;
+  // Latest executed pipeline run (if any pipeline has run yet)
+  const latestPipelineRun =
+    [...pipelines]
+      .filter((p) => p.last_run_at)
+      .sort((a, b) => new Date(b.last_run_at!).getTime() - new Date(a.last_run_at!).getTime())[0] ??
+    null;
 
   const runningServicesCount = services.filter((s) => s.status === 'running' || s.status === 'connected').length;
 
@@ -222,7 +214,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                 onClick={() => onNavigate('pipelines')}
                 className="text-xs text-sky-600 hover:text-sky-700 font-medium flex items-center gap-1"
               >
-                <span>Pipelines & Dagster</span>
+                <span>Pipelines</span>
                 <ArrowUpRight className="w-3.5 h-3.5" />
               </button>
             </div>
@@ -258,7 +250,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
               </div>
             </div>
 
-            {/* 2. Scheduled Cron Jobs */}
+            {/* 2. Pipelines */}
             <div
               onClick={() => onNavigate('pipelines')}
               className="p-3.5 rounded-xl border border-indigo-200/80 bg-indigo-50/40 hover:bg-indigo-50/80 transition-all cursor-pointer group flex flex-col justify-between"
@@ -266,16 +258,16 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
               <div>
                 <div className="flex items-center justify-between">
                   <span className="text-[10px] font-mono uppercase font-bold text-indigo-800">
-                    Cron Automations
+                    Pipelines
                   </span>
                   <Clock className="w-3.5 h-3.5 text-indigo-600 group-hover:scale-110 transition-transform" />
                 </div>
                 <div className="text-2xl font-bold font-mono text-slate-900 mt-1">
-                  {totalCronCount}
+                  {totalPipelineCount}
                 </div>
               </div>
               <div className="mt-2 pt-2 border-t border-indigo-100 text-[11px] text-slate-500 font-mono truncate">
-                {totalCronCount === 0 ? 'No jobs scheduled' : `${activeCronCount} active schedules`}
+                {totalPipelineCount === 0 ? 'No pipelines yet' : `${activePipelineCount} enabled`}
               </div>
             </div>
 
@@ -328,59 +320,57 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
 
           {/* Bottom Execution Status & Orchestrator Engines Ribbon */}
           <div className="p-3 rounded-xl border border-slate-200 bg-slate-50 flex flex-wrap items-center justify-between gap-3 text-xs">
-            {/* Orchestration Status Indicator */}
+            {/* Latest pipeline run */}
             <div className="flex items-center gap-2">
-              <span className="font-semibold text-slate-700">Orchestration:</span>
-              {latestCronRun ? (
+              <span className="font-semibold text-slate-700">Pipelines:</span>
+              {latestPipelineRun ? (
                 <div className="flex items-center gap-1.5">
-                  <span className="font-medium text-slate-800">{latestCronRun.name}</span>
+                  <span className="font-medium text-slate-800">{latestPipelineRun.name}</span>
                   <span
                     className={`px-2 py-0.5 rounded-md font-mono text-[10px] font-semibold uppercase ${
-                      latestCronRun.last_status === 'success'
+                      latestPipelineRun.last_status === 'success'
                         ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                        : latestCronRun.last_status === 'failed'
-                        ? 'bg-rose-100 text-rose-800 border border-rose-200'
-                        : 'bg-amber-100 text-amber-800 border border-amber-200'
+                        : latestPipelineRun.last_status === 'failed'
+                          ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                          : 'bg-amber-100 text-amber-800 border border-amber-200'
                     }`}
                   >
-                    {latestCronRun.last_status || 'Ready'}
+                    {latestPipelineRun.last_status || 'Ready'}
                   </span>
-                  {latestCronRun.last_run_at && (
+                  {latestPipelineRun.last_run_at && (
                     <span className="text-slate-400 text-[11px] font-mono">
-                      ({new Date(latestCronRun.last_run_at).toLocaleTimeString()})
+                      ({new Date(latestPipelineRun.last_run_at).toLocaleTimeString()})
                     </span>
                   )}
-                  {latestCronRun.last_logs && (
-                    <button
-                      onClick={() => setActiveLogModalJob(latestCronRun)}
-                      className="ml-1 inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-indigo-600 underline"
-                    >
-                      <Terminal className="w-3 h-3" />
-                      <span>View Log</span>
-                    </button>
-                  )}
+                  <button
+                    onClick={() => onNavigate('pipelines')}
+                    className="ml-1 inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-indigo-600 underline"
+                  >
+                    <Terminal className="w-3 h-3" />
+                    <span>Open run</span>
+                  </button>
                 </div>
               ) : (
                 <span className="text-slate-400 font-mono text-[11px]">
-                  Standby • In-process Cron & Dagster ready (0 jobs scheduled)
+                  Standby • no pipeline has run yet ({totalPipelineCount} defined)
                 </span>
               )}
             </div>
 
-            {/* Engines Status Indicator */}
+            {/* Engine status */}
             <div className="flex items-center gap-2 text-[11px] font-mono text-slate-500">
               <span className="flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                <span className="text-slate-700 font-medium">Obelisk Cron: Active</span>
+                <span className="text-slate-700 font-medium">Pipeline engine: Active</span>
               </span>
               <span className="text-slate-300">•</span>
               <span className="flex items-center gap-1">
                 <span
                   className={`w-1.5 h-1.5 rounded-full ${
-                    dagsterEngine?.status === 'running' ? 'bg-emerald-500' : 'bg-slate-300'
+                    activePipelineCount > 0 ? 'bg-emerald-500' : 'bg-slate-300'
                   }`}
                 />
-                <span>Dagster: {dagsterEngine?.status === 'running' ? 'Live (:3000)' : 'Offline'}</span>
+                <span>{activePipelineCount} enabled schedule(s)</span>
               </span>
             </div>
           </div>
@@ -483,56 +473,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         </div>
       </div>
 
-      {/* Cron Job Execution Details Log Modal */}
-      {activeLogModalJob && (
-        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-xl w-full max-w-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150 flex flex-col max-h-[80vh]">
-            <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-              <div className="flex items-center gap-2.5">
-                <Terminal className="w-4 h-4 text-indigo-600" />
-                <div>
-                  <h3 className="text-sm font-bold text-slate-900">
-                    {activeLogModalJob.name}
-                  </h3>
-                  <p className="text-[11px] text-slate-500 font-mono">
-                    Target: {activeLogModalJob.target} ({activeLogModalJob.target_type}) • Cron: {activeLogModalJob.cron_expression}
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => setActiveLogModalJob(null)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="p-4 bg-slate-950 text-slate-200 font-mono text-xs overflow-y-auto flex-1 select-text">
-              <pre className="whitespace-pre-wrap leading-relaxed">
-                {activeLogModalJob.last_logs || 'No logs available for this job run.'}
-              </pre>
-            </div>
-
-            <div className="px-5 py-3 border-t border-slate-100 bg-slate-50 flex items-center justify-between text-xs">
-              <span
-                className={`px-2 py-0.5 rounded font-mono font-semibold uppercase text-[10px] ${
-                  activeLogModalJob.last_status === 'success'
-                    ? 'bg-emerald-100 text-emerald-800'
-                    : 'bg-rose-100 text-rose-800'
-                }`}
-              >
-                Status: {activeLogModalJob.last_status || 'Unknown'}
-              </span>
-              <button
-                onClick={() => setActiveLogModalJob(null)}
-                className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-semibold transition-colors"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

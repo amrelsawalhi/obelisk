@@ -89,8 +89,7 @@ class ResourceAdvisor:
         # Baseline proportions based on Obelisk Master Plan
         defaults = {
             "postgres": {"min_mb": 512, "target_ratio": 0.20, "max_mb": 12288},
-            "dagster": {"min_mb": 512, "target_ratio": 0.10, "max_mb": 4096},
-            "superset": {"min_mb": 512, "target_ratio": 0.10, "max_mb": 4096},
+                    "superset": {"min_mb": 512, "target_ratio": 0.10, "max_mb": 4096},
             "clickhouse": {"min_mb": 512, "target_ratio": 0.15, "max_mb": 6144},
             "redpanda": {"min_mb": 256, "target_ratio": 0.05, "max_mb": 2048},
             "gitea": {"min_mb": 128, "target_ratio": 0.02, "max_mb": 512},

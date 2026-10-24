@@ -1,994 +1,1131 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Play,
-  RefreshCw,
-  CheckCircle2,
   AlertCircle,
-  Terminal,
-  Database,
-  Plus,
-  Trash2,
+  Ban,
+  CheckCircle2,
+  CircleSlash,
   Clock,
-  ExternalLink,
-  Search,
-  X,
   Loader2,
-  Power,
-  BookOpen,
-  Code2,
-  Maximize2,
-  Minimize2,
+  Play,
+  Plus,
+  RefreshCw,
+  Save,
+  Settings2,
+  Square,
+  Trash2,
+  X,
 } from 'lucide-react';
 import { api } from '../../lib/api';
+import { usePolling } from '../../lib/viewActivity';
 import type {
-  OrchestrationEngineInfo,
-  CronJob,
-  CreateCronJobRequest,
-  CronTargetsResponse,
+  EdgeCondition,
+  EdgePayload,
+  ExecutionStatus,
+  PipelineDetail,
+  PipelineExecution,
+  PipelineExecutionDetail,
+  PipelineStepDef,
+  PipelineSummary,
+  PipelineTargets,
+  StepRunItem,
+  StepType,
 } from '../../lib/types';
-import { DagsterNativePanel } from './DagsterNativePanel';
+import { PipelineCanvas, EDGE_COLOURS, type StepRuntime } from './PipelineCanvas';
+import { PipelineInspector } from './PipelineInspector';
 
 interface PipelinesViewProps {
   onOpenInQuery?: (sql: string) => void;
   onNavigateToSettings?: () => void;
 }
 
+const CRON_PRESETS: Array<{ label: string; expr: string }> = [
+  { label: 'Every 15 min', expr: '*/15 * * * *' },
+  { label: 'Hourly', expr: '0 * * * *' },
+  { label: 'Nightly 02:00', expr: '0 2 * * *' },
+  { label: 'Weekdays 06:00', expr: '0 6 * * 1-5' },
+];
+
+const STATUS_CHIP: Record<string, string> = {
+  success: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  failed: 'bg-rose-50 text-rose-700 border-rose-200',
+  running: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+  pending: 'bg-slate-50 text-slate-600 border-slate-200',
+  waiting: 'bg-slate-50 text-slate-600 border-slate-200',
+  skipped: 'bg-slate-50 text-slate-500 border-slate-200',
+  cancelled: 'bg-amber-50 text-amber-700 border-amber-200',
+  interrupted: 'bg-orange-50 text-orange-700 border-orange-200',
+  idle: 'bg-slate-50 text-slate-500 border-slate-200',
+};
+
+const STATUS_ICON: Record<string, React.ElementType> = {
+  success: CheckCircle2,
+  failed: AlertCircle,
+  running: Loader2,
+  cancelled: Ban,
+  interrupted: Square,
+  skipped: CircleSlash,
+  pending: Clock,
+  waiting: Clock,
+  idle: Clock,
+};
+
+const STEP_TEMPLATES: Array<{ type: StepType; name: string; target: string }> = [
+  { type: 'dbt_run', name: 'dbt run', target: '*' },
+  { type: 'dbt_test', name: 'dbt test', target: '*' },
+  { type: 'script', name: 'Script', target: '' },
+  { type: 'notebook', name: 'Notebook', target: '' },
+  { type: 'raw_sql', name: 'SQL', target: 'SELECT 1 AS ok' },
+  { type: 'webhook', name: 'Webhook', target: '' },
+];
+
+const fmtWhen = (value?: string | null) => {
+  if (!value) return '—';
+  const date = new Date(value.includes('+') || value.endsWith('Z') ? value : `${value}Z`);
+  if (Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+};
+
+const fmtDuration = (seconds?: number | null) => {
+  if (seconds == null) return '—';
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.round(seconds % 60)}s`;
+};
+
+const newKey = () =>
+  typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `step-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+interface DraftState {
+  steps: PipelineStepDef[];
+  edges: EdgePayload[];
+}
+
+const draftFrom = (detail: PipelineDetail): DraftState => ({
+  steps: detail.steps.map((step) => ({ ...step })),
+  edges: detail.edges.map((edge) => ({
+    from_key: edge.from_step,
+    to_key: edge.to_step,
+    condition: edge.condition,
+  })),
+});
+
+const TERMINAL: ExecutionStatus[] = ['success', 'failed', 'cancelled', 'interrupted', 'skipped'];
+
 export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettings }) => {
-  // Engines & Active View State
-  const [engines, setEngines] = useState<OrchestrationEngineInfo[]>([]);
-  const [selectedEngineId, setSelectedEngineId] = useState<string>('cron');
-  const [loadingEngines, setLoadingEngines] = useState<boolean>(true);
+  const [pipelines, setPipelines] = useState<PipelineSummary[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<PipelineDetail | null>(null);
+  const [draft, setDraft] = useState<DraftState>({ steps: [], edges: [] });
+  const [targets, setTargets] = useState<PipelineTargets | null>(null);
 
-  // Obelisk Cron State
-  const [cronJobs, setCronJobs] = useState<CronJob[]>([]);
-  const [cronTargets, setCronTargets] = useState<CronTargetsResponse | null>(null);
-  const [loadingJobs, setLoadingJobs] = useState<boolean>(false);
-  const [filterType, setFilterType] = useState<string>('all');
-  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
-  // Immediate Run & Logs State
-  const [runningJobId, setRunningJobId] = useState<string | null>(null);
-  const [activeLogJob, setActiveLogJob] = useState<CronJob | null>(null);
-  const [isLogDrawerOpen, setIsLogDrawerOpen] = useState<boolean>(false);
+  const [selectedStepKey, setSelectedStepKey] = useState<string | null>(null);
+  const [pendingEdge, setPendingEdge] = useState<{ from: string; to: string } | null>(null);
+  const [showNew, setShowNew] = useState(false);
 
-  // New Cron Job Modal State
-  const [isCreateModalOpen, setIsCreateModalOpen] = useState<boolean>(false);
-  const [newJobName, setNewJobName] = useState<string>('');
-  const [newJobDesc, setNewJobDesc] = useState<string>('');
-  const [newJobType, setNewJobType] = useState<'dbt' | 'script' | 'notebook'>('script');
-  const [newJobTarget, setNewJobTarget] = useState<string>('');
-  const [newJobCron, setNewJobCron] = useState<string>('0 4 * * *');
-  const [creatingJob, setCreatingJob] = useState<boolean>(false);
+  const [executions, setExecutions] = useState<PipelineExecution[]>([]);
+  const [monitor, setMonitor] = useState<PipelineExecutionDetail | null>(null);
+  const [stepLogs, setStepLogs] = useState('');
+  const [logsOffset, setLogsOffset] = useState(0);
+  const [loadingLogs, setLoadingLogs] = useState(false);
 
-  // Embedded Iframe Controls
-  const [iframeKey, setIframeKey] = useState<number>(Date.now());
-  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const dirty = useMemo(() => {
+    if (!detail) return false;
+    const saved = draftFrom(detail);
+    return JSON.stringify(saved) !== JSON.stringify(draft);
+  }, [detail, draft]);
 
-  // Global Error & Feedback
-  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const selectedStep = useMemo(
+    () => draft.steps.find((step) => step.key === selectedStepKey) ?? null,
+    [draft.steps, selectedStepKey],
+  );
 
-  // Fetch all engines and cron jobs
-  const fetchEnginesAndJobs = async () => {
-    try {
-      setLoadingEngines(true);
-      const res = await api.getOrchestrationEngines();
-      setEngines(res.engines);
+  const monitorByStep = useMemo(() => {
+    const map: Record<string, StepRunItem> = {};
+    for (const stepRun of monitor?.step_runs ?? []) map[stepRun.step_id] = stepRun;
+    return map;
+  }, [monitor]);
 
-      // Default to Dagster if running, otherwise use server recommendation or cron
-      const dagsterRunning = res.engines.find((e) => e.id === 'dagster' && e.status === 'running');
-      if (dagsterRunning) {
-        setSelectedEngineId((prev) => (prev === 'cron' ? 'dagster' : prev));
-      } else {
-        setSelectedEngineId((prev) => prev || res.default_engine || 'cron');
-      }
-
-      await loadCronData();
-    } catch (err: unknown) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : 'Failed to load orchestration engines',
-      });
-    } finally {
-      setLoadingEngines(false);
+  const runtimeByStep = useMemo(() => {
+    const map: Record<string, StepRuntime> = {};
+    for (const [stepId, stepRun] of Object.entries(monitorByStep)) {
+      map[stepId] = {
+        status: stepRun.status,
+        duration_seconds: stepRun.duration_seconds,
+        attempt: stepRun.attempt,
+        error: stepRun.error,
+      };
     }
-  };
+    return map;
+  }, [monitorByStep]);
 
-  const loadCronData = async () => {
+  const selectedStepRun = selectedStepKey ? monitorByStep[selectedStepKey] ?? null : null;
+  const monitorActive = monitor != null && !TERMINAL.includes(monitor.status);
+
+  const refreshList = useCallback(async () => {
     try {
-      setLoadingJobs(true);
-      const [jobs, targets] = await Promise.all([
-        api.getCronJobs(),
-        api.getCronTargets().catch(() => null),
-      ]);
-      setCronJobs(jobs);
-      if (targets) {
-        setCronTargets(targets);
-        // Default target if empty
-        if (!newJobTarget) {
-          if (newJobType === 'script' && targets.scripts.length > 0) {
-            setNewJobTarget(targets.scripts[0].filename);
-          } else if (newJobType === 'dbt' && targets.dbt_selectors.length > 0) {
-            setNewJobTarget(targets.dbt_selectors[0].value);
-          } else if (newJobType === 'notebook' && targets.notebooks.length > 0) {
-            setNewJobTarget(targets.notebooks[0].filename);
-          }
-        }
-      }
-    } catch (err: unknown) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : 'Failed to fetch cron data',
-      });
-    } finally {
-      setLoadingJobs(false);
+      const list = await api.listPipelines();
+      setPipelines(list);
+      setSelectedId((current) => current ?? list[0]?.id ?? null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not load pipelines.');
     }
-  };
-
-  useEffect(() => {
-    fetchEnginesAndJobs();
   }, []);
 
-  // Update default target when target type changes in modal
-  const handleTypeChange = (type: 'dbt' | 'script' | 'notebook') => {
-    setNewJobType(type);
-    if (!cronTargets) return;
-    if (type === 'script') {
-      setNewJobTarget(cronTargets.scripts[0]?.filename || 'daily_kpi_summary.py');
-    } else if (type === 'dbt') {
-      setNewJobTarget(cronTargets.dbt_selectors[0]?.value || '*');
-    } else if (type === 'notebook') {
-      setNewJobTarget(cronTargets.notebooks[0]?.filename || '');
-    }
-  };
-
-  // Immediate manual run
-  const handleRunNow = async (job: CronJob) => {
+  const openPipeline = useCallback(async (pipelineId: string) => {
+    setLoadingDetail(true);
+    setError(null);
     try {
-      setRunningJobId(job.id);
-      setFeedback(null);
-      const res = await api.runCronJobNow(job.id);
-      setFeedback({
-        type: res.status === 'success' ? 'success' : 'error',
-        message: `Job '${job.name}' finished with status: ${res.status.toUpperCase()} (${res.duration_seconds}s)`,
-      });
-      await loadCronData();
-      // Auto open log drawer for convenience
-      const updated = {
-        ...job,
-        last_status: res.status,
-        last_duration_seconds: res.duration_seconds,
-        last_logs: res.logs,
-      };
-      setActiveLogJob(updated);
-      setIsLogDrawerOpen(true);
-    } catch (err: unknown) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : `Failed to execute job '${job.name}'`,
-      });
+      const data = await api.getPipeline(pipelineId);
+      setDetail(data);
+      setDraft(draftFrom(data));
+      setSelectedStepKey(null);
+      setMonitor(null);
+      setStepLogs('');
+      setLogsOffset(0);
+      const runs = await api.listPipelineExecutions({ pipeline_id: pipelineId, limit: 40 });
+      setExecutions(runs);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not load this pipeline.');
     } finally {
-      setRunningJobId(null);
+      setLoadingDetail(false);
     }
-  };
+  }, []);
 
-  // Toggle enable/disable
-  const handleToggleJob = async (id: string) => {
+  useEffect(() => {
+    refreshList();
+    api.getPipelineTargets().then(setTargets).catch(() => setTargets(null));
+  }, [refreshList]);
+
+  useEffect(() => {
+    if (selectedId) openPipeline(selectedId);
+  }, [selectedId, openPipeline]);
+
+  const refreshExecutions = useCallback(async () => {
+    if (!selectedId) return;
     try {
-      await api.toggleCronJob(id);
-      await loadCronData();
-    } catch (err: unknown) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : 'Failed to toggle job status',
-      });
+      setExecutions(await api.listPipelineExecutions({ pipeline_id: selectedId, limit: 40 }));
+    } catch {
+      /* list refresh is best-effort */
     }
-  };
+  }, [selectedId]);
 
-  // Delete job
-  const handleDeleteJob = async (job: CronJob) => {
-    if (!confirm(`Are you sure you want to delete scheduled job '${job.name}'?`)) return;
+  const refreshMonitor = useCallback(async () => {
+    if (!monitor?.id) return;
     try {
-      await api.deleteCronJob(job.id);
-      setFeedback({ type: 'success', message: `Job '${job.name}' deleted successfully.` });
-      await loadCronData();
-      if (activeLogJob?.id === job.id) {
-        setIsLogDrawerOpen(false);
-        setActiveLogJob(null);
-      }
-    } catch (err: unknown) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : 'Failed to delete job',
-      });
+      const fresh = await api.getPipelineExecution(monitor.id);
+      setMonitor(fresh);
+      if (TERMINAL.includes(fresh.status)) refreshExecutions();
+    } catch {
+      /* keep the last known picture */
     }
-  };
+  }, [monitor?.id, refreshExecutions]);
 
-  // Create new cron job
-  const handleCreateJob = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newJobName.trim() || !newJobTarget.trim() || !newJobCron.trim()) {
-      setFeedback({ type: 'error', message: 'Please fill in all required job fields' });
+  const refreshLogs = useCallback(async () => {
+    if (!selectedStepRun) {
+      setStepLogs('');
       return;
     }
-
     try {
-      setCreatingJob(true);
-      const payload: CreateCronJobRequest = {
-        name: newJobName.trim(),
-        description: newJobDesc.trim(),
-        target_type: newJobType,
-        target: newJobTarget.trim(),
-        cron_expression: newJobCron.trim(),
-      };
-      await api.createCronJob(payload);
-      setFeedback({ type: 'success', message: `Job '${newJobName.trim()}' scheduled successfully.` });
-      setIsCreateModalOpen(false);
-      setNewJobName('');
-      setNewJobDesc('');
-      await loadCronData();
-    } catch (err: unknown) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : 'Failed to schedule job',
-      });
+      setLoadingLogs(true);
+      const tail = await api.getStepRunLogs(selectedStepRun.id, logsOffset);
+      if (tail.logs) setStepLogs((current) => current + tail.logs);
+      setLogsOffset(tail.size);
+    } catch {
+      /* log tail is best-effort */
     } finally {
-      setCreatingJob(false);
+      setLoadingLogs(false);
     }
-  };
+  }, [selectedStepRun, logsOffset]);
 
-  // 1-Click Deploy Service from Pipeline Tab
-  const handleDeployLocal = async (serviceId: string) => {
+  // Three cadences: the list when idle, the run while it is live, the log tail while
+  // its step is. All pause when the tab is not visible (usePolling).
+  usePolling(refreshList, 15000);
+  usePolling(refreshExecutions, monitorActive ? 2500 : 10000);
+  usePolling(() => (monitorActive ? refreshMonitor() : undefined), 1500);
+  usePolling(
+    () => (selectedStepRun && !TERMINAL.includes(selectedStepRun.status as ExecutionStatus)
+      ? refreshLogs()
+      : undefined),
+    1500,
+  );
+
+  useEffect(() => {
+    setStepLogs('');
+    setLogsOffset(0);
+  }, [selectedStepKey, monitor?.id]);
+
+
+  // ------------------------------------------------------------------ actions
+
+  const saveGraph = async () => {
+    if (!detail) return;
+    setSaving(true);
+    setError(null);
     try {
-      setFeedback({ type: 'success', message: `Deploying ${serviceId} locally on localhost...` });
-      await api.deployLocalService({
-        service_name: serviceId,
+      await api.replacePipelineGraph(detail.id, {
+        steps: draft.steps.map((step) => ({
+          key: step.key,
+          name: step.name.trim(),
+          step_type: step.step_type,
+          target: step.target,
+          args: step.args ?? {},
+          timeout_seconds: step.timeout_seconds,
+          max_retries: step.max_retries,
+          retry_delay_seconds: step.retry_delay_seconds,
+          position_x: step.position_x,
+          position_y: step.position_y,
+        })),
+        edges: draft.edges,
+        params: detail.params,
       });
-      setFeedback({
-        type: 'success',
-        message: `${serviceId} deployment initiated successfully! Refreshing status...`,
-      });
-      await fetchEnginesAndJobs();
-    } catch (err: unknown) {
-      setFeedback({
-        type: 'error',
-        message: err instanceof Error ? err.message : `Failed to deploy ${serviceId}`,
-      });
+      const fresh = await api.getPipeline(detail.id);
+      setDetail(fresh);
+      setDraft(draftFrom(fresh));
+      setNotice('Pipeline saved.');
+      await refreshList();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? (err as { response?: { data?: { detail?: string } } }).response?.data?.detail ??
+              err.message
+          : 'Could not save the pipeline.',
+      );
+    } finally {
+      setSaving(false);
     }
   };
 
-  // Filtered Cron Jobs
-  const filteredJobs = cronJobs.filter((job) => {
-    if (filterType !== 'all' && job.target_type !== filterType) return false;
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      return (
-        job.name.toLowerCase().includes(q) ||
-        job.target.toLowerCase().includes(q) ||
-        job.description?.toLowerCase().includes(q) ||
-        job.cron_expression.toLowerCase().includes(q)
-      );
+  const runNow = async () => {
+    if (!detail) return;
+    setStarting(true);
+    setError(null);
+    try {
+      const { run_id } = await api.runPipelineNow(detail.id);
+      const fresh = await api.getPipelineExecution(run_id);
+      setMonitor(fresh);
+      setSelectedStepKey(null);
+      await refreshExecutions();
+      await refreshList();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not start the run.');
+    } finally {
+      setStarting(false);
     }
-    return true;
-  });
+  };
 
-  const selectedEngine = engines.find((e) => e.id === selectedEngineId) || engines[0];
+  const cancelRun = async (runId: string) => {
+    try {
+      await api.cancelPipelineExecution(runId);
+      await refreshMonitor();
+      await refreshExecutions();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not cancel this run.');
+    }
+  };
 
-  // Helper for human-readable cron presets
-  const cronPresets = [
-    { label: 'Every 15 min', expr: '*/15 * * * *' },
-    { label: 'Hourly', expr: '0 * * * *' },
-    { label: 'Daily at Midnight', expr: '0 0 * * *' },
-    { label: 'Daily at 04:00 UTC', expr: '0 4 * * *' },
-    { label: 'Weekly (Sunday)', expr: '0 0 * * 0' },
-  ];
+  const rerunFromSelected = async () => {
+    if (!monitor || !selectedStepKey) return;
+    try {
+      const { run_id } = await api.rerunFromStep(monitor.id, selectedStepKey);
+      const fresh = await api.getPipelineExecution(run_id);
+      setMonitor(fresh);
+      await refreshExecutions();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not re-run from this step.');
+    }
+  };
+
+  const togglePipeline = async (pipeline: PipelineSummary) => {
+    try {
+      await api.togglePipeline(pipeline.id);
+      await refreshList();
+      if (selectedId === pipeline.id) await openPipeline(pipeline.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not change the schedule.');
+    }
+  };
+
+  const deletePipeline = async (pipeline: PipelineSummary) => {
+    if (!window.confirm(`Delete pipeline '${pipeline.name}' and its run history?`)) return;
+    try {
+      await api.deletePipeline(pipeline.id);
+      setDetail(null);
+      setMonitor(null);
+      setSelectedId(null);
+      await refreshList();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not delete the pipeline.');
+    }
+  };
+
+  const addStep = (type: StepType) => {
+    const template = STEP_TEMPLATES.find((entry) => entry.type === type) ?? STEP_TEMPLATES[0];
+    const index = draft.steps.length;
+    const key = newKey();
+    const other = draft.steps.some((step) => step.step_type === type);
+    const step: PipelineStepDef = {
+      id: key,
+      key,
+      name: `${template.name}${other ? ` ${index + 1}` : ''}`,
+      step_type: type,
+      target: template.target,
+      args: {},
+      timeout_seconds: null,
+      max_retries: null,
+      retry_delay_seconds: null,
+      position_x: 80 + (index % 4) * 260,
+      position_y: 80 + Math.floor(index / 4) * 170,
+    };
+    setDraft((current) => ({ ...current, steps: [...current.steps, step] }));
+    setSelectedStepKey(key);
+  };
+
+  const updateStep = (patch: Partial<PipelineStepDef>) => {
+    if (!selectedStepKey) return;
+    setDraft((current) => ({
+      ...current,
+      steps: current.steps.map((step) =>
+        step.key === selectedStepKey ? { ...step, ...patch } : step,
+      ),
+    }));
+  };
+
+  const moveStep = (stepKey: string, position: { x: number; y: number }) => {
+    setDraft((current) => ({
+      ...current,
+      steps: current.steps.map((step) =>
+        step.key === stepKey ? { ...step, position_x: position.x, position_y: position.y } : step,
+      ),
+    }));
+  };
+
+  const removeStep = (stepKey: string) => {
+    setDraft((current) => ({
+      steps: current.steps.filter((step) => step.key !== stepKey),
+      edges: current.edges.filter((edge) => edge.from_key !== stepKey && edge.to_key !== stepKey),
+    }));
+    if (selectedStepKey === stepKey) setSelectedStepKey(null);
+  };
+
+  const confirmEdge = (condition: EdgeCondition) => {
+    if (!pendingEdge) return;
+    const { from, to } = pendingEdge;
+    setDraft((current) => ({
+      ...current,
+      edges: [
+        ...current.edges.filter((edge) => !(edge.from_key === from && edge.to_key === to)),
+        { from_key: from, to_key: to, condition },
+      ],
+    }));
+    setPendingEdge(null);
+  };
+
+  const removeEdge = (fromKey: string, toKey: string) => {
+    setDraft((current) => ({
+      ...current,
+      edges: current.edges.filter(
+        (edge) => !(edge.from_key === fromKey && edge.to_key === toKey),
+      ),
+    }));
+    setPendingEdge(null);
+  };
+
+  const stepName = (key: string) =>
+    draft.steps.find((step) => step.key === key)?.name ?? 'deleted step';
+
+
+  // --------------------------------------------------------------------- view
 
   return (
-    <div
-      className={`flex-1 w-full h-full flex flex-col min-w-0 bg-slate-50 overflow-hidden ${
-        isFullscreen ? 'fixed inset-0 z-50 bg-white' : ''
-      }`}
-    >
-      {/* Top Multi-Orchestrator Switcher & Action Bar */}
-      <div className="bg-white border-b border-slate-200 px-6 py-2.5 flex flex-wrap items-center justify-between gap-4 shrink-0 shadow-xs">
-        {/* Engine Switcher Tabs */}
-        <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200/80">
-          <button
-            onClick={() => setSelectedEngineId('cron')}
-            className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-              selectedEngineId === 'cron'
-                ? 'bg-white text-indigo-700 shadow-xs border border-slate-200/50'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
-            }`}
-          >
-            <Clock className="w-3.5 h-3.5 text-indigo-600" />
-            <span>Obelisk Cron</span>
-            <span className="px-1.5 py-0.2 bg-emerald-100 text-emerald-800 text-[10px] font-mono rounded">
-              Active
-            </span>
-          </button>
-
-          <button
-            onClick={() => setSelectedEngineId('dagster')}
-            className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-              selectedEngineId === 'dagster'
-                ? 'bg-white text-indigo-700 shadow-xs border border-slate-200/50'
-                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-200/50'
-            }`}
-          >
-            <RefreshCw className="w-3.5 h-3.5 text-violet-600" />
-            <span>Dagster</span>
-            {engines.find((e) => e.id === 'dagster')?.status === 'running' ? (
-              <span className="flex items-center gap-1 text-[10px] text-emerald-600 font-mono">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                Live
-              </span>
-            ) : (
-              <span className="px-1.5 py-0.2 bg-slate-200 text-slate-600 text-[10px] font-mono rounded">
-                Offline
-              </span>
-            )}
-          </button>
+    <div className="flex h-full min-h-0 flex-col bg-slate-50">
+      <div className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
+        <div>
+          <h1 className="text-sm font-bold text-slate-800">Pipelines</h1>
+          <p className="text-[11px] text-slate-500">
+            Dependencies, schedules and run history for everything Obelisk executes.
+          </p>
         </div>
-
-        {/* Global Action Toolbar */}
         <div className="flex items-center gap-2">
-          {selectedEngineId === 'cron' ? (
-            <button
-              onClick={() => {
-                if (cronTargets) {
-                  setNewJobType('script');
-                  setNewJobTarget(cronTargets.scripts[0]?.filename || 'daily_kpi_summary.py');
-                }
-                setIsCreateModalOpen(true);
-              }}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>New Scheduled Job</span>
-            </button>
-          ) : (
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setIframeKey(Date.now())}
-                title="Reload Iframe"
-                className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg border border-slate-200 transition-colors"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-              </button>
-              <button
-                onClick={() => setIsFullscreen(!isFullscreen)}
-                title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
-                className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg border border-slate-200 transition-colors"
-              >
-                {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
-              </button>
-              {selectedEngine?.web_url && (
-                <a
-                  href={selectedEngine.web_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-slate-700 hover:text-indigo-600 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors"
-                >
-                  <ExternalLink className="w-3.5 h-3.5" />
-                  <span>Open Tab</span>
-                </a>
-              )}
-            </div>
-          )}
-
           <button
-            onClick={fetchEnginesAndJobs}
-            disabled={loadingEngines || loadingJobs}
-            className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg border border-slate-200 transition-colors disabled:opacity-50"
-            title="Refresh Status"
+            type="button"
+            onClick={refreshList}
+            className="flex items-center gap-1.5 rounded-lg border border-slate-300 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
           >
-            <RefreshCw
-              className={`w-3.5 h-3.5 ${loadingEngines || loadingJobs ? 'animate-spin' : ''}`}
-            />
+            <RefreshCw className="h-3.5 w-3.5" /> Refresh
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowNew(true)}
+            className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700"
+          >
+            <Plus className="h-3.5 w-3.5" /> New pipeline
           </button>
         </div>
       </div>
 
-      {/* Global Feedback Alert */}
-      {feedback && (
-        <div
-          className={`mx-6 mt-3 px-4 py-2.5 rounded-xl border flex items-center justify-between text-xs transition-all ${
-            feedback.type === 'success'
-              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
-              : 'bg-rose-50 border-rose-200 text-rose-800'
-          }`}
-        >
-          <div className="flex items-center gap-2">
-            {feedback.type === 'success' ? (
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-            ) : (
-              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
-            )}
-            <span className="font-medium">{feedback.message}</span>
-          </div>
-          <button
-            onClick={() => setFeedback(null)}
-            className="text-slate-400 hover:text-slate-600"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
-        </div>
-      )}
-
-      {/* VIEW: OBELISK CRON */}
-      {selectedEngineId === 'cron' && (
-        <div className="flex-1 flex flex-col p-6 overflow-hidden">
-          {/* Jobs Table & Filter Toolbar */}
-          <div className="flex-1 bg-white rounded-xl border border-slate-200 shadow-xs flex flex-col overflow-hidden">
-            <div className="px-5 py-3 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 shrink-0">
-              {/* Type Filter Buttons & Active Count */}
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-1.5">
-                  {[
-                    { id: 'all', label: 'All Jobs' },
-                    { id: 'script', label: 'Python Scripts' },
-                    { id: 'dbt', label: 'dbt Models' },
-                    { id: 'notebook', label: 'Notebooks' },
-                  ].map((tab) => (
-                    <button
-                      key={tab.id}
-                      onClick={() => setFilterType(tab.id)}
-                      className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${
-                        filterType === tab.id
-                          ? 'bg-indigo-50 text-indigo-700 font-bold border border-indigo-200/80'
-                          : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
-                      }`}
-                    >
-                      {tab.label}
-                    </button>
-                  ))}
-                </div>
-                <span className="text-[11px] font-mono text-slate-500 bg-slate-100 px-2.5 py-0.5 rounded-full font-medium border border-slate-200/60">
-                  {cronJobs.length} {cronJobs.length === 1 ? 'job' : 'jobs'} ({cronJobs.filter((j) => j.is_enabled).length} active)
-                </span>
-              </div>
-
-              {/* Search Box */}
-              <div className="relative w-64">
-                <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Filter jobs by name, selector..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 rounded-lg border border-slate-200 focus:outline-hidden focus:border-indigo-500 focus:bg-white"
-                />
-              </div>
+      {(error || notice) && (
+        <div className="px-4 pt-3">
+          {error && (
+            <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="flex-1 break-words">{error}</span>
+              <button type="button" onClick={() => setError(null)} aria-label="Dismiss">
+                <X className="h-3.5 w-3.5" />
+              </button>
             </div>
-
-            {/* Table or Empty State */}
-            <div className="flex-1 overflow-auto">
-              {filteredJobs.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center p-8 text-center">
-                  <div className="w-14 h-14 rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 mb-3">
-                    <Clock className="w-7 h-7" />
-                  </div>
-                  <h3 className="text-sm font-bold text-slate-800">No scheduled cron jobs found</h3>
-                  <p className="text-xs text-slate-500 max-w-md mt-1 mb-4 leading-relaxed">
-                    Create your first scheduled job to automate dbt data marts, standalone Python
-                    scripts in <code className="px-1 py-0.5 bg-slate-100 rounded text-slate-700 font-mono">git_repo/scripts/</code>,
-                    or reactive Marimo notebooks.
-                  </p>
-                  <button
-                    onClick={() => {
-                      if (cronTargets) {
-                        setNewJobType('script');
-                        setNewJobTarget(cronTargets.scripts[0]?.filename || 'daily_kpi_summary.py');
-                      }
-                      setIsCreateModalOpen(true);
-                    }}
-                    className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Create First Scheduled Job</span>
-                  </button>
-                </div>
-              ) : (
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-200 bg-slate-50/70 text-[11px] font-bold text-slate-500 uppercase tracking-wider font-mono">
-                      <th className="py-2.5 px-4">Status</th>
-                      <th className="py-2.5 px-4">Job Name</th>
-                      <th className="py-2.5 px-4">Type</th>
-                      <th className="py-2.5 px-4">Target / Selector</th>
-                      <th className="py-2.5 px-4">Schedule (Cron)</th>
-                      <th className="py-2.5 px-4">Next Run</th>
-                      <th className="py-2.5 px-4">Last Run</th>
-                      <th className="py-2.5 px-4 text-right">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 text-xs">
-                    {filteredJobs.map((job) => {
-                      const isRunning = runningJobId === job.id;
-                      return (
-                        <tr
-                          key={job.id}
-                          className="hover:bg-slate-50/80 transition-colors group"
-                        >
-                          {/* Active / Enabled Toggle */}
-                          <td className="py-3 px-4">
-                            <button
-                              onClick={() => handleToggleJob(job.id)}
-                              title={job.is_enabled ? 'Pause schedule' : 'Enable schedule'}
-                              className={`w-7 h-4 rounded-full transition-colors relative p-0.5 ${
-                                job.is_enabled ? 'bg-indigo-600' : 'bg-slate-300'
-                              }`}
-                            >
-                              <div
-                                className={`w-3 h-3 rounded-full bg-white transition-transform ${
-                                  job.is_enabled ? 'translate-x-3' : 'translate-x-0'
-                                }`}
-                              />
-                            </button>
-                          </td>
-
-                          {/* Name & Description */}
-                          <td className="py-3 px-4">
-                            <div className="font-semibold text-slate-900 group-hover:text-indigo-600 transition-colors">
-                              {job.name}
-                            </div>
-                            {job.description && (
-                              <div className="text-[11px] text-slate-400 mt-0.5 max-w-xs truncate">
-                                {job.description}
-                              </div>
-                            )}
-                          </td>
-
-                          {/* Type Badge */}
-                          <td className="py-3 px-4">
-                            {job.target_type === 'dbt' && (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-violet-50 text-violet-700 border border-violet-200">
-                                <Database className="w-3 h-3" />
-                                dbt
-                              </span>
-                            )}
-                            {job.target_type === 'script' && (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                <Code2 className="w-3 h-3" />
-                                script
-                              </span>
-                            )}
-                            {job.target_type === 'notebook' && (
-                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-50 text-amber-700 border border-amber-200">
-                                <BookOpen className="w-3 h-3" />
-                                notebook
-                              </span>
-                            )}
-                          </td>
-
-                          {/* Target Selector */}
-                          <td className="py-3 px-4">
-                            <code className="px-1.5 py-0.5 bg-slate-100 text-slate-800 rounded font-mono text-[11px] font-semibold">
-                              {job.target}
-                            </code>
-                          </td>
-
-                          {/* Cron Expression */}
-                          <td className="py-3 px-4 font-mono text-slate-700 text-[11px]">
-                            <div className="font-semibold text-indigo-900">{job.cron_expression}</div>
-                          </td>
-
-                          {/* Next Run */}
-                          <td className="py-3 px-4 text-slate-500 font-mono text-[11px]">
-                            {job.is_enabled && job.next_run_at ? (
-                              new Date(job.next_run_at).toLocaleString(undefined, {
-                                month: 'short',
-                                day: 'numeric',
-                                hour: '2-digit',
-                                minute: '2-digit',
-                              })
-                            ) : (
-                              <span className="text-slate-400 italic">Paused</span>
-                            )}
-                          </td>
-
-                          {/* Last Run Pill */}
-                          <td className="py-3 px-4">
-                            {job.last_status === 'success' && (
-                              <span className="inline-flex items-center gap-1 text-emerald-700 font-semibold text-[11px]">
-                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
-                                Success ({job.last_duration_seconds}s)
-                              </span>
-                            )}
-                            {job.last_status === 'failed' && (
-                              <span className="inline-flex items-center gap-1 text-rose-700 font-semibold text-[11px]">
-                                <AlertCircle className="w-3.5 h-3.5 text-rose-500" />
-                                Failed
-                              </span>
-                            )}
-                            {!job.last_status && (
-                              <span className="text-slate-400 text-[11px] italic">Never run</span>
-                            )}
-                          </td>
-
-                          {/* Actions */}
-                          <td className="py-3 px-4 text-right">
-                            <div className="flex items-center justify-end gap-1.5">
-                              <button
-                                onClick={() => handleRunNow(job)}
-                                disabled={isRunning}
-                                title="Run immediately"
-                                className="flex items-center gap-1 px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
-                              >
-                                {isRunning ? (
-                                  <Loader2 className="w-3 h-3 animate-spin" />
-                                ) : (
-                                  <Play className="w-3 h-3 fill-current" />
-                                )}
-                                <span>{isRunning ? 'Running...' : 'Run'}</span>
-                              </button>
-
-                              {job.last_logs && (
-                                <button
-                                  onClick={() => {
-                                    setActiveLogJob(job);
-                                    setIsLogDrawerOpen(true);
-                                  }}
-                                  title="View execution logs"
-                                  className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg border border-slate-200 transition-colors"
-                                >
-                                  <Terminal className="w-3.5 h-3.5" />
-                                </button>
-                              )}
-
-                              <button
-                                onClick={() => handleDeleteJob(job)}
-                                title="Delete job"
-                                className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* VIEW: DAGSTER (NATIVE PANEL OR OFFLINE SERVICE CARD) */}
-      {selectedEngineId !== 'cron' && (
-        <div className="flex-1 flex flex-col overflow-hidden bg-slate-50">
-          {selectedEngine?.status === 'running' && selectedEngineId === 'dagster' ? (
-            <DagsterNativePanel webUrl={selectedEngine?.web_url} />
-          ) : selectedEngine?.status === 'running' ? (
-            <div className="flex-1 flex flex-col relative bg-white">
-              <iframe
-                key={iframeKey}
-                src={selectedEngine.web_url || '/dagster'}
-                title={selectedEngine.name}
-                className="w-full flex-1 border-0"
-              />
-            </div>
-          ) : (
-            <div className="flex-1 flex items-center justify-center p-8">
-              <div className="max-w-xl w-full bg-white rounded-2xl border border-slate-200 p-8 shadow-sm text-center">
-                <div className="w-16 h-16 rounded-2xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 mx-auto mb-4">
-                  <RefreshCw className="w-8 h-8 text-violet-600" />
-                </div>
-
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-slate-100 text-slate-600 border border-slate-200 mb-3">
-                  <span className="w-2 h-2 rounded-full bg-slate-400" />
-                  Service Offline
-                </div>
-
-                <h2 className="text-xl font-bold text-slate-900 mb-2">
-                  {selectedEngine?.name || 'Orchestration Engine'}
-                </h2>
-                <p className="text-xs text-slate-600 leading-relaxed mb-6">
-                  {selectedEngine?.description}
-                </p>
-
-                <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
-                  {selectedEngine?.can_deploy_local && (
-                    <button
-                      onClick={() => handleDeployLocal(selectedEngine.id)}
-                      className="w-full sm:w-auto px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-xs transition-colors flex items-center justify-center gap-2"
-                    >
-                      <Power className="w-4 h-4" />
-                      <span>1-Click Deploy {selectedEngine.name} Locally</span>
-                    </button>
-                  )}
-
-                  {onNavigateToSettings ? (
-                    <button
-                      onClick={onNavigateToSettings}
-                      className="w-full sm:w-auto px-5 py-2.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 text-xs font-bold rounded-xl transition-colors"
-                    >
-                      Connect Remote Instance
-                    </button>
-                  ) : null}
-
-                  <button
-                    onClick={() => setSelectedEngineId('cron')}
-                    className="w-full sm:w-auto px-4 py-2.5 text-xs text-indigo-600 hover:text-indigo-800 font-semibold"
-                  >
-                    Use Obelisk Cron Instead →
-                  </button>
-                </div>
-              </div>
+          )}
+          {notice && (
+            <div className="mt-2 flex items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+              <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="flex-1">{notice}</span>
+              <button type="button" onClick={() => setNotice(null)} aria-label="Dismiss">
+                <X className="h-3.5 w-3.5" />
+              </button>
             </div>
           )}
         </div>
       )}
 
-      {/* CREATE NEW SCHEDULED JOB MODAL */}
-      {isCreateModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-2xl border border-slate-200 w-full max-w-lg shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
-            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Clock className="w-5 h-5 text-indigo-600" />
-                <h3 className="text-base font-bold text-slate-900">New Scheduled Cron Job</h3>
-              </div>
+      <div className="flex min-h-0 flex-1">
+        <aside className="w-[286px] shrink-0 overflow-y-auto border-r border-slate-200 bg-white">
+          {pipelines.length === 0 && (
+            <p className="p-4 text-xs text-slate-400">No pipelines yet. Create one to begin.</p>
+          )}
+          {pipelines.map((pipeline) => {
+            const active = pipeline.id === selectedId;
+            const Icon = STATUS_ICON[pipeline.last_status] ?? Clock;
+            const chip = STATUS_CHIP[pipeline.last_status] ?? STATUS_CHIP.idle;
+            return (
               <button
-                onClick={() => setIsCreateModalOpen(false)}
-                className="text-slate-400 hover:text-slate-600"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <form onSubmit={handleCreateJob} className="p-6 space-y-4">
-              {/* Job Name */}
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase font-mono mb-1">
-                  Job Name *
-                </label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. Daily KPI Aggregation"
-                  value={newJobName}
-                  onChange={(e) => setNewJobName(e.target.value)}
-                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 focus:outline-hidden focus:border-indigo-500"
-                />
-              </div>
-
-              {/* Target Type Picker */}
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase font-mono mb-1.5">
-                  Target Execution Type *
-                </label>
-                <div className="grid grid-cols-3 gap-2">
-                  {[
-                    {
-                      id: 'script' as const,
-                      title: 'Python Script',
-                      desc: 'git_repo/scripts/',
-                      icon: <Code2 className="w-4 h-4" />,
-                    },
-                    {
-                      id: 'dbt' as const,
-                      title: 'dbt Model',
-                      desc: 'Silver & Gold Marts',
-                      icon: <Database className="w-4 h-4" />,
-                    },
-                    {
-                      id: 'notebook' as const,
-                      title: 'Notebook',
-                      desc: 'git_repo/notebooks/',
-                      icon: <BookOpen className="w-4 h-4" />,
-                    },
-                  ].map((type) => (
-                    <div
-                      key={type.id}
-                      onClick={() => handleTypeChange(type.id)}
-                      className={`p-3 rounded-xl border cursor-pointer text-left transition-all ${
-                        newJobType === type.id
-                          ? 'border-indigo-600 bg-indigo-50/80 ring-2 ring-indigo-200'
-                          : 'border-slate-200 hover:border-indigo-300 hover:bg-slate-50'
-                      }`}
-                    >
-                      <div className="text-indigo-600 mb-1">{type.icon}</div>
-                      <div className="text-xs font-bold text-slate-800">{type.title}</div>
-                      <div className="text-[10px] text-slate-500 mt-0.5">{type.desc}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* Target Selection Dropdown */}
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase font-mono mb-1">
-                  Target / Selector *
-                </label>
-                {newJobType === 'script' && (
-                  <div>
-                    <select
-                      value={newJobTarget}
-                      onChange={(e) => setNewJobTarget(e.target.value)}
-                      className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 focus:outline-hidden focus:border-indigo-500 font-mono"
-                    >
-                      {cronTargets?.scripts?.map((s) => (
-                        <option key={s.filename} value={s.filename}>
-                          {s.filename} ({Math.round(s.size_bytes / 1024)} KB)
-                        </option>
-                      ))}
-                    </select>
-                    <p className="text-[11px] text-slate-400 mt-1">
-                      Target script from <code className="text-indigo-600">git_repo/scripts/</code>
-                    </p>
-                  </div>
-                )}
-
-                {newJobType === 'dbt' && (
-                  <div>
-                    <select
-                      value={newJobTarget}
-                      onChange={(e) => setNewJobTarget(e.target.value)}
-                      className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 focus:outline-hidden focus:border-indigo-500 font-mono"
-                    >
-                      {cronTargets?.dbt_selectors?.map((sel) => (
-                        <option key={sel.value} value={sel.value}>
-                          {sel.label} - {sel.description}
-                        </option>
-                      ))}
-                    </select>
-                    <p className="text-[11px] text-slate-400 mt-1">
-                      Compiles and executes dbt models in PostgreSQL
-                    </p>
-                  </div>
-                )}
-
-                {newJobType === 'notebook' && (
-                  <div>
-                    <select
-                      value={newJobTarget}
-                      onChange={(e) => setNewJobTarget(e.target.value)}
-                      className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 focus:outline-hidden focus:border-indigo-500 font-mono"
-                    >
-                      {cronTargets?.notebooks?.map((nb) => (
-                        <option key={nb.filename} value={nb.filename}>
-                          {nb.filename}
-                        </option>
-                      ))}
-                    </select>
-                    <p className="text-[11px] text-slate-400 mt-1">
-                      Runs Marimo notebook headlessly in <code className="text-indigo-600">git_repo/notebooks/</code>
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              {/* Cron Expression & Presets */}
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="text-xs font-bold text-slate-700 uppercase font-mono">
-                    Schedule (Standard Cron) *
-                  </label>
-                  <span className="text-[10px] text-slate-400 font-mono">UTC Timezone</span>
-                </div>
-
-                <div className="flex flex-wrap gap-1.5 mb-2">
-                  {cronPresets.map((preset) => (
-                    <button
-                      key={preset.expr}
-                      type="button"
-                      onClick={() => setNewJobCron(preset.expr)}
-                      className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
-                        newJobCron === preset.expr
-                          ? 'bg-indigo-600 text-white font-bold'
-                          : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-                      }`}
-                    >
-                      {preset.label}
-                    </button>
-                  ))}
-                </div>
-
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. 0 4 * * *"
-                  value={newJobCron}
-                  onChange={(e) => setNewJobCron(e.target.value)}
-                  className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 focus:outline-hidden focus:border-indigo-500"
-                />
-              </div>
-
-              {/* Description */}
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase font-mono mb-1">
-                  Description (Optional)
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. Calculates daily KPIs and updates gold marts"
-                  value={newJobDesc}
-                  onChange={(e) => setNewJobDesc(e.target.value)}
-                  className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 focus:outline-hidden focus:border-indigo-500"
-                />
-              </div>
-
-              {/* Modal Actions */}
-              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-200">
-                <button
-                  type="button"
-                  onClick={() => setIsCreateModalOpen(false)}
-                  className="px-4 py-2 rounded-lg text-xs font-semibold text-slate-600 hover:bg-slate-100 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={creatingJob || !newJobName.trim()}
-                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors disabled:opacity-50 flex items-center gap-1.5"
-                >
-                  {creatingJob ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
-                  <span>{creatingJob ? 'Scheduling...' : 'Create Scheduled Job'}</span>
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* EXECUTION LOG DRAWER */}
-      {isLogDrawerOpen && activeLogJob && (
-        <div className="fixed inset-y-0 right-0 z-50 w-full max-w-2xl bg-slate-900 text-slate-100 shadow-2xl flex flex-col animate-in slide-in-from-right duration-200 border-l border-slate-800">
-          <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between shrink-0 bg-slate-950">
-            <div className="flex items-center gap-2.5">
-              <Terminal className="w-5 h-5 text-emerald-400" />
-              <div>
-                <h3 className="text-sm font-bold text-white font-mono">{activeLogJob.name}</h3>
-                <p className="text-[11px] text-slate-400 font-mono">
-                  {activeLogJob.target_type}: {activeLogJob.target}
-                </p>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <span
-                className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase ${
-                  activeLogJob.last_status === 'success'
-                    ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
-                    : 'bg-rose-950 text-rose-400 border border-rose-800'
+                key={pipeline.id}
+                type="button"
+                onClick={() => setSelectedId(pipeline.id)}
+                className={`flex w-full flex-col gap-1 border-b border-slate-100 px-4 py-3 text-left transition-colors ${
+                  active ? 'bg-indigo-50/60' : 'hover:bg-slate-50'
                 }`}
               >
-                {activeLogJob.last_status || 'UNKNOWN'} (
-                {activeLogJob.last_duration_seconds || 0}s)
-              </span>
-              <button
-                onClick={() => setIsLogDrawerOpen(false)}
-                className="text-slate-400 hover:text-white p-1"
-              >
-                <X className="w-4 h-4" />
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-xs font-semibold text-slate-800">
+                    {pipeline.name}
+                  </span>
+                  {pipeline.is_running ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-600" />
+                  ) : (
+                    <span
+                      className={`flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase ${chip}`}
+                    >
+                      <Icon className="h-2.5 w-2.5" />
+                      {pipeline.last_status}
+                    </span>
+                  )}
+                </div>
+                <span className="truncate text-[10px] font-mono text-slate-400">
+                  {pipeline.is_enabled ? 'every' : 'paused ·'} {pipeline.cron_expression} ·{' '}
+                  {pipeline.step_count} step{pipeline.step_count === 1 ? '' : 's'}
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  Next: {pipeline.is_enabled ? fmtWhen(pipeline.next_run_at) : '—'}
+                </span>
               </button>
+            );
+          })}
+        </aside>
+
+
+        <section className="flex min-w-0 flex-1 flex-col">
+          {!detail && (
+            <div className="flex flex-1 items-center justify-center">
+              <p className="text-xs text-slate-400">
+                {loadingDetail ? 'Loading…' : 'Select a pipeline on the left.'}
+              </p>
             </div>
-          </div>
+          )}
 
-          <div className="flex-1 p-5 overflow-auto font-mono text-xs leading-relaxed bg-slate-900/90 select-text">
-            <pre className="whitespace-pre-wrap text-slate-300 font-mono">
-              {activeLogJob.last_logs || 'No execution logs recorded yet.'}
-            </pre>
-          </div>
+          {detail && (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-white px-4 py-2.5">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <h2 className="truncate text-sm font-semibold text-slate-800">
+                      {detail.name}
+                    </h2>
+                    <span
+                      className={`rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase ${
+                        STATUS_CHIP[monitor?.status ?? detail.last_status] ?? STATUS_CHIP.idle
+                      }`}
+                    >
+                      {monitor?.status ?? detail.last_status}
+                    </span>
+                    {dirty && (
+                      <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold uppercase text-amber-700">
+                        Unsaved
+                      </span>
+                    )}
+                  </div>
+                  <p className="truncate text-[10px] font-mono text-slate-400">
+                    {detail.is_enabled ? 'Scheduled' : 'Paused'} · {detail.cron_expression} ·{' '}
+                    {detail.timezone} · overlap {detail.overlap_policy} · max {detail.max_parallel}{' '}
+                    parallel
+                  </p>
+                </div>
 
-          <div className="p-3 border-t border-slate-800 bg-slate-950 flex items-center justify-between text-[11px] text-slate-400 font-mono">
-            <span>Obelisk Cron In-Process Subprocess Runner</span>
-            <button
-              onClick={() => {
-                if (activeLogJob.last_logs) {
-                  navigator.clipboard.writeText(activeLogJob.last_logs);
-                  setFeedback({ type: 'success', message: 'Logs copied to clipboard.' });
-                }
-              }}
-              className="text-indigo-400 hover:text-indigo-300 font-semibold"
-            >
-              Copy Logs
-            </button>
-          </div>
-        </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => togglePipeline(detail)}
+                    className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold ${
+                      detail.is_enabled
+                        ? 'border-slate-300 text-slate-600 hover:bg-slate-50'
+                        : 'border-emerald-300 text-emerald-700 hover:bg-emerald-50'
+                    }`}
+                  >
+                    {detail.is_enabled ? 'Pause' : 'Enable'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={runNow}
+                    disabled={starting}
+                    className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {starting ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Play className="h-3.5 w-3.5" />
+                    )}
+                    Run now
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveGraph}
+                    disabled={!dirty || saving}
+                    className="flex items-center gap-1.5 rounded-lg border border-indigo-300 bg-indigo-50 px-2.5 py-1.5 text-[11px] font-semibold text-indigo-700 hover:bg-indigo-100 disabled:opacity-40"
+                  >
+                    {saving ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Save className="h-3.5 w-3.5" />
+                    )}
+                    Save
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => deletePipeline(detail)}
+                    className="rounded-lg border border-rose-200 p-1.5 text-rose-600 hover:bg-rose-50"
+                    aria-label="Delete pipeline"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+
+
+              {monitor && (
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-100/70 px-4 py-2">
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-600">
+                    <span className="font-semibold">Watching run</span>
+                    <span className="font-mono text-slate-500">{monitor.id.slice(0, 8)}</span>
+                    <span className="text-slate-400">
+                      {monitor.kind} · started {fmtWhen(monitor.started_at)} ·{' '}
+                      {fmtDuration(monitor.duration_seconds)}
+                    </span>
+                    {Object.entries(monitor.step_counts).map(([key, count]) => (
+                      <span
+                        key={key}
+                        className={`rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase ${
+                          STATUS_CHIP[key] ?? STATUS_CHIP.idle
+                        }`}
+                      >
+                        {key} {count}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {monitorActive && (
+                      <button
+                        type="button"
+                        onClick={() => cancelRun(monitor.id)}
+                        className="flex items-center gap-1 rounded-lg border border-amber-300 bg-white px-2 py-1 text-[11px] font-semibold text-amber-700 hover:bg-amber-50"
+                      >
+                        <Ban className="h-3 w-3" /> Cancel run
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setMonitor(null)}
+                      className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                    >
+                      Back to design
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex min-h-0 flex-1">
+                <div className="flex min-w-0 flex-1 flex-col">
+                  {!monitor && (
+                    <div className="flex flex-wrap items-center gap-1.5 border-b border-slate-200 bg-white px-3 py-2">
+                      <span className="mr-1 flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide text-slate-400 font-mono">
+                        <Plus className="h-3 w-3" /> Add step
+                      </span>
+                      {STEP_TEMPLATES.map((template) => (
+                        <button
+                          key={template.type}
+                          type="button"
+                          onClick={() => addStep(template.type)}
+                          className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                        >
+                          {template.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="min-h-0 flex-1">
+                    {draft.steps.length === 0 ? (
+                      <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+                        <p className="text-xs text-slate-400">
+                          This pipeline has no steps yet. Add one above.
+                        </p>
+                      </div>
+                    ) : (
+                      <PipelineCanvas
+                        steps={draft.steps}
+                        edges={draft.edges}
+                        editable={!monitor}
+                        runtimeByStep={runtimeByStep}
+                        selectedStepId={selectedStepKey}
+                        onSelectStep={setSelectedStepKey}
+                        onConnectRequest={(from, to) => setPendingEdge({ from, to })}
+                        onDeleteStep={removeStep}
+                        onMoveStep={moveStep}
+                      />
+                    )}
+                  </div>
+                </div>
+
+                <aside className="w-[320px] shrink-0 border-l border-slate-200 bg-white">
+                  <PipelineInspector
+                    step={selectedStep}
+                    runtime={selectedStepKey ? runtimeByStep[selectedStepKey] : undefined}
+                    stepRun={selectedStepRun}
+                    editable={!monitor}
+                    targets={targets}
+                    logs={stepLogs}
+                    loadingLogs={loadingLogs}
+                    onChange={updateStep}
+                    onDelete={() => selectedStepKey && removeStep(selectedStepKey)}
+                    onRerunFrom={monitor && selectedStepRun ? rerunFromSelected : undefined}
+                  />
+                </aside>
+              </div>
+
+
+              <div className="h-[196px] shrink-0 overflow-y-auto border-t border-slate-200 bg-white">
+                <div className="sticky top-0 flex items-center justify-between border-b border-slate-100 bg-white px-4 py-1.5">
+                  <span className="text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
+                    Runs ({executions.length})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={refreshExecutions}
+                    className="flex items-center gap-1 text-[10px] font-semibold text-slate-500 hover:text-indigo-600"
+                  >
+                    <RefreshCw className="h-3 w-3" /> Refresh
+                  </button>
+                </div>
+                {executions.length === 0 && (
+                  <p className="px-4 py-3 text-[11px] text-slate-400">
+                    No runs yet — use “Run now”, or enable the schedule.
+                  </p>
+                )}
+                {executions.map((run) => {
+                  const Icon = STATUS_ICON[run.status] ?? Clock;
+                  return (
+                    <div
+                      key={run.id}
+                      className={`flex items-center justify-between gap-2 border-b border-slate-50 px-4 py-1.5 text-[11px] hover:bg-slate-50 ${
+                        monitor?.id === run.id ? 'bg-indigo-50/50' : ''
+                      }`}
+                    >
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span
+                          className={`flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase ${
+                            STATUS_CHIP[run.status] ?? STATUS_CHIP.idle
+                          }`}
+                        >
+                          <Icon className="h-2.5 w-2.5" />
+                          {run.status}
+                        </span>
+                        <span className="font-mono text-slate-400">{run.id.slice(0, 8)}</span>
+                        <span className="text-slate-500">{run.kind}</span>
+                        <span className="text-slate-400">{fmtWhen(run.started_at ?? run.scheduled_for)}</span>
+                        <span className="font-mono text-slate-400">
+                          {fmtDuration(run.duration_seconds)}
+                        </span>
+                        {run.error && (
+                          <span className="max-w-[280px] truncate text-rose-600">{run.error}</span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const fresh = await api.getPipelineExecution(run.id);
+                            setMonitor(fresh);
+                            setSelectedStepKey(null);
+                          }}
+                          className="rounded border border-slate-300 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white"
+                        >
+                          Watch
+                        </button>
+                        {!TERMINAL.includes(run.status) && (
+                          <button
+                            type="button"
+                            onClick={() => cancelRun(run.id)}
+                            className="rounded border border-amber-300 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 hover:bg-amber-50"
+                          >
+                            Cancel
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </section>
+      </div>
+
+
+      {pendingEdge && (
+        <EdgeConditionModal
+          from={stepName(pendingEdge.from)}
+          to={stepName(pendingEdge.to)}
+          current={
+            draft.edges.find(
+              (edge) => edge.from_key === pendingEdge.from && edge.to_key === pendingEdge.to,
+            )?.condition ?? null
+          }
+          onPick={confirmEdge}
+          onRemove={() => removeEdge(pendingEdge.from, pendingEdge.to)}
+          onClose={() => setPendingEdge(null)}
+        />
+      )}
+
+      {showNew && (
+        <NewPipelineModal
+          onClose={() => setShowNew(false)}
+          onOpenSettings={onNavigateToSettings}
+          onCreated={async (id) => {
+            setShowNew(false);
+            await refreshList();
+            setSelectedId(id);
+          }}
+        />
       )}
     </div>
   );
 };
+
+const CONDITIONS: Array<{ key: EdgeCondition; label: string; hint: string }> = [
+  { key: 'success', label: 'On success', hint: 'Run only when the previous step succeeded' },
+  { key: 'failure', label: 'On failure', hint: 'Run only when the previous step failed' },
+  { key: 'completion', label: 'On completion', hint: 'Run once the previous step finished, either way' },
+  { key: 'skipped', label: 'On skip', hint: 'Run when the previous step was skipped' },
+];
+
+const EdgeConditionModal: React.FC<{
+  from: string;
+  to: string;
+  current: EdgeCondition | null;
+  onPick: (condition: EdgeCondition) => void;
+  onRemove: () => void;
+  onClose: () => void;
+}> = ({ from, to, current, onPick, onRemove, onClose }) => (
+  <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+    <div className="w-full max-w-sm rounded-xl bg-white p-4 shadow-xl">
+      <div className="mb-3 flex items-start justify-between">
+        <div>
+          <h3 className="text-sm font-bold text-slate-800">When should it run?</h3>
+          <p className="text-[11px] text-slate-500">
+            <span className="font-semibold">{from}</span> →{' '}
+            <span className="font-semibold">{to}</span>
+          </p>
+        </div>
+        <button type="button" onClick={onClose} aria-label="Close">
+          <X className="h-4 w-4 text-slate-400" />
+        </button>
+      </div>
+      <div className="space-y-1.5">
+        {CONDITIONS.map((option) => (
+          <button
+            key={option.key}
+            type="button"
+            onClick={() => onPick(option.key)}
+            className={`flex w-full items-center justify-between rounded-lg border px-3 py-2 text-left hover:bg-slate-50 ${
+              current === option.key ? 'border-indigo-400 ring-1 ring-indigo-200' : 'border-slate-200'
+            }`}
+          >
+            <span>
+              <span className="block text-xs font-semibold text-slate-800">{option.label}</span>
+              <span className="block text-[10px] text-slate-500">{option.hint}</span>
+            </span>
+            <span
+              className="h-2.5 w-2.5 rounded-full"
+              style={{ background: EDGE_COLOURS[option.key] }}
+            />
+          </button>
+        ))}
+      </div>
+      {current && (
+        <button
+          type="button"
+          onClick={onRemove}
+          className="mt-3 w-full rounded-lg border border-rose-200 px-2 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
+        >
+          Remove this dependency
+        </button>
+      )}
+    </div>
+  </div>
+);
+
+
+const NewPipelineModal: React.FC<{
+  onClose: () => void;
+  onCreated: (id: string) => void | Promise<void>;
+  onOpenSettings?: () => void;
+}> = ({ onClose, onCreated, onOpenSettings }) => {
+  const [name, setName] = useState('');
+  const [cron, setCron] = useState('0 2 * * *');
+  const [timezone, setTimezone] = useState('UTC');
+  const [enabled, setEnabled] = useState(false);
+  const [stepType, setStepType] = useState<StepType>('dbt_run');
+  const [target, setTarget] = useState('*');
+  const [preview, setPreview] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      api
+        .previewSchedule(cron, timezone, 3)
+        .then((res) => {
+          setPreview(res.next_runs);
+          setError(null);
+        })
+        .catch(() => {
+          setPreview([]);
+          setError('That cron expression or timezone is not valid.');
+        });
+    }, 350);
+    return () => window.clearTimeout(handle);
+  }, [cron, timezone]);
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const key = newKey();
+      const created = await api.createPipeline({
+        name: name.trim(),
+        description: '',
+        cron_expression: cron.trim(),
+        timezone: timezone.trim() || 'UTC',
+        is_enabled: enabled,
+        overlap_policy: 'skip',
+        max_parallel: 3,
+        keep_runs: 100,
+        timeout_seconds: 3600,
+        max_retries: 0,
+        retry_delay_seconds: 60,
+        auto_rerun_interrupted: false,
+        graph: {
+          steps: [
+            {
+              key,
+              name: stepType === 'dbt_test' ? 'dbt test' : 'Step 1',
+              step_type: stepType,
+              target,
+              args: {},
+              timeout_seconds: null,
+              max_retries: null,
+              retry_delay_seconds: null,
+              position_x: 80,
+              position_y: 100,
+            },
+          ],
+          edges: [],
+          params: [],
+        },
+      });
+      await onCreated(created.id);
+    } catch (err) {
+      const detail = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail;
+      setError(detail ?? (err instanceof Error ? err.message : 'Could not create the pipeline.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const input =
+    'w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:border-indigo-500 focus:outline-hidden';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
+      <form onSubmit={submit} className="w-full max-w-md rounded-xl bg-white p-4 shadow-xl">
+        <div className="mb-3 flex items-start justify-between">
+          <div>
+            <h3 className="text-sm font-bold text-slate-800">New pipeline</h3>
+            <p className="text-[11px] text-slate-500">
+              Start with one step; add the rest on the canvas.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close">
+            <X className="h-4 w-4 text-slate-400" />
+          </button>
+        </div>
+
+        <div className="space-y-3">
+          <label className="block">
+            <span className="mb-1 block text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
+              Name
+            </span>
+            <input
+              className={input}
+              value={name}
+              required
+              placeholder="Nightly dbt build"
+              onChange={(event) => setName(event.target.value)}
+            />
+          </label>
+
+          <div>
+            <span className="mb-1 block text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
+              Schedule
+            </span>
+            <div className="mb-1.5 flex flex-wrap gap-1">
+              {CRON_PRESETS.map((preset) => (
+                <button
+                  key={preset.expr}
+                  type="button"
+                  onClick={() => setCron(preset.expr)}
+                  className={`rounded px-1.5 py-0.5 text-[10px] font-mono ${
+                    cron === preset.expr
+                      ? 'bg-indigo-600 text-white'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              <input
+                className={`${input} col-span-2 font-mono`}
+                value={cron}
+                onChange={(event) => setCron(event.target.value)}
+              />
+              <input
+                className={`${input} font-mono`}
+                value={timezone}
+                onChange={(event) => setTimezone(event.target.value)}
+                placeholder="UTC"
+              />
+            </div>
+            <p className="mt-1 text-[10px] text-slate-400">
+              {preview.length
+                ? `Next: ${preview.map((value) => fmtWhen(value)).join(' · ')}`
+                : 'Five-field cron, interpreted in the timezone.'}
+            </p>
+          </div>
+
+
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block">
+              <span className="mb-1 block text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
+                First step
+              </span>
+              <select
+                className={input}
+                value={stepType}
+                onChange={(event) => setStepType(event.target.value as StepType)}
+              >
+                {STEP_TEMPLATES.map((template) => (
+                  <option key={template.type} value={template.type}>
+                    {template.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
+                Target
+              </span>
+              <input
+                className={`${input} font-mono`}
+                value={target}
+                onChange={(event) => setTarget(event.target.value)}
+              />
+            </label>
+          </div>
+
+          <label className="flex items-center gap-2 text-xs text-slate-600">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => setEnabled(event.target.checked)}
+            />
+            Enable the schedule immediately
+          </label>
+
+          {error && <p className="text-[11px] text-rose-600">{error}</p>}
+
+          {onOpenSettings && (
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              className="flex items-center gap-1 text-[10px] font-semibold text-indigo-600 hover:underline"
+            >
+              <Settings2 className="h-3 w-3" /> Variables and secrets live in Settings
+            </button>
+          )}
+        </div>
+
+        <div className="mt-4 flex items-center justify-end gap-2 border-t border-slate-200 pt-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg px-3 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-100"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={busy || !name.trim()}
+            className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            Create pipeline
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+};
+

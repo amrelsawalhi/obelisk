@@ -41,10 +41,9 @@ async def test_services_catalog_status_and_connect_remote():
         resp = await ac.get("/api/services/status")
         assert resp.status_code == 200
         services = resp.json()
-        assert len(services) == 6
+        assert len(services) == 5
         service_names = {s["service_name"] for s in services}
         assert "postgres" in service_names
-        assert "dagster" in service_names
         assert "superset" in service_names
 
         # Connect remote postgres

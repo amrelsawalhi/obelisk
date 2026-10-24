@@ -48,9 +48,8 @@ BLOCKING_MODULES = {
     "docker_mgr",
     "process_manager",
     "marimo_service",
-    "cron_engine",
+    "pipeline_engine",
     "introspector",
-    "dagster_client",
 }
 
 # Attribute calls that block regardless of the module they hang off.
@@ -75,11 +74,10 @@ BLOCKING_ATTRS = {
 # Functions that hand work to another thread; calls inside them are fine.
 OFFLOADERS = {"to_thread", "run_in_executor", "run_in_threadpool"}
 
-# Pure computation with no I/O: croniter evaluating an expression against "now". A
-# thread hop would cost more than the call it is meant to protect. Same for the
-# Dagster probe cache, which is a single reference store (see its docstring) and is
-# dropped by the service deploy/stop handlers on the event loop.
-ALLOWED_CALLS = {"cron_engine.compute_next_run", "dagster_client.invalidate_status_cache"}
+# Pure computation with no I/O: croniter evaluating an expression against "now" in
+# the schedule preview endpoint. A thread hop would cost more than the call it is
+# meant to protect.
+ALLOWED_CALLS: set = set()
 
 
 def _call_name(node: ast.Call) -> str:
@@ -140,7 +138,7 @@ def scan_file(path: Path) -> list[dict]:
     for function in [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)]:
         spans = _offloaded_lines(function)
         # A call that is itself awaited returns control to the loop, even if it hangs
-        # off a blocking-looking object: `await cron_engine.run_job(...)`.
+        # off a blocking-looking object: `await pipeline_engine.run_now(...)`.
         awaited = {
             id(node.value) for node in ast.walk(function) if isinstance(node, ast.Await)
         }

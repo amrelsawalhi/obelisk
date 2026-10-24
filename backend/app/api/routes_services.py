@@ -20,7 +20,6 @@ from app.core.deploy_tracker import deploy_tracker
 from app.core.process_manager import process_manager
 from app.core.vault import encrypt, decrypt
 from app.config import settings
-from app.engines.dagster_client import dagster_client
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -28,7 +27,6 @@ router = APIRouter(prefix="/api/services", tags=["services"])
 
 SUPPORTED_SERVICES = [
     "postgres",
-    "dagster",
     "superset",
     "clickhouse",
     "redpanda",
@@ -37,7 +35,7 @@ SUPPORTED_SERVICES = [
 
 # Request / Response Schemas
 class DeployLocalRequest(BaseModel):
-    service_name: str = Field(..., description="Service identifier, e.g. postgres, dagster")
+    service_name: str = Field(..., description="Service identifier, e.g. postgres or superset")
     memory_mb: Optional[int] = Field(None, description="Optional explicit memory limit in MB")
     image: Optional[str] = Field(None, description="Optional custom image override (blueprint pins are used by default)")
     host_port: Optional[int] = Field(None, description="Optional host port override for the primary port")
@@ -230,27 +228,11 @@ async def list_service_statuses(db: AsyncSession = Depends(get_db)):
     return statuses
 
 
-async def _warmup_dagster_workspace(svc_name: str) -> None:
-    """Best-effort pre-warm of the Dagster code-server after a process deploy.
-
-    The first GraphQL query after a cold deploy pays the code-location load
-    cost; running discover_workspace() here amortizes that into the deploy so
-    the first Pipelines panel open is instant. Failures are intentionally
-    silent — the panel already renders an empty state when Dagster is down.
-    """
-    if svc_name != "dagster":
-        return
-    try:
-        await asyncio.to_thread(dagster_client.discover_workspace)
-    except Exception:
-        pass
-
-
 async def _deploy_process_mode(svc_name: str, bp, req, db) -> DeployLocalResponse:
     """
     Deploys a run_mode='process' service as host processes (no Docker, no image).
 
-    Used by Dagster: webserver + daemon run from the backend venv, so deploys take
+    Host-process services run from the backend venv, so deploys take
     seconds, need no registry/disk, and logs land in data/logs/<service>_*.log.
     """
     host_port = req.host_port or bp.primary_host_port
@@ -281,13 +263,6 @@ async def _deploy_process_mode(svc_name: str, bp, req, db) -> DeployLocalRespons
         await asyncio.sleep(1.0)
     status_value = "ready" if ready else "starting"
     deploy_tracker.finish(svc_name, status_value, probe_detail)
-    dagster_client.invalidate_status_cache()
-
-    if ready and svc_name == "dagster":
-        # Amortize Dagster's code-location cold load into the deploy, so the
-        # first open of the Pipelines panel doesn't pay it. Fire-and-forget:
-        # the deploy response returns immediately.
-        asyncio.create_task(_warmup_dagster_workspace(svc_name))
 
     stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
     svc_record = (await db.execute(stmt)).scalar_one_or_none()
@@ -350,7 +325,7 @@ async def deploy_local_service(
                 detail=f"{bp.display_name} cannot be deployed locally: {bp.reason_not_deployable}")
 
         if bp.run_mode == "process":
-            # Host-process service (e.g. Dagster): no Docker engine, image, or disk needed.
+            # Host-process service: no Docker engine, image, or disk needed.
             return await _deploy_process_mode(svc_name, bp, req, db)
 
         # Pre-flight 1: Docker engine reachable
@@ -507,7 +482,7 @@ async def deploy_local_service(
             await asyncio.sleep(2.0)
         status_value = "ready" if ready else "starting"
         deploy_tracker.finish(svc_name, status_value, probe_detail)
-        dagster_client.invalidate_status_cache()
+
         config_json.update({"image": req.image or bp.image, "host_port": host_port, "volume_name": bp.volume_name})
         if not svc_record:
             svc_record = ServiceConfig(
@@ -687,9 +662,7 @@ async def stop_service(
         svc_record.container_id = None
         await db.commit()
 
-    # The engines panel caches the Dagster probe; a stop must not leave it
-    # reporting "running" for the rest of the window.
-    dagster_client.invalidate_status_cache()
+    
 
     return {"service_name": svc_name, "status": "stopped"}
 

@@ -56,7 +56,7 @@ class ServiceBlueprint:
     build_dockerfile: Optional[str] = None       # local image build instead of registry pull
     bind_mounts: Dict[str, Dict[str, str]] = field(default_factory=dict)  # host rel path -> {"bind": container_path, "mode": ...}
     pass_env: List[str] = field(default_factory=list)  # settings attributes injected as env at deploy
-    run_mode: str = "container"                  # "container" | "process" (host-managed processes, e.g. Dagster)
+    run_mode: str = "container"                  # "container" | "process" (host-managed process)
     process_commands: List[List[str]] = field(default_factory=list)  # argv lists started by core/process_manager
     process_cwd: Optional[str] = None            # working dir for process commands (defaults to project root)
 
@@ -145,36 +145,6 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
         image_size_gb=1.0,
         web_ui=True,
         web_ui_path="/gitea",
-    ),
-    ServiceBlueprint(
-        name="dagster",
-        display_name="Dagster Engine",
-        description="Orchestrator for scheduled assets and pipelines.",
-        category="Orchestration",
-        image="obelisk-dagster:local",
-        build_dockerfile="Dockerfile.dagster",
-        run_mode="process",
-        process_commands=[
-            ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "--path-prefix", "/dagster", "-w", "{dagster_home}/workspace.yaml"],
-            ["dagster-daemon", "run", "-w", "{dagster_home}/workspace.yaml"],
-        ],
-        ports={"3000/tcp": 3000},
-        primary_container_port="3000/tcp",
-        primary_host_port=3000,
-        volume_name="obelisk_dagster_home",
-        volume_path="/opt/obelisk/dagster_home",
-        bind_mounts={
-            "backend": {"bind": "/opt/obelisk/backend", "mode": "ro"},
-            "git_repo": {"bind": "/opt/obelisk/git_repo", "mode": "ro"},
-            "data": {"bind": "/opt/obelisk/data", "mode": "rw"},
-        },
-        env={"PYTHONPATH": "/opt/obelisk/backend"},
-        pass_env=["OBELISK_MASTER_KEY", "DATABASE_URL", "STORAGE_URI"],
-        readiness=ReadinessProbe(kind="http", host_port=3000, path="/dagster/server_info", expected_status=200),
-        probe_timeout_seconds=60,
-        image_size_gb=3.0,
-        web_ui=True,
-        web_ui_path="/dagster",
     ),
     ServiceBlueprint(
         name="superset",

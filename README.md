@@ -78,7 +78,7 @@ graph TD
     subgraph Services ["Pluggable Companion Services"]
         LocalPG[("PostgreSQL 16 Warehouse")]
         MarimoServer["Marimo Reactive Server (:2718)"]
-        DagsterEng["Dagster Engine & dbt Runner"]
+        PipelineEng["Pipeline Orchestrator (built in)"]
         SupersetBI["Apache Superset Dashboards"]
         ClickHouseOLAP["ClickHouse Columnar Engine"]
     end
@@ -143,10 +143,15 @@ graph TD
   <img src="docs/images/dbt_studio.png" alt="dbt Studio with Interactive Model Lineage DAG" width="100%">
 </p>
 
-### 5. Pipelines & Cron Orchestration
-* Define recurring ingestion, transformation, and custom Python tasks.
-* Standard 5-part cron scheduling (`*/15 * * * *`) with persistent task states in SQLite.
-* Live streaming execution logs and asset dependency tracking.
+### 5. Pipelines (built-in orchestrator)
+* One orchestrator for everything Obelisk executes: `dbt run`, `dbt test`, Python
+  scripts, Marimo notebooks, raw SQL and webhooks.
+* A visual canvas with conditional dependencies: a step runs on **success**,
+  **failure**, **completion** or **skip** of its parent.
+* Five-field cron schedules with a timezone, anchor-based next-run calculation and
+  one catch-up run after downtime, never a backfill storm.
+* Durable run history: every run and every step row survives a crash or a machine
+  restart, and anything that was mid-flight is reported as `interrupted` on boot.
 
 <p align="center">
   <img src="docs/images/pipelines.png" alt="Automated Scheduled Pipelines and Batch Ingestion" width="100%">
@@ -238,7 +243,6 @@ For every service, administrators can choose **[ 🚀 1-Click Deploy Locally ]**
 | Service | Engine Role | Local Default RAM | Remote Capability |
 | :--- | :--- | :--- | :--- |
 | **🐘 PostgreSQL (16)** | Relational Warehouse & dbt marts | 4 GB – 12 GB | Connect any RDS, Cloud SQL, or on-prem PG |
-| **🔄 Dagster Engine** | Asset scheduling & pipeline logs | 2 GB – 4 GB | Connect remote Dagster GraphQL daemon |
 | **📊 Apache Superset** | BI Dashboards & reporting | 2 GB – 4 GB | Connect existing enterprise Superset instance |
 | **🏎️ ClickHouse** | Columnar real-time OLAP | 2 GB – 6 GB | Connect external ClickHouse cluster |
 | **🐼 Redpanda** | C++ Kafka-compatible streaming | 500 MB – 2 GB | Connect enterprise Kafka or Redpanda |
@@ -298,6 +302,52 @@ npm run dev
 Visit **`http://localhost:5173`** in your browser.
 
 ---
+
+
+---
+
+### Option C: Linux server install (systemd, recommended for production)
+
+The backend serves the built UI, so a Linux install is **one process** and needs no
+Node at runtime:
+
+```bash
+# 1. Build the SPA once, wherever Node is available
+cd frontend && npm ci && npm run build && cd ..
+
+# 2. Install as a systemd service (code -> /opt/obelisk, state -> /var/lib/obelisk)
+sudo scripts/install_service.sh install
+```
+
+The installer creates the `obelisk` system user, the virtualenv, `/etc/obelisk/obelisk.env`
+and a unit with `Restart=always`, then enables it at boot:
+
+```bash
+systemctl status obelisk          # running?
+journalctl -u obelisk -f          # service log
+sudo scripts/install_service.sh restart
+```
+
+Visit **http://<host>:8000**. Upgrades: replace `/opt/obelisk`, then restart - the
+database migrations run on startup.
+
+On Windows the equivalent is a startup task:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_service.ps1 install
+```
+
+---
+
+## Verifying the orchestrator
+
+`backend/scripts/verify_pipelines.py` builds real pipelines from the shipped sample
+assets (Python scripts, a notebook, dbt, raw SQL and a webhook), runs them against a
+live backend and prints a pass/fail report:
+
+```bash
+python backend/scripts/verify_pipelines.py --base-url http://127.0.0.1:8000
+```
 
 ## 🧪 Testing (Zero Mocks Discipline)
 

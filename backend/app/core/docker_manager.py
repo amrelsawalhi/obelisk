@@ -335,7 +335,7 @@ class DockerManager:
 
     def build_image_with_progress(self, dockerfile: str, tag: str, on_event: Any = None) -> None:
         """
-        Builds a local image from the project root (e.g. Dockerfile.dagster),
+        Builds a local image from the project root (e.g. a service Dockerfile),
         streaming build log lines to on_event(line). Raises on build failure.
         """
         last_err: Optional[Exception] = None

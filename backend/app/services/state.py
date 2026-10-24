@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
@@ -27,7 +28,7 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-KINDS: tuple[str, ...] = ("ingest", "dbt", "deploy")
+KINDS: tuple[str, ...] = ("ingest", "dbt", "deploy", "pipeline")
 
 
 def _iso(value: Any) -> str:
@@ -93,6 +94,34 @@ class TaskHistory:
                 )
                 conn.commit()
             return True
+        except sqlite3.OperationalError as exc:
+            # "database is locked" happens when the orchestrator, an ingest and a dbt
+            # child all commit within the same instant. SQLite is single-writer, so a
+            # short retry is the correct response — history is a display record, not a
+            # transaction that must succeed on the first attempt.
+            if "locked" in str(exc).lower():
+                for delay in (0.25, 0.75, 1.5):
+                    time.sleep(delay)
+                    try:
+                        with self._connect() as conn:
+                            conn.execute(
+                                """
+                                INSERT INTO task_history
+                                    (kind, id, status, started_at, updated_at, payload_json)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(kind, id) DO UPDATE SET
+                                    status=excluded.status,
+                                    updated_at=excluded.updated_at,
+                                    payload_json=excluded.payload_json
+                                """,
+                                (kind, task_id, status, _iso(started_at), now, body),
+                            )
+                            conn.commit()
+                        return True
+                    except sqlite3.Error:
+                        continue
+            logger.warning("task_history: could not record %s/%s: %s", kind, task_id, exc)
+            return False
         except sqlite3.Error as exc:
             logger.warning("task_history: could not record %s/%s: %s", kind, task_id, exc)
             return False

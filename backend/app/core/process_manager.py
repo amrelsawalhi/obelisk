@@ -2,15 +2,17 @@
 Process Service Manager:
 Manages catalog services with run_mode="process" as host processes.
 
-Why process mode: services like Dagster are execution engines that run Obelisk's
-own code. Running them from the backend venv needs zero image download, has no
-dependency drift, and their logs are directly readable. Container mode remains
+Why process mode: a service can be an execution engine that runs Obelisk's
+own code. Running it from the backend venv needs zero image download, has no
+dependency drift, and its logs are directly readable. Container mode remains
 available per blueprint (or run_mode override) for production/air-gapped parity.
+No shipped blueprint uses process mode today; the machinery stays because it is
+the cheapest way to run a future host process without inventing a second deployer.
 
 Layout:
   data/run/<service>_<n>.pid        process ids
   data/logs/<service>_<n>.log       combined stdout/stderr
-  data/<service>_home/              service home dir (Dagster: DAGSTER_HOME)
+  data/<service>_home/              service home dir, exposed as {service_home}
 """
 import os
 import shutil
@@ -35,7 +37,7 @@ class ProcessServiceManager:
         return Path(sys.executable).resolve().parent
 
     def _resolve_cmd(self, argv: List[str]) -> List[str]:
-        """Resolve console scripts (dagster-webserver, dagster-daemon) from the venv."""
+        """Resolve console scripts from the backend venv rather than PATH."""
         base = self._scripts_dir()
         name = argv[0]
         for cand in (base / name, base / f"{name}.exe", base / f"{name}.cmd"):
@@ -43,28 +45,15 @@ class ProcessServiceManager:
                 return [str(cand)] + argv[1:]
         return argv
 
-    def _write_workspace(self, dagster_home: Path) -> Path:
-        """Dagster workspace for the daemon ($DAGSTER_HOME/workspace.yaml, absolute paths)."""
-        ws = dagster_home / "workspace.yaml"
-        ws_dir = (_PROJECT_ROOT / "git_repo" / "dagster_workspace").resolve()
-        ws.write_text(
-            "load_from:\n"
-            "  - python_file:\n"
-            f"      relative_path: {(ws_dir / 'repository.py').as_posix()}\n"
-            f"      working_directory: {ws_dir.as_posix()}\n",
-            encoding="utf-8",
-        )
-        return ws
-
-    def _build_env(self, bp: Any, dagster_home: Optional[Path]) -> Dict[str, str]:
+    def _build_env(self, bp: Any, service_home: Optional[Path]) -> Dict[str, str]:
         from app.config import settings
 
         env = os.environ.copy()
         env["PYTHONPATH"] = str((_PROJECT_ROOT / "backend").resolve()) + os.pathsep + env.get("PYTHONPATH", "")
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        if dagster_home is not None:
-            env["DAGSTER_HOME"] = str(dagster_home)
+        if service_home is not None:
+            env["SERVICE_HOME"] = str(service_home)
         for key in bp.pass_env or []:
             val = getattr(settings, key, None) or os.environ.get(key, "")
             if val:
@@ -98,35 +87,15 @@ class ProcessServiceManager:
 
         home = _DATA_DIR / f"{service_name}_home"
         home.mkdir(parents=True, exist_ok=True)
-        dagster_home: Optional[Path] = home if any("{dagster_home}" in a for argv in bp.process_commands for a in argv) else None
-        if dagster_home is not None:
-            self._write_workspace(dagster_home)
-
-        env = self._build_env(bp, dagster_home)
+        env = self._build_env(bp, home)
         cwd = str((_PROJECT_ROOT / bp.process_cwd).resolve()) if bp.process_cwd else str(_PROJECT_ROOT)
-
-        # Initialize/migrate instance storages serially before both processes start:
-        # webserver + daemon concurrently initializing the same SQLite storages races
-        # the alembic revision check on first boot.
-        if dagster_home is not None:
-            try:
-                mig = subprocess.run(
-                    self._resolve_cmd(["dagster", "instance", "migrate"]),
-                    cwd=cwd, env=env, capture_output=True, text=True, timeout=180,
-                )
-                if on_log:
-                    detail = (mig.stdout or "") + (mig.stderr or "")
-                    on_log(f"instance migrate rc={mig.returncode}: {detail.strip()[:300]}")
-            except Exception as e:
-                if on_log:
-                    on_log(f"instance migrate skipped: {e}")
 
         pids: List[int] = []
         handles: List[Any] = []
 
         for idx, argv in enumerate(bp.process_commands):
             expanded = [
-                a.replace("{dagster_home}", str(dagster_home or home).replace("\\", "/"))
+                a.replace("{service_home}", str(home).replace("\\", "/"))
                  .replace("{project_root}", str(_PROJECT_ROOT).replace("\\", "/"))
                 for a in argv
             ]
