@@ -183,6 +183,9 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     ? (monitor?.step_runs ?? []).find((run) => run.step_id === selectedStepKey) ?? null
     : null;
   const monitorActive = monitor != null && !TERMINAL.includes(monitor.status);
+  // Watching any run (live or finished) is a read-only mode: the inspector shows what
+  // happened, and 'Back to design' returns to editing the graph.
+  const watching = monitor != null;
 
   const dockSteps = useMemo(() => {
     const rows = [...(monitor?.step_runs ?? [])];
@@ -839,6 +842,11 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             ))}
             {detail && tab === "designer" && (
               <div className="ml-auto flex items-center gap-2 py-1">
+                {watching && (
+                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500">
+                    Read-only while watching a run
+                  </span>
+                )}
                 {monitor && (
                   <span className="flex items-center gap-1.5 rounded-md bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
                     Watching <span className="font-mono">{monitor.id.slice(0, 8)}</span>
@@ -849,7 +857,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                       onClick={() => setMonitor(null)}
                       className="font-semibold text-indigo-600 hover:underline"
                     >
-                      design
+                      Back to design
                     </button>
                   </span>
                 )}
@@ -900,13 +908,18 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                   <PipelineCanvas
                     steps={draft.steps}
                     edges={draft.edges}
-                    editable
+                    editable={!watching}
                     fitKey={`${detail.id}:${detail.updated_at ?? ""}`}
                     runtimeByStep={runtimeByStep}
                     selectedStepId={selectedStepKey}
                     problemSteps={problemSteps}
                     problemEdges={problemEdges}
-                    onSelectStep={(key) => setSelectedStepKey(key)}
+                    onSelectStep={(key) => {
+                      setSelectedStepKey(key);
+                      // A step inside a run has output worth seeing; open the dock so
+                      // clicking a node is enough to read it.
+                      if (key && monitor) setDockOpen(true);
+                    }}
                     onConnectRequest={(from, to) => setPendingEdge({ from, to })}
                     onDeleteStep={(key) => removeStep(key)}
                     onMoveStep={moveStep}
@@ -926,7 +939,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     step={selectedStep}
                     runtime={selectedStepKey ? runtimeByStep[selectedStepKey] : undefined}
                     stepRun={selectedStepRun}
-                    editable
+                    editable={!watching}
                     targets={targets}
                     parents={selectedStepKey ? parentsByStep[selectedStepKey] ?? [] : []}
                     onChange={updateStep}
@@ -936,7 +949,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                       setDockTab("step");
                     }}
                     onRerunFrom={
-                      monitor && selectedStepRun && !monitorActive ? rerunFromSelected : undefined
+                      watching && selectedStepRun && !monitorActive ? rerunFromSelected : undefined
                     }
                   />
                 </div>
