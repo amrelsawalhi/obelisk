@@ -12,6 +12,7 @@ a `generate_schema_name` macro applies it. Rename a layer and the pipeline follo
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -803,31 +804,179 @@ class DbtRunner:
         """Resolves target PostgreSQL warehouse connection parameters."""
         return resolve_warehouse_postgres_params(custom_params)
 
-    def _get_target_env(self, target: str = "postgres") -> Dict[str, str]:
-        """Prepares environment variables for dbt execution matching the active target adapter."""
-        clean_target = (target or "postgres").strip().lower()
-        if clean_target == "dev":
-            clean_target = "postgres"
+    # ---------------------------------------------------------- dbt targets
 
-        env: Dict[str, str] = {
-            "DBT_TARGET": clean_target,
-        }
+    def profiles_path(self) -> Path:
+        return self.dbt_project_dir / "profiles.yml"
 
-        if clean_target == "postgres":
+    def _read_profiles(self) -> Dict[str, Any]:
+        """Parses ``profiles.yml``.
+
+        Jinja only ever appears inside quoted strings (``"{{ env_var(...) }}"``), so the
+        file is valid YAML and safe to read. A broken profile returns ``{}`` rather than
+        taking down the Studio's target list.
+        """
+        import yaml
+
+        path = self.profiles_path()
+        if not path.is_file():
+            return {}
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _profile_default(value: Any, fallback: str) -> str:
+        """``"{{ env_var('DBT_TARGET', 'duckdb') }}"`` -> ``"duckdb"``."""
+        if not isinstance(value, str):
+            return fallback
+        match = re.search(
+            r"env_var\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]([^'\"]+)['\"]", value
+        )
+        return match.group(1) if match else (value.strip() or fallback)
+
+    def _profile_block(self) -> tuple:
+        """Returns ``(project_name, outputs)`` from the first profile with outputs."""
+        for name, block in self._read_profiles().items():
+            if isinstance(block, dict) and isinstance(block.get("outputs"), dict):
+                return name, block["outputs"]
+        return "obelisk", {}
+
+    def default_target(self) -> str:
+        """The profile's own default target, not a guess about adapters."""
+        for block in self._read_profiles().values():
+            if isinstance(block, dict) and isinstance(block.get("outputs"), dict):
+                return self._profile_default(block.get("target"), "dev")
+        return "dev"
+
+    def list_targets(self) -> Dict[str, Any]:
+        """Every target the project defines, with enough context to be trusted.
+
+        The Studio used to hardcode ``postgres | duckdb``. dbt is multi-target by
+        design: whatever the operator writes in ``profiles.yml`` is the list, and the
+        only honest extras are whether the adapter is installed and what the resolved
+        connection looks like.
+        """
+        from importlib.util import find_spec
+
+        from app.core.warehouse_resolver import describe_warehouse_postgres
+
+        project, outputs = self._profile_block()
+        targets: List[Dict[str, Any]] = []
+        for name, config in outputs.items():
+            config = config if isinstance(config, dict) else {}
+            adapter = str(config.get("type", "unknown")).lower()
+            detail: Dict[str, Any] = {}
+            if adapter == "postgres":
+                info = describe_warehouse_postgres()
+                detail = {
+                    "host": info.get("host"),
+                    "port": info.get("port"),
+                    "database": info.get("database"),
+                    "source": info.get("source"),
+                }
+            elif adapter == "duckdb":
+                detail = {
+                    "path": (settings.lakehouse_root_path / "lakehouse.duckdb")
+                    .resolve()
+                    .as_posix(),
+                    "source": "local file",
+                }
+            elif config.get("OBELISK_CONNECTION"):
+                detail = {"source": f"vault:{config['OBELISK_CONNECTION']}"}
+            targets.append(
+                {
+                    "name": name,
+                    "adapter": adapter,
+                    "available": find_spec(f"dbt.adapters.{adapter}") is not None,
+                    "detail": detail,
+                }
+            )
+        return {"project": project, "default": self.default_target(), "targets": targets}
+
+    def _get_target_env(self, target: str = "") -> Dict[str, str]:
+        """Environment for one dbt target.
+
+        The target name is passed through untouched: if the profile calls its default
+        ``dev``, dbt must see ``dev``. Credentials come from, in order: an
+        ``OBELISK_CONNECTION`` reference resolved from the vault (exported as the
+        standard ``DBT_*`` set), the PostgreSQL resolver, or the profile's own
+        ``env_var`` defaults.
+        """
+        clean_target = (target or self.default_target()).strip() or "postgres"
+        _, outputs = self._profile_block()
+        config = outputs.get(clean_target)
+        if not isinstance(config, dict):
+            config = outputs.get("dev" if clean_target == "postgres" else clean_target, {})
+        config = config if isinstance(config, dict) else {}
+        adapter = str(config.get("type") or "").lower()
+
+        env: Dict[str, str] = {"DBT_TARGET": clean_target}
+
+        connection_ref = config.get("OBELISK_CONNECTION")
+        if isinstance(connection_ref, str) and connection_ref.strip():
+            env.update(self._connection_env(connection_ref.strip()))
+
+        if adapter == "postgres" or (not adapter and clean_target in ("dev", "postgres")):
             pg = self._resolve_postgres_params()
             resolved_host = resolve_connection_host(pg["host"], int(pg["port"]))
-            env.update({
-                "DBT_PG_HOST": str(resolved_host),
-                "DBT_PG_PORT": str(pg["port"]),
-                "DBT_PG_USER": str(pg.get("username") or pg.get("user") or "testuser"),
-                "DBT_PG_PASSWORD": str(pg.get("password") or "testpass"),
-                "DBT_PG_DBNAME": str(pg.get("database") or "sourcedb"),
-                "DBT_PG_SSLMODE": str(pg.get("sslmode", "disable")),
-            })
-        elif clean_target == "duckdb":
-            duck_path = (settings.lakehouse_root_path / "lakehouse.duckdb").resolve().as_posix()
-            env["DBT_DUCKDB_PATH"] = duck_path
+            env.update(
+                {
+                    "DBT_PG_HOST": str(resolved_host),
+                    "DBT_PG_PORT": str(pg["port"]),
+                    "DBT_PG_USER": str(pg.get("username") or pg.get("user") or "testuser"),
+                    "DBT_PG_PASSWORD": str(pg.get("password") or "testpass"),
+                    "DBT_PG_DBNAME": str(pg.get("database") or "sourcedb"),
+                    "DBT_PG_SSLMODE": str(pg.get("sslmode", "disable")),
+                }
+            )
+        elif adapter == "duckdb":
+            env["DBT_DUCKDB_PATH"] = (
+                settings.lakehouse_root_path / "lakehouse.duckdb"
+            ).resolve().as_posix()
 
+        return env
+
+    @staticmethod
+    def _connection_env(reference: str) -> Dict[str, str]:
+        """Credentials for ``OBELISK_CONNECTION`` references, from the vault.
+
+        The profile declares a connection by name or id and reads the exported
+        ``DBT_*`` variables, so credentials never sit in a file that gets committed.
+        """
+        import sqlite3
+
+        try:
+            with sqlite3.connect(settings.sqlite_db_path, timeout=3.0) as con:
+                row = con.execute(
+                    "SELECT host, port, database, username, encrypted_credentials "
+                    "FROM connections WHERE id = ? OR name = ? LIMIT 1",
+                    (reference, reference),
+                ).fetchone()
+        except Exception:
+            return {}
+        if not row:
+            return {}
+        host, port, database, username, encrypted = row
+        try:
+            from app.core.vault import decrypt
+
+            password = decrypt(encrypted) if encrypted else ""
+        except Exception:
+            password = ""
+        env: Dict[str, str] = {}
+        if host:
+            env["DBT_HOST"] = str(resolve_connection_host(host, int(port or 0) or 5432))
+        if port:
+            env["DBT_PORT"] = str(port)
+        if username:
+            env["DBT_USER"] = str(username)
+        if password:
+            env["DBT_PASSWORD"] = password
+        if database:
+            env["DBT_DATABASE"] = str(database)
         return env
 
     def run_scoped_dbt(

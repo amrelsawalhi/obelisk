@@ -26,23 +26,47 @@ class FileDeleteRequest(BaseModel):
 
 class CompileModelRequest(BaseModel):
     model_name: str = Field(..., description="Name of the dbt model (e.g. stg_orders)")
-    target: Optional[str] = Field(default="postgres", description="dbt target database adapter: 'postgres' | 'duckdb'")
+    target: Optional[str] = Field(
+        default=None,
+        description="A target name from profiles.yml; defaults to the profile's own default",
+    )
 
 
 class PreviewModelRequest(BaseModel):
     model_name: str = Field(..., description="Name of the dbt model (e.g. stg_orders)")
-    target: Optional[str] = Field(default="postgres", description="dbt target database adapter: 'postgres' | 'duckdb'")
+    target: Optional[str] = Field(
+        default=None,
+        description="A target name from profiles.yml; defaults to the profile's own default",
+    )
     limit: Optional[int] = Field(default=50, description="Max rows to return for DataGrid preview")
 
 
 class RunDbtRequest(BaseModel):
     selector: str = Field(default="*", description="dbt selector pattern (e.g. 'stg_orders', 'models/staging', '*')")
-    target: Optional[str] = Field(default="postgres", description="dbt target database adapter: 'postgres' | 'duckdb'")
+    target: Optional[str] = Field(
+        default=None,
+        description="A target name from profiles.yml; defaults to the profile's own default",
+    )
 
 
 class TestDbtRequest(BaseModel):
     selector: str = Field(default="*", description="dbt selector pattern (e.g. 'stg_orders', 'models/staging', '*')")
-    target: Optional[str] = Field(default="postgres", description="dbt target database adapter: 'postgres' | 'duckdb'")
+    target: Optional[str] = Field(
+        default=None,
+        description="A target name from profiles.yml; defaults to the profile's own default",
+    )
+
+
+@router.get("/targets")
+async def list_dbt_targets():
+    """The targets this project defines in ``profiles.yml``.
+
+    dbt is multi-target by design; the Studio must not carry its own list of adapters.
+    """
+    try:
+        return await asyncio.to_thread(dbt_runner.list_targets)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read dbt targets: {exc}") from exc
 
 
 @router.get("/tree")
@@ -103,7 +127,7 @@ async def delete_dbt_file(
 async def compile_dbt_model(req: CompileModelRequest):
     """Runs dbt compile for a specific model and returns the compiled SQL, duration, and logs."""
     try:
-        res = await asyncio.to_thread(dbt_runner.compile_model, req.model_name, req.target or "postgres")
+        res = await asyncio.to_thread(dbt_runner.compile_model, req.model_name, req.target or dbt_runner.default_target())
         return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"dbt compilation failed: {str(e)}")
@@ -116,7 +140,7 @@ async def preview_dbt_model_data(req: PreviewModelRequest):
         res = await asyncio.to_thread(
             dbt_runner.preview_model_data,
             model_name=req.model_name,
-            target=req.target or "postgres",
+            target=req.target or dbt_runner.default_target(),
             limit=req.limit or 50,
         )
         return res
@@ -132,7 +156,7 @@ async def run_dbt_models(req: RunDbtRequest):
             dbt_runner.run_scoped_dbt,
             command="run",
             selector=req.selector or "*",
-            target=req.target or "postgres",
+            target=req.target or dbt_runner.default_target(),
         )
         return res
     except Exception as e:
@@ -147,7 +171,7 @@ async def test_dbt_models(req: TestDbtRequest):
             dbt_runner.run_scoped_dbt,
             command="test",
             selector=req.selector or "*",
-            target=req.target or "postgres",
+            target=req.target or dbt_runner.default_target(),
         )
         return res
     except Exception as e:

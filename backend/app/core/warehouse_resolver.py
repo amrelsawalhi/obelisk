@@ -152,6 +152,20 @@ def _from_environment_or_local() -> Dict[str, Any]:
     }
 
 
+def describe_warehouse_postgres() -> Dict[str, Any]:
+    """The resolved PostgreSQL warehouse plus where it came from.
+
+    Callers that only need credentials use :func:`resolve_warehouse_postgres_params`.
+    The Studio needs the label too: a target silently pointing at a local test
+    container is exactly the confusion this exists to end.
+    """
+    for source, loader in (("service", _from_service_config), ("connection", _from_connections)):
+        params = loader()
+        if params:
+            return {"source": source, **params}
+    return {"source": "environment", **_from_environment_or_local()}
+
+
 def resolve_warehouse_postgres_params(custom_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Resolves PostgreSQL warehouse params, highest-priority source first."""
     if custom_params:

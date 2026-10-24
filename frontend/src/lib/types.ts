@@ -751,6 +751,26 @@ export interface PipelineDetail extends PipelineSummary {
   last_run: PipelineExecution | null;
 }
 
+/** A target defined in the dbt project's profiles.yml. */
+export interface DbtTarget {
+  name: string;
+  adapter: string;
+  available: boolean;
+  detail: {
+    host?: string;
+    port?: number;
+    database?: string;
+    path?: string;
+    source?: string;
+  };
+}
+
+export interface DbtTargets {
+  project: string;
+  default: string;
+  targets: DbtTarget[];
+}
+
 export interface PipelineTargets {
   scripts: string[];
   notebooks: string[];

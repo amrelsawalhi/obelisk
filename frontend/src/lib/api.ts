@@ -37,6 +37,7 @@ import type {
   PipelineExecution,
   PipelineExecutionDetail,
   PipelineTargets,
+  DbtTargets,
   CreatePipelinePayload,
   GraphPayload,
   ExecutionStatus,
@@ -497,6 +498,12 @@ export const api = {
   },
 
   // dbt Studio API
+  // Targets come from profiles.yml; the app carries no adapter list of its own.
+  getDbtTargets: async (): Promise<DbtTargets> => {
+    const res = await apiClient.get<DbtTargets>('/dbt/targets');
+    return res.data;
+  },
+
   getDbtTree: async (): Promise<DbtTreeNode> => {
     const res = await apiClient.get<DbtTreeNode>('/dbt/tree');
     return res.data;

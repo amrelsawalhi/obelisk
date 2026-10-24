@@ -1200,7 +1200,7 @@ class PipelineEngine:
     ) -> Dict[str, Dict[str, Any]]:
         """Runs the step and returns the outputs the engine derived itself."""
         if step.step_type in ("dbt_run", "dbt_test"):
-            return await self._run_dbt(step, params, log, timeout)
+            return await self._run_dbt(step, args, params, log, timeout)
         if step.step_type == "script":
             await self._run_python_file(
                 self.scripts_dir, step.target, args, params, step_run_id, run_id,
@@ -1222,7 +1222,12 @@ class PipelineEngine:
         return {}
 
     async def _run_dbt(
-        self, step: PipelineStep, params: Dict[str, Any], log: List[str], timeout: int
+        self,
+        step: PipelineStep,
+        args: Dict[str, Any],
+        params: Dict[str, Any],
+        log: List[str],
+        timeout: int,
     ) -> Dict[str, Dict[str, Any]]:
         from app.engines.dbt_runner import dbt_runner
 
@@ -1236,6 +1241,12 @@ class PipelineEngine:
             selector = None
         log.append(f"$ dbt {command}" + (f" --select {selector}" if selector else " (whole project)"))
         dbt_vars = {**dbt_runner._dbt_vars_payload(), **params}
+        # A scheduled run used to fall back to the profile's default target and the
+        # server's environment, which could be a different database than the Studio
+        # just used. It now resolves the same environment the Studio does.
+        target = str(args.get("target") or "").strip() or None
+        env_vars = await asyncio.to_thread(dbt_runner._get_target_env, target or "")
+        log.append(f"dbt target: {env_vars.get('DBT_TARGET', '?')}")
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -1243,6 +1254,7 @@ class PipelineEngine:
                     command=command,
                     select=selector,
                     dbt_vars=dbt_vars,
+                    env_vars=env_vars,
                 ),
                 timeout=timeout,
             )

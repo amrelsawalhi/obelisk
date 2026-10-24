@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 
 import { api } from '../../lib/api';
+import type { DbtTarget } from '../../lib/types';
 import type {
   DbtTreeNode,
   DbtPreviewResponse,
@@ -54,7 +55,8 @@ export const DbtStudio: React.FC = () => {
   const [isSplitView, setIsSplitView] = useState(true);
 
   // Target Database
-  const [targetDb, setTargetDb] = useState<'postgres' | 'duckdb'>('postgres');
+  const [targetDb, setTargetDb] = useState('');
+  const [targets, setTargets] = useState<DbtTarget[]>([]);
 
   // Modals
   const [isNewModelOpen, setIsNewModelOpen] = useState(false);
@@ -110,6 +112,17 @@ export const DbtStudio: React.FC = () => {
   useEffect(() => {
     fetchTree();
   }, [fetchTree]);
+
+  // Targets live in profiles.yml: whatever is defined there is the list.
+  useEffect(() => {
+    api
+      .getDbtTargets()
+      .then((res) => {
+        setTargets(res.targets);
+        setTargetDb((current) => current || res.default || res.targets[0]?.name || '');
+      })
+      .catch(() => setTargets([]));
+  }, []);
 
   // 2. Open File into Tab. Idempotent by path, including when two opens race
   // (StrictMode mounts every effect twice in dev), which used to leave the same
@@ -530,11 +543,23 @@ export const DbtStudio: React.FC = () => {
               <div className="relative">
                 <select
                   value={targetDb}
-                  onChange={(e) => setTargetDb(e.target.value as 'postgres' | 'duckdb')}
+                  onChange={(e) => setTargetDb(e.target.value)}
+                  title={(() => {
+                    const active = targets.find((item) => item.name === targetDb);
+                    if (!active) return 'No dbt target defined in profiles.yml';
+                    const d = active.detail;
+                    const where = d.host ? `${d.host}:${d.port}/${d.database ?? ''}` : d.path ?? d.source;
+                    return `${active.adapter}${where ? ' \u00b7 ' + where : ''}${active.available ? '' : ' \u00b7 adapter not installed'}`;
+                  })()}
                   className="appearance-none bg-white border border-slate-200 hover:border-slate-300 rounded-md pl-2 pr-6 py-1 text-[11px] font-semibold text-slate-700 shadow-2xs focus:outline-sky-500 cursor-pointer"
                 >
-                  <option value="postgres">PostgreSQL Warehouse</option>
-                  <option value="duckdb">DuckDB Lakehouse</option>
+                  {targets.length === 0 && <option value="">No targets in profiles.yml</option>}
+                  {targets.map((item) => (
+                    <option key={item.name} value={item.name} disabled={!item.available}>
+                      {item.name} \u00b7 {item.adapter}
+                      {item.available ? '' : ' (adapter not installed)'}
+                    </option>
+                  ))}
                 </select>
                 <ChevronDown className="w-3 h-3 text-slate-400 absolute right-1.5 top-2 pointer-events-none" />
               </div>

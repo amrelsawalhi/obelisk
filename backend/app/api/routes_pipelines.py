@@ -346,6 +346,19 @@ async def _validate_graph(graph: GraphIn, pipeline_id: Optional[str] = None) -> 
                 )
 
         args = step.args or {}
+        if step.step_type in ("dbt_run", "dbt_test") and (args.get("target") or "").strip():
+            from app.engines.dbt_runner import dbt_runner
+
+            known = await asyncio.to_thread(dbt_runner.list_targets)
+            names = [item["name"] for item in known["targets"]]
+            wanted = str(args["target"]).strip()
+            if wanted not in names:
+                raise _invalid(
+                    f"Step '{clean_name}' runs dbt target '{wanted}', which "
+                    f"profiles.yml does not define "
+                    f"(available: {', '.join(names) or 'none'}).",
+                    steps=[step.key],
+                )
         materialize = args.get("materialize")
         if materialize is not None:
             if step.step_type != "raw_sql":
