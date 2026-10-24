@@ -111,7 +111,8 @@ async def delete_pipeline(pipeline_id: str):
 @router.get("/assets")
 async def get_pipeline_asset_graph(selector: Optional[str] = None):
     """Returns the pipeline lineage graph, optionally scoped to a selector."""
-    return dbt_runner.get_asset_graph(selector=selector)
+    # Reads the dbt manifest and every model file on disk.
+    return await asyncio.to_thread(dbt_runner.get_asset_graph, selector=selector)
 
 
 @router.post("/run")
@@ -157,7 +158,7 @@ class SaveModelRequest(BaseModel):
 @router.get("/model/{layer}/{model_name}")
 async def get_pipeline_model_code(layer: str, model_name: str):
     """Returns the raw SQL/Jinja source code of a dbt model."""
-    code = dbt_runner.get_model_code(layer=layer, name=model_name)
+    code = await asyncio.to_thread(dbt_runner.get_model_code, layer=layer, name=model_name)
     if code is None:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found in layer '{layer}'.")
     return {"name": model_name, "layer": layer, "sql": code}
@@ -167,7 +168,9 @@ async def get_pipeline_model_code(layer: str, model_name: str):
 async def save_or_create_pipeline_model(req: SaveModelRequest):
     """Saves or creates a dbt model in git_repo/dbt_project/models/."""
     try:
-        res = dbt_runner.save_model_code(layer=req.layer, name=req.name, sql=req.sql)
+        res = await asyncio.to_thread(
+            dbt_runner.save_model_code, layer=req.layer, name=req.name, sql=req.sql
+        )
         return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save model: {str(e)}")
@@ -176,7 +179,8 @@ async def save_or_create_pipeline_model(req: SaveModelRequest):
 @router.get("/runs")
 async def get_pipeline_runs():
     """Returns historical pipeline run metadata and execution logs."""
-    runs = dbt_runner.get_runs_history()
+    # Reads run history from SQLite.
+    runs = await asyncio.to_thread(dbt_runner.get_runs_history)
     return {"runs": runs, "total": len(runs)}
 
 
@@ -369,7 +373,7 @@ async def list_orchestration_engines():
 async def list_cron_targets():
     """Returns available runnable targets (scripts, notebooks, dbt models) for the job creation picker."""
     from app.engines.cron_engine import cron_engine
-    return cron_engine.list_available_targets()
+    return await asyncio.to_thread(cron_engine.list_available_targets)
 
 
 @router.get("/cron/jobs")

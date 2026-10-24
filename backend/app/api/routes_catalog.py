@@ -512,6 +512,27 @@ def _layer_for_folder(folder: str) -> str:
     return "main" if folder == "root" else folder
 
 
+def _ensure_lakehouse_directory(target_dir: Path) -> None:
+    """Creates a directory and drops a .gitkeep when it is empty.
+
+    Filesystem work, so callers hand it to a worker thread instead of the event loop.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if not any(target_dir.iterdir()):
+        (target_dir / ".gitkeep").touch(exist_ok=True)
+
+
+def _parquet_files_under(directory: Path) -> List[Path]:
+    return list(directory.rglob("*.parquet"))
+
+
+def _first_parquet_named(root: Path, stem: str) -> Optional[Path]:
+    for candidate in root.rglob(f"{stem}.parquet"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 @router.post("/lakehouse/directories")
 async def create_lakehouse_directory(req: CreateLakehouseDirectoryRequest):
     """Creates a new directory or nested subfolder inside Lakehouse storage."""
@@ -520,10 +541,7 @@ async def create_lakehouse_directory(req: CreateLakehouseDirectoryRequest):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Directory path or name is required.")
     rel_path = _clean_lakehouse_path(raw)
     target_dir = settings.lakehouse_root_path / rel_path
-    target_dir.mkdir(parents=True, exist_ok=True)
-    gitkeep = target_dir / ".gitkeep"
-    if not any(target_dir.iterdir()):
-        gitkeep.touch(exist_ok=True)
+    await asyncio.to_thread(_ensure_lakehouse_directory, target_dir)
     invalidate_catalog_cache()
     return {"status": "created", "name": target_dir.name, "path": rel_path}
 
@@ -595,7 +613,7 @@ async def delete_lakehouse_directory(
             detail=f"Directory '{rel_path}' does not exist in Lakehouse."
         )
 
-    parquet_files = list(target_dir.rglob("*.parquet"))
+    parquet_files = await asyncio.to_thread(_parquet_files_under, target_dir)
     if parquet_files and not cascade:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -611,7 +629,7 @@ async def delete_lakehouse_directory(
             await db.delete(asset)
     await db.commit()
 
-    shutil.rmtree(target_dir, ignore_errors=True)
+    await asyncio.to_thread(shutil.rmtree, target_dir, True)
     invalidate_catalog_cache()
     return {"status": "deleted", "path": rel_path}
 
@@ -676,7 +694,7 @@ async def delete_lakehouse_table(
         table_file = settings.lakehouse_root_path / f"{clean_name}.parquet"
 
     if table_file.exists():
-        table_file.unlink()
+        await asyncio.to_thread(table_file.unlink)
 
     # Clean from SQLite
     stmt = select(Asset).where(Asset.name == clean_name, Asset.layer == _layer_for_folder(clean_folder))
@@ -709,14 +727,14 @@ async def move_lakehouse_table(
             detail=f"Table '{table_name}' does not exist in folder '{src_folder}'."
         )
 
-    dst_dir.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(dst_dir.mkdir, parents=True, exist_ok=True)
     if dst_file.exists():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Table '{table_name}' already exists in folder '{dst_folder}'."
         )
 
-    shutil.move(src_file, dst_file)
+    await asyncio.to_thread(shutil.move, src_file, dst_file)
 
     # Update metadata brain
     stmt = select(Asset).where(Asset.name == table_name, Asset.layer == _layer_for_folder(src_folder))
@@ -818,7 +836,7 @@ async def get_catalog_tree(
 
     # 1. Lakehouse: one walk over the tree, with every Parquet footer read in it
     lakehouse_root = settings.lakehouse_root_path
-    lakehouse_root.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(lakehouse_root.mkdir, parents=True, exist_ok=True)
 
     discovered_dirs, tables_by_dir = await asyncio.to_thread(
         introspector.introspect_lakehouse, lakehouse_root
@@ -981,10 +999,9 @@ async def get_table_preview(
             if flat.exists():
                 parquet_file = flat
             else:
-                for candidate in lakehouse_root.rglob(f"{table_name}.parquet"):
-                    if candidate.is_file():
-                        parquet_file = candidate
-                        break
+                parquet_file = await asyncio.to_thread(
+                    _first_parquet_named, lakehouse_root, table_name
+                )
 
         if not parquet_file or not parquet_file.exists():
             raise HTTPException(

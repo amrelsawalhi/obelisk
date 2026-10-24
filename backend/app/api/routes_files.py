@@ -114,7 +114,7 @@ class DeleteFileRequest(BaseModel):
 
 
 @router.get("/tree")
-async def get_file_tree():
+def get_file_tree():
     """
     Returns the full file and directory tree of git_repo/.
     """
@@ -129,7 +129,7 @@ async def get_file_tree():
 
 
 @router.get("/content")
-async def get_file_content(path: str = Query(..., description="Relative path within git_repo")):
+def get_file_content(path: str = Query(..., description="Relative path within git_repo")):
     """
     Reads the content of a text file inside git_repo/.
     """
@@ -166,7 +166,7 @@ async def get_file_content(path: str = Query(..., description="Relative path wit
 
 
 @router.post("/save")
-async def save_file(req: SaveFileRequest):
+def save_file(req: SaveFileRequest):
     """
     Saves content to an existing or new file in git_repo/.
     """
@@ -190,7 +190,7 @@ async def save_file(req: SaveFileRequest):
 
 
 @router.post("/create")
-async def create_file_or_dir(req: CreateFileRequest):
+def create_file_or_dir(req: CreateFileRequest):
     """
     Creates a new file or directory inside git_repo/.
     """
@@ -216,7 +216,7 @@ async def create_file_or_dir(req: CreateFileRequest):
 
 
 @router.post("/rename")
-async def rename_file(req: RenameFileRequest):
+def rename_file(req: RenameFileRequest):
     """
     Renames or moves a file/directory inside git_repo/.
     """
@@ -243,7 +243,7 @@ async def rename_file(req: RenameFileRequest):
 
 
 @router.post("/delete")
-async def delete_file(req: DeleteFileRequest):
+def delete_file(req: DeleteFileRequest):
     """
     Deletes a file or directory inside git_repo/.
     """

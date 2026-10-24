@@ -1,7 +1,11 @@
 """
 Notebook API Routes: Exposes Marimo server status, lifecycle, and notebook workspace management.
+
+Every handler here calls a synchronous service, so they are plain ``def``: FastAPI runs
+those in its threadpool instead of on the event loop.
 """
 
+import time
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -21,14 +25,14 @@ class StartServerRequest(BaseModel):
 
 
 @router.get("")
-async def list_notebooks():
+def list_notebooks():
     """Returns list of all reactive Marimo notebook files in git_repo/notebooks."""
     notebooks = marimo_service.list_notebooks()
     return {"notebooks": notebooks, "total": len(notebooks)}
 
 
 @router.post("")
-async def create_notebook(req: CreateNotebookRequest):
+def create_notebook(req: CreateNotebookRequest):
     """Creates a new starter Marimo notebook."""
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="Notebook name cannot be empty.")
@@ -41,7 +45,7 @@ async def create_notebook(req: CreateNotebookRequest):
 
 
 @router.delete("/{name}")
-async def delete_notebook(name: str):
+def delete_notebook(name: str):
     """Deletes a reactive Marimo notebook file from git_repo/notebooks."""
     try:
         return marimo_service.delete_notebook(name)
@@ -52,13 +56,13 @@ async def delete_notebook(name: str):
 
 
 @router.get("/server/status")
-async def server_status():
+def server_status():
     """Returns current status and health of the headless Marimo server."""
     return marimo_service.get_status()
 
 
 @router.post("/server/start")
-async def start_server(req: Optional[StartServerRequest] = None):
+def start_server(req: Optional[StartServerRequest] = None):
     """Starts the headless Marimo directory server."""
     port = req.port if req else None
     try:
@@ -68,19 +72,18 @@ async def start_server(req: Optional[StartServerRequest] = None):
 
 
 @router.post("/server/stop")
-async def stop_server():
+def stop_server():
     """Stops the headless Marimo server and releases the port."""
     return marimo_service.stop()
 
 
 @router.post("/server/restart")
-async def restart_server(req: Optional[StartServerRequest] = None):
+def restart_server(req: Optional[StartServerRequest] = None):
     """Restarts the headless Marimo directory server."""
     port = req.port if req else None
     try:
         marimo_service.stop()
-        import asyncio
-        await asyncio.sleep(0.5)
+        time.sleep(0.5)
         return marimo_service.start(port=port)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to restart Marimo server: {str(e)}")

@@ -207,7 +207,7 @@ async def list_service_statuses(db: AsyncSession = Depends(get_db)):
         if deployment_type == "local" and live_c is None:
             _st_bp = get_blueprint(svc_name)
             if _st_bp is not None and _st_bp.run_mode == "process":
-                proc = process_manager.status(svc_name)
+                proc = await asyncio.to_thread(process_manager.status, svc_name)
                 if proc["alive_pids"]:
                     db_status = "running"
                     live_status = "process"
@@ -767,7 +767,7 @@ async def destroy_service(service_name: str, db: AsyncSession = Depends(get_db))
     has_volume = False
     if bp and bp.volume_name and docker_mgr.client:
         try:
-            docker_mgr.client.volumes.get(bp.volume_name)
+            await asyncio.to_thread(docker_mgr.client.volumes.get, bp.volume_name)
             has_volume = True
         except Exception:
             pass
