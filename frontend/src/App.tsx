@@ -22,6 +22,8 @@ const DbtStudio = React.lazy(() =>
 const NotebooksView = React.lazy(() =>
   import('./components/notebooks/NotebooksView').then((m) => ({ default: m.NotebooksView })),
 );
+import { ToastHost } from './components/common/ToastHost';
+
 const PipelinesView = React.lazy(() =>
   import('./components/pipelines/PipelinesView').then((m) => ({ default: m.PipelinesView })),
 );
@@ -191,6 +193,9 @@ const AppLayout: React.FC = () => {
 
       {/* Global Minimizable Ingestion Activity Dock */}
       <IngestActivityDock />
+
+      {/* One toast stack for the whole app: any screen can raise a notification. */}
+      <ToastHost />
     </div>
   );
 };

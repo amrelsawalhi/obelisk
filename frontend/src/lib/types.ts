@@ -674,6 +674,8 @@ export interface PipelineSummary {
   next_run_at: string | null;
   last_status: string;
   last_run_at: string | null;
+  /** Newest first; the rail paints one dot per run. */
+  recent_statuses?: string[];
   step_count: number;
   is_running: boolean;
   created_at?: string | null;
@@ -696,6 +698,11 @@ export interface PipelineExecution {
   step_counts: Record<string, number>;
 }
 
+export interface StepOutputValue {
+  type: 'scalar' | 'table';
+  value: unknown;
+}
+
 export interface StepRunItem {
   id: string;
   run_id: string;
@@ -711,6 +718,8 @@ export interface StepRunItem {
   error: string | null;
   logs_size: number;
   logs?: string;
+  /** Declared outputs captured from this attempt; never rows, only names and scalars. */
+  outputs?: Record<string, StepOutputValue>;
 }
 
 export interface PipelineExecutionDetail extends PipelineExecution {
