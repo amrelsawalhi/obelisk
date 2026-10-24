@@ -369,6 +369,14 @@ export interface NotebookServerStatus {
   notebooks_dir: string;
 }
 
+export interface ResolvedLayer {
+  path: string;
+  depth: number;
+  filesystem_dir: string;
+  warehouse_schema: string;
+  dbt_folder: string;
+}
+
 export interface Layer {
   /** Dot-separated path, e.g. "raw" or "marts.sales". */
   path: string;

@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertCircle,
   Check,
+  ChevronDown,
+  ChevronRight,
   CornerDownRight,
   Layers,
   Pencil,
@@ -11,7 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import { api } from '../../lib/api';
-import type { Layer } from '../../lib/types';
+import type { Layer, ResolvedLayer } from '../../lib/types';
 
 interface LayersModalProps {
   onClose: () => void;
@@ -46,6 +48,8 @@ export const LayersModal: React.FC<LayersModalProps> = ({ onClose, onChanged }) 
   const [draftName, setDraftName] = useState('');
   const [renaming, setRenaming] = useState<{ path: string; name: string } | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [resolved, setResolved] = useState<Record<string, ResolvedLayer>>({});
 
   const load = useCallback(async () => {
     try {
@@ -108,6 +112,22 @@ export const LayersModal: React.FC<LayersModalProps> = ({ onClose, onChanged }) 
   const depthPadding = (depth: number) => ({
     paddingLeft: `${Math.max(0, depth - 1) * 16}px`,
   });
+
+  /** Shows the three places one layer actually lives: files, schema, dbt folder. */
+  const toggleShapes = async (path: string) => {
+    if (expanded === path) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(path);
+    if (resolved[path]) return;
+    try {
+      const shapes = await api.resolveLayer(path);
+      setResolved((current) => ({ ...current, [path]: shapes }));
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
@@ -177,7 +197,17 @@ export const LayersModal: React.FC<LayersModalProps> = ({ onClose, onChanged }) 
                 style={depthPadding(layer.depth)}
                 className="group flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-slate-50"
               >
-                <Layers className="w-3.5 h-3.5 text-slate-300 shrink-0" />
+                <button
+                  onClick={() => toggleShapes(layer.path)}
+                  title="Show where this layer lives"
+                  className="p-0.5 rounded text-slate-300 hover:text-sky-600 hover:bg-sky-50 shrink-0"
+                >
+                  {expanded === layer.path ? (
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  ) : (
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  )}
+                </button>
 
                 {renaming?.path === layer.path ? (
                   <input
@@ -239,6 +269,29 @@ export const LayersModal: React.FC<LayersModalProps> = ({ onClose, onChanged }) 
                   </button>
                 </div>
               </div>
+              {/* Where this layer actually lives */}
+              {expanded === layer.path && (
+                <div style={depthPadding(layer.depth + 1)} className="px-2 pb-1.5">
+                  {resolved[layer.path] ? (
+                    <dl className="grid grid-cols-[3.5rem,1fr] gap-x-3 gap-y-0.5 rounded-md bg-slate-50 px-2.5 py-1.5 text-[10px] font-mono">
+                      <dt className="text-slate-400">files</dt>
+                      <dd
+                        className="text-slate-700 truncate"
+                        title={resolved[layer.path].filesystem_dir}
+                      >
+                        {resolved[layer.path].filesystem_dir}
+                      </dd>
+                      <dt className="text-slate-400">schema</dt>
+                      <dd className="text-slate-700">{resolved[layer.path].warehouse_schema}</dd>
+                      <dt className="text-slate-400">dbt</dt>
+                      <dd className="text-slate-700">{resolved[layer.path].dbt_folder}</dd>
+                    </dl>
+                  ) : (
+                    <p className="text-[10px] text-slate-400">Resolving…</p>
+                  )}
+                </div>
+              )}
+
               {/* Delete confirmation stays inline: a destructive action should sit next
                   to its target rather than behind another dialog. */}
               {confirmingDelete === layer.path && (

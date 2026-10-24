@@ -180,6 +180,12 @@ export const api = {
     );
     return res.data;
   },
+  resolveLayer: async (path: string): Promise<import('./types').ResolvedLayer> => {
+    const res = await apiClient.get<import('./types').ResolvedLayer>('/layers/resolve', {
+      params: { path },
+    });
+    return res.data;
+  },
   createConnection: async (req: CreateConnectionRequest): Promise<Connection> => {
     const res = await apiClient.post<Connection>('/catalog/connections', req);
     return res.data;
