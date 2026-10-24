@@ -35,10 +35,17 @@ if exist "backend\.venv\Scripts\python.exe" (
 
 :: 4. Guard the API port. A stale `uvicorn --reload` parent can keep the port
 ::    listening while its worker is dead, which makes the UI load with no data.
+::    `--restart` replaces a backend that is still running (the API can be up
+::    while the Vite window that serves the page is gone).
 echo [*] Checking port 8000 ...
-"%~dp0!PYTHON_EXE!" "%~dp0backend\scripts\preflight_port.py" --port 8000
+if /I "%~1"=="--restart" (
+    "%~dp0!PYTHON_EXE!" "%~dp0backend\scripts\preflight_port.py" --port 8000 --restart
+) else (
+    "%~dp0!PYTHON_EXE!" "%~dp0backend\scripts\preflight_port.py" --port 8000
+)
 if errorlevel 1 (
     echo [!] Aborting: port 8000 is not available. See the message above.
+    echo     To replace the running instance: run_obelisk.bat --restart
     pause
     exit /b 1
 )
@@ -72,5 +79,6 @@ echo      - Notebooks:  Auto-starts on http://localhost:2718
 echo.
 echo  Keep the opened terminal windows running while testing.
 echo  Close those windows when you are done.
+echo  If port 8000 is still held next time: run_obelisk.bat --restart
 echo ==============================================================================
 echo.

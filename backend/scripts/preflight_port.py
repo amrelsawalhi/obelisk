@@ -7,13 +7,19 @@ call from the UI times out and the SPA renders an empty shell. This preflight
 turns that silent state into an explicit one:
 
   * port free                     -> exit 0
-  * port answers ``/health``      -> exit 1 ("already running")
+  * port answers ``/health``      -> exit 1 ("already running", with the PID to stop)
   * port held by Obelisk itself   -> terminate the stale processes, exit 0
   * port held by anything else    -> exit 1, owner named, nothing killed
+
+``--restart`` turns the "already running" case into a restart: an Obelisk backend
+holding the port is stopped together with its reloader children and the launch
+continues. That is the state where the API answers but the UI cannot be opened,
+because only the backend window survived and the Vite window was closed.
 
 Run it before binding the API port:
 
     python backend/scripts/preflight_port.py --port 8000
+    python backend/scripts/preflight_port.py --port 8000 --restart
 """
 from __future__ import annotations
 
@@ -91,17 +97,46 @@ def _terminate(targets: list[psutil.Process]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ensure the API port is usable.")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="Stop an Obelisk backend that already holds the port, then continue.",
+    )
     args = parser.parse_args()
 
     if not _port_open(args.port):
         return 0
 
-    if _healthy(args.port):
-        print(f"[!] Obelisk is already running on port {args.port} (health check passed).")
-        print("    Stop that instance before starting another one.")
+    owners = _obelisk_owners(args.port)
+
+    if args.restart:
+        if not owners:
+            print(f"[!] Port {args.port} is held by something that is not an Obelisk backend.")
+            print("    Refusing to kill it. Inspect the owner with:")
+            print(f"      netstat -ano | findstr :{args.port}")
+            return 1
+        targets = _with_children(owners)
+        print(f"[*] --restart: stopping the backend on port {args.port} ({len(targets)} process(es)).")
+        _terminate(targets)
+        for _ in range(20):
+            if not _port_open(args.port):
+                print(f"[+] Port {args.port} is free.")
+                return 0
+            time.sleep(0.25)
+        print(f"[!] Port {args.port} is still in use after cleanup.")
         return 1
 
-    owners = _obelisk_owners(args.port)
+    if _healthy(args.port):
+        print(f"[!] Obelisk is already running on port {args.port} (health check passed).")
+        if owners:
+            print(f"    Stop that instance:  taskkill /PID {owners[0].pid} /T /F")
+        else:
+            print(f"    Find that instance:  netstat -ano | findstr :{args.port}")
+        print("    Replace it instead:  run_obelisk.bat --restart")
+        print("    Note: the page you open is served by the Vite window, not the API.")
+        print("    If the browser shows nothing, that window is the one that is gone.")
+        return 1
+
     if not owners:
         print(f"[!] Port {args.port} is in use but unresponsive, and it is not an Obelisk process.")
         print("    Refusing to kill it. Inspect the owner with:")
