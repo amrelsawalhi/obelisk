@@ -563,19 +563,23 @@ class DbtRunner:
                 cur = conn.cursor()
                 cur.execute("PRAGMA journal_mode=WAL;")
                 for m in models:
-                    asset_id = str(uuid.uuid4())
                     cur.execute(
                         """
-                        INSERT INTO assets (id, name, layer, storage_uri, format, record_count, schema_metadata, created_at, last_materialized_at)
-                        VALUES (?, ?, ?, ?, 'postgres_table', 0, ?, ?, ?)
-                        ON CONFLICT(layer, name) DO UPDATE SET
-                            storage_uri=excluded.storage_uri,
-                            format=excluded.format,
-                            schema_metadata=excluded.schema_metadata,
-                            last_materialized_at=excluded.last_materialized_at;
+                        INSERT INTO catalog_objects (
+                            id, fqn, name, layer_path, kind, backend, location,
+                            schema_json, row_count, size_bytes, version, created_at,
+                            last_materialized_at
+                        )
+                        VALUES (?, ?, ?, ?, 'model', 'postgres', ?, ?, 0, NULL, 1, ?, ?)
+                        ON CONFLICT(fqn) DO UPDATE SET
+                            location=excluded.location,
+                            schema_json=excluded.schema_json,
+                            last_materialized_at=excluded.last_materialized_at,
+                            version=catalog_objects.version + 1;
                         """,
                         (
-                            asset_id,
+                            str(uuid.uuid4()),
+                            f"lakehouse.{m['layer']}.{m['name']}",
                             m["name"],
                             m["layer"],
                             f"postgresql:///{m['schema']}.{m['name']}",

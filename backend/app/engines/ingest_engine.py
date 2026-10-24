@@ -89,20 +89,7 @@ class IngestEngine:
             with conn:
                 cur = conn.cursor()
                 cur.execute("PRAGMA journal_mode=WAL;")
-                cur.execute(
-                    """
-                    INSERT INTO assets (id, name, layer, storage_uri, format, record_count, schema_metadata, created_at, last_materialized_at)
-                    VALUES (?, ?, ?, ?, 'parquet', ?, ?, ?, ?)
-                    ON CONFLICT(layer, name) DO UPDATE SET
-                        storage_uri=excluded.storage_uri,
-                        record_count=excluded.record_count,
-                        schema_metadata=excluded.schema_metadata,
-                        last_materialized_at=excluded.last_materialized_at;
-                    """,
-                    (asset_id, name, layer_path, storage_uri, record_count, metadata_json, now_iso, now_iso),
-                )
-                # The registry mirrors the legacy assets table so it cannot drift while
-                # `assets` is still the write target.
+                # One table knows what exists; `assets` is only a projection of it now.
                 cur.execute(
                     """
                     INSERT INTO catalog_objects (

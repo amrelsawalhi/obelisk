@@ -24,7 +24,7 @@ from app.services.layers import (
 
 def _cleanup(layer: str, name: str) -> None:
     with sqlite3.connect(settings.sqlite_db_path) as con:
-        con.execute("DELETE FROM assets WHERE layer = ? AND name = ?", (layer, name))
+        con.execute("DELETE FROM catalog_objects WHERE layer_path = ? AND name = ?", (layer, name))
         con.execute("DELETE FROM catalog_objects WHERE fqn = ?", (f"lakehouse.{layer}.{name}",))
         con.commit()
 

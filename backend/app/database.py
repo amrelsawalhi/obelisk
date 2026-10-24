@@ -155,6 +155,14 @@ async def _migrate_assets_unique_constraint(conn) -> None:
     if not settings.is_sqlite:
         return
 
+    # `assets` is a read-only view over catalog_objects now; there is no constraint to
+    # rebuild, and PRAGMA on a view is meaningless.
+    object_row = (
+        await conn.exec_driver_sql("SELECT type FROM sqlite_master WHERE name = 'assets'")
+    ).fetchone()
+    if object_row is None or object_row[0] != "table":
+        return
+
     index_rows = (await conn.exec_driver_sql("PRAGMA index_list('assets')")).fetchall()
     unique_columns = []
     for row in index_rows:

@@ -5,10 +5,17 @@ filesystem path, so `/api/catalog/preview/lakehouse:../../secret` read any
 .parquet on the host and a name containing a quote broke out of the DuckDB
 literal.
 """
+import shutil
+import uuid
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.config import settings
 from app.main import app
+from app.services.layers import ensure_layer
 
 
 @pytest.mark.asyncio
@@ -40,17 +47,45 @@ async def test_preview_still_serves_a_real_table() -> None:
         tree = (await client.get("/api/catalog/tree?refresh=true")).json()
 
     lakehouse = next(node for node in tree if node.get("id") == "lakehouse")
-    table = next(
-        (t for node in lakehouse.get("directories", []) for t in node.get("tables", [])),
-        None,
-    )
-    if table is None:
+    # A directory's own path is the identifier the preview expects: layer paths keep
+    # their dots, plain folders are slash-separated.
+    node = next((d for d in lakehouse.get("directories", []) if d.get("tables")), None)
+    if node is None:
         pytest.skip("no lakehouse table available to preview")
 
-    folder = table["fqn"].rsplit(".", 1)[0]
+    table = node["tables"][0]
+    folder = node["path"]
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get(f"/api/catalog/preview/lakehouse:{folder}/{table['name']}")
 
-    assert response.status_code == 200
+    assert response.status_code == 200, (
+        f"{folder}/{table['name']} -> {response.status_code} {response.text}"
+    )
     assert "columns" in response.json()
+
+
+@pytest.mark.asyncio
+async def test_preview_serves_a_nested_layer() -> None:
+    """A layer path contains dots, which a plain folder name never could."""
+    layer = f"zz{uuid.uuid4().hex[:6]}.sales"
+    directory = settings.lakehouse_root_path / layer
+    directory.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"id": [1, 2]}), directory / "probe.parquet")
+
+    try:
+        ensure_layer(layer)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(f"/api/catalog/preview/lakehouse:{layer}/probe")
+
+        assert response.status_code == 200, response.text
+        assert len(response.json()["columns"]) == 1
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+        import sqlite3
+
+        with sqlite3.connect(settings.sqlite_db_path) as con:
+            con.execute("DELETE FROM layers WHERE path = ?", (layer,))
+            con.commit()

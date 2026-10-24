@@ -6,6 +6,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base
 
 class Asset(Base):
+    """Read-only projection of ``catalog_objects`` under the original column names.
+
+    `catalog_objects` is the table that knows what exists; ``assets`` is a view the
+    migration leaves behind so older callers (and the UI) can keep reading
+    ``layer``/``storage_uri``/``record_count``. Do not write through this mapping.
+    """
+
     __tablename__ = "assets"
 
     # Uniqueness is per tier: `bronze.orders` and `silver.orders` are two distinct

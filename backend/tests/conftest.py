@@ -161,7 +161,7 @@ def cleanup_test_artifacts():
         try:
             with sqlite3.connect(str(db_path), timeout=5.0) as con:
                 cur = con.cursor()
-                cur.execute("DELETE FROM assets WHERE name LIKE 'bronze_%' OR name LIKE 'test_%' OR name LIKE 'sdk_%'")
+                cur.execute("DELETE FROM catalog_objects WHERE name LIKE 'bronze_%' OR name LIKE 'test_%' OR name LIKE 'sdk_%'")
                 cur.execute("DELETE FROM connections WHERE name LIKE 'test_%'")
                 con.commit()
         except Exception:

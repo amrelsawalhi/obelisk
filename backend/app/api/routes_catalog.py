@@ -7,14 +7,14 @@ from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, or_
 from app.database import get_db
 from app.config import settings
 from app.core.vault import encrypt, decrypt
 from app.core.host_resolver import resolve_connection_host
 from app.core.dsn import sql_string
 from app.models.connection import Connection
-from app.models.asset import Asset
+from app.models.catalog_object import CatalogObject
 from app.engines.introspector import introspector
 from app.engines.duckdb_engine import duckdb_engine
 from app.core.sources import (
@@ -502,7 +502,7 @@ def _clean_lakehouse_path(raw_path: str) -> str:
 
 
 def _layer_for_folder(folder: str) -> str:
-    """Maps a lakehouse folder to the `Asset.layer` value it is catalogued under.
+    """Maps a lakehouse folder to the layer path it is catalogued under.
 
     Root-level Parquet files are registered with layer "main" (the /tree endpoint
     labels the flat root tier "main"), while callers may address that folder as
@@ -574,20 +574,20 @@ async def rename_lakehouse_directory(
         )
 
     dest_rel_path = dest_dir.relative_to(settings.lakehouse_root_path).as_posix()
-    target_dir.rename(dest_dir)
+    await asyncio.to_thread(target_dir.rename, dest_dir)
 
-    # Synchronize SQLite metadata brain
-    stmt = select(Asset)
-    result = await db.execute(stmt)
-    all_assets = result.scalars().all()
-    for asset in all_assets:
-        if asset.layer == rel_path:
-            asset.layer = dest_rel_path
-            asset.storage_uri = asset.storage_uri.replace(f"/{rel_path}/", f"/{dest_rel_path}/")
-        elif asset.layer.startswith(f"{rel_path}/"):
-            sub_part = asset.layer[len(rel_path):]
-            asset.layer = f"{dest_rel_path}{sub_part}"
-            asset.storage_uri = asset.storage_uri.replace(f"/{rel_path}/", f"/{dest_rel_path}/")
+    # Catalog rows carry the layer path inside their fqn, so the three move together.
+    stmt = select(CatalogObject).where(
+        or_(
+            CatalogObject.layer_path == rel_path,
+            CatalogObject.layer_path.like(f"{rel_path}/%"),
+            CatalogObject.layer_path.like(f"{rel_path}.%"),
+        )
+    )
+    for obj in (await db.execute(stmt)).scalars().all():
+        obj.layer_path = dest_rel_path + obj.layer_path[len(rel_path):]
+        obj.location = (obj.location or "").replace(f"/{rel_path}/", f"/{dest_rel_path}/")
+        obj.fqn = f"lakehouse.{obj.layer_path}.{obj.name}"
     await db.commit()
 
     invalidate_catalog_cache()
@@ -620,13 +620,16 @@ async def delete_lakehouse_directory(
             detail=f"Directory '{rel_path}' contains {len(parquet_files)} Parquet table(s). Confirm deletion to remove directory and its tables."
         )
 
-    # Delete matching assets from SQLite brain
-    stmt = select(Asset)
-    result = await db.execute(stmt)
-    all_assets = result.scalars().all()
-    for asset in all_assets:
-        if asset.layer == rel_path or asset.layer.startswith(f"{rel_path}/"):
-            await db.delete(asset)
+    # One statement instead of listing rows and deleting them one at a time.
+    await db.execute(
+        delete(CatalogObject).where(
+            or_(
+                CatalogObject.layer_path == rel_path,
+                CatalogObject.layer_path.like(f"{rel_path}/%"),
+                CatalogObject.layer_path.like(f"{rel_path}.%"),
+            )
+        )
+    )
     await db.commit()
 
     await asyncio.to_thread(shutil.rmtree, target_dir, True)
@@ -666,15 +669,20 @@ async def rename_lakehouse_table(
             detail=f"Table '{new_name}' already exists in folder '{clean_folder}'."
         )
 
-    old_file.rename(new_file)
+    await asyncio.to_thread(old_file.rename, new_file)
 
-    # Update metadata brain
-    stmt = select(Asset).where(Asset.name == old_name, Asset.layer == _layer_for_folder(clean_folder))
-    result = await db.execute(stmt)
-    asset = result.scalar_one_or_none()
-    if asset:
-        asset.name = new_name
-        asset.storage_uri = asset.storage_uri.replace(f"{old_name}.parquet", f"{new_name}.parquet")
+    # fqn carries the table name, so renaming has to move it as well.
+    stmt = select(CatalogObject).where(
+        CatalogObject.name == old_name,
+        CatalogObject.layer_path == _layer_for_folder(clean_folder),
+    )
+    obj = (await db.execute(stmt)).scalars().first()
+    if obj:
+        obj.name = new_name
+        obj.fqn = f"lakehouse.{obj.layer_path}.{new_name}"
+        obj.location = (obj.location or "").replace(
+            f"{old_name}.parquet", f"{new_name}.parquet"
+        )
         await db.commit()
 
     invalidate_catalog_cache()
@@ -696,13 +704,14 @@ async def delete_lakehouse_table(
     if table_file.exists():
         await asyncio.to_thread(table_file.unlink)
 
-    # Clean from SQLite
-    stmt = select(Asset).where(Asset.name == clean_name, Asset.layer == _layer_for_folder(clean_folder))
-    result = await db.execute(stmt)
-    asset = result.scalar_one_or_none()
-    if asset:
-        await db.delete(asset)
-        await db.commit()
+    # Clean from the catalog
+    await db.execute(
+        delete(CatalogObject).where(
+            CatalogObject.name == clean_name,
+            CatalogObject.layer_path == _layer_for_folder(clean_folder),
+        )
+    )
+    await db.commit()
 
     invalidate_catalog_cache()
     return {"status": "deleted", "folder": clean_folder, "name": clean_name}
@@ -736,13 +745,18 @@ async def move_lakehouse_table(
 
     await asyncio.to_thread(shutil.move, src_file, dst_file)
 
-    # Update metadata brain
-    stmt = select(Asset).where(Asset.name == table_name, Asset.layer == _layer_for_folder(src_folder))
-    result = await db.execute(stmt)
-    asset = result.scalar_one_or_none()
-    if asset:
-        asset.layer = dst_folder
-        asset.storage_uri = asset.storage_uri.replace(f"/{src_folder}/", f"/{dst_folder}/")
+    # Update the registry row: layer path, fqn and location all follow the file.
+    stmt = select(CatalogObject).where(
+        CatalogObject.name == table_name,
+        CatalogObject.layer_path == _layer_for_folder(src_folder),
+    )
+    obj = (await db.execute(stmt)).scalars().first()
+    if obj:
+        obj.layer_path = dst_folder
+        obj.fqn = f"lakehouse.{dst_folder}.{table_name}"
+        obj.location = (obj.location or "").replace(
+            f"/{src_folder}/", f"/{dst_folder}/"
+        )
         await db.commit()
 
     invalidate_catalog_cache()
@@ -960,19 +974,22 @@ async def get_table_preview(
         )
     table_name = _stem
 
-    # 1. Lakehouse Parquet preview. A tier identifier is either a layer path or a
-    # folder that predates layers; both resolve to a directory the same way.
+    # 1. Lakehouse Parquet preview. A tier identifier is either a layer path (dots
+    # allowed, resolved through the tree) or a plain folder that predates layers.
     lakehouse_root = settings.lakehouse_root_path
     raw_tier = source_id.split(":", 1)[1] if source_id.startswith("lakehouse:") else source_id
     is_root = raw_tier in ("root", "main", "", "lakehouse")
-    clean_tier = "" if is_root else _clean_lakehouse_path(raw_tier)
 
     tier_dir: Optional[Path] = None
-    if not is_root:
-        layer_path = find_layer_path(clean_tier)
-        if layer_path:
-            tier_dir = resolve_layer(layer_path).filesystem_dir
-        elif (lakehouse_root / clean_tier).is_dir():
+    if is_root:
+        clean_tier = ""
+    elif find_layer_path(raw_tier):
+        # A layer path may contain dots, which a folder name may not.
+        clean_tier = raw_tier
+        tier_dir = resolve_layer(raw_tier).filesystem_dir
+    else:
+        clean_tier = _clean_lakehouse_path(raw_tier)
+        if (lakehouse_root / clean_tier).is_dir():
             tier_dir = lakehouse_root / clean_tier
 
     if (

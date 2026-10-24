@@ -87,25 +87,28 @@ def test_catalog_records_the_layer_each_folder_targets() -> None:
     dbt_runner._catalog_dbt_models()
 
     with sqlite3.connect(settings.sqlite_db_path) as con:
-        rows = {
-            name: (layer, uri)
-            for name, layer, uri in con.execute(
-                "SELECT name, layer, storage_uri FROM assets"
+        # Rows for older layer names may still exist from earlier runs; assert the pair
+        # this run wrote rather than assuming it is the only one.
+        pairs = set(
+            con.execute(
+                "SELECT name, layer_path, location FROM catalog_objects"
                 " WHERE name IN ('stg_orders', 'fct_revenue')"
             )
-        }
+        )
 
     staging_schema = resolve_layer(targets["staging"]).warehouse_schema
     marts_schema = resolve_layer(targets["marts"]).warehouse_schema
 
-    assert rows["stg_orders"] == (
+    assert (
+        "stg_orders",
         targets["staging"],
         f"postgresql:///{staging_schema}.stg_orders",
-    )
-    assert rows["fct_revenue"] == (
+    ) in pairs
+    assert (
+        "fct_revenue",
         targets["marts"],
         f"postgresql:///{marts_schema}.fct_revenue",
-    )
+    ) in pairs
 
 
 def test_dotted_layer_paths_resolve_to_a_flat_schema() -> None:

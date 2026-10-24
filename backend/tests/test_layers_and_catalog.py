@@ -198,6 +198,10 @@ def test_migrations_are_idempotent_and_reversible(tmp_path: Path) -> None:
         assert "driver" in {
             r[1] for r in con.execute("PRAGMA table_info(connections)")
         }
+        # The catalog is the table now; the old name is a projection of it.
+        assert con.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'assets'"
+        ).fetchone()[0] == "view"
 
     command.downgrade(cfg, "0001_baseline")
     with sqlite3.connect(db) as con:
@@ -205,8 +209,13 @@ def test_migrations_are_idempotent_and_reversible(tmp_path: Path) -> None:
             r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         connection_columns = {r[1] for r in con.execute("PRAGMA table_info(connections)")}
+        assets_kind = con.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'assets'"
+        ).fetchone()[0]
     assert "catalog_objects" not in tables and "layers" not in tables
     assert "assets" in tables
+    # 0008 rolled back into a table, so the pre-catalog schema is intact.
+    assert assets_kind == "table"
     # 0003 rolled back cleanly as well (SQLite needs batch mode for DROP COLUMN).
     assert "driver" not in connection_columns
 
@@ -446,7 +455,7 @@ def test_ingest_writes_one_catalog_object_per_fqn() -> None:
     finally:
         with sqlite3.connect(settings.sqlite_db_path) as con:
             con.execute("DELETE FROM catalog_objects WHERE fqn = ?", (fqn,))
-            con.execute("DELETE FROM assets WHERE name = ? AND layer = ?", (name, layer))
+            con.execute("DELETE FROM catalog_objects WHERE name = ? AND layer_path = ?", (name, layer))
             # Ingest creates the layer it lands in; drop the probe one again.
             con.execute("DELETE FROM layers WHERE path = ?", (layer,))
             con.commit()

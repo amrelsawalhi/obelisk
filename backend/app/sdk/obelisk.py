@@ -403,18 +403,6 @@ def save(df: Any, target: str, sync_postgres: Optional[bool] = None) -> Dict[str
             cur.execute("PRAGMA journal_mode=WAL;")
             cur.execute(
                 """
-                INSERT INTO assets (id, name, layer, storage_uri, format, record_count, schema_metadata, created_at, last_materialized_at)
-                VALUES (?, ?, ?, ?, 'parquet', ?, ?, ?, ?)
-                ON CONFLICT(layer, name) DO UPDATE SET
-                    storage_uri=excluded.storage_uri,
-                    record_count=excluded.record_count,
-                    schema_metadata=excluded.schema_metadata,
-                    last_materialized_at=excluded.last_materialized_at;
-                """,
-                (asset_id, stem, layer, asset_storage_uri, num_rows, json.dumps(schema_meta), now_iso, now_iso),
-            )
-            cur.execute(
-                """
                 INSERT INTO catalog_objects (
                     id, fqn, name, layer_path, kind, backend, location,
                     schema_json, row_count, version, created_at, last_materialized_at

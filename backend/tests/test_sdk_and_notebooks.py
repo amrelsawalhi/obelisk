@@ -110,7 +110,7 @@ def test_obelisk_save_and_catalog():
     if target_file.exists():
         target_file.unlink(missing_ok=True)
     with sqlite3.connect(db_path) as conn:
-        conn.execute("DELETE FROM assets WHERE name = ?;", (gold_stem,))
+        conn.execute("DELETE FROM catalog_objects WHERE name = ?;", (gold_stem,))
         conn.commit()
 
 

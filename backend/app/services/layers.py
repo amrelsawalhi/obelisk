@@ -92,9 +92,9 @@ def reconcile_layers_from_assets() -> int:
         with sqlite3.connect(settings.sqlite_db_path, timeout=10.0) as conn:
             conn.execute("PRAGMA busy_timeout=15000;")
             rows = conn.execute(
-                "SELECT DISTINCT layer FROM assets"
-                " WHERE layer IS NOT NULL AND TRIM(layer) <> ''"
-                "   AND layer NOT IN (SELECT path FROM layers)"
+                "SELECT DISTINCT layer_path FROM catalog_objects"
+                " WHERE layer_path IS NOT NULL AND TRIM(layer_path) <> ''"
+                "   AND layer_path NOT IN (SELECT path FROM layers)"
             ).fetchall()
     except sqlite3.Error as exc:
         logger.warning("Could not reconcile layers from the catalog: %s", exc)
