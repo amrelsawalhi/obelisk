@@ -605,7 +605,14 @@ export interface SaveQueryTabPayload {
 // Pipeline Orchestrator
 // ==========================================
 
-export type StepType = 'dbt_run' | 'dbt_test' | 'script' | 'notebook' | 'webhook' | 'raw_sql';
+export type StepType =
+  | 'dbt_run'
+  | 'dbt_test'
+  | 'script'
+  | 'notebook'
+  | 'webhook'
+  | 'raw_sql'
+  | 'pipeline';
 export type EdgeCondition = 'success' | 'failure' | 'completion' | 'skipped';
 export type OverlapPolicy = 'skip' | 'queue' | 'kill';
 export type ExecutionStatus =
@@ -696,6 +703,17 @@ export interface PipelineExecution {
   duration_seconds: number | null;
   error: string | null;
   step_counts: Record<string, number>;
+  /** Set when a pipeline step in another pipeline started this run. */
+  parent_run_id?: string | null;
+  parent_step_run_id?: string | null;
+  parent?: PipelineParent | null;
+}
+
+export interface PipelineParent {
+  run_id: string;
+  pipeline_id?: string;
+  pipeline_name: string | null;
+  step_name: string | null;
 }
 
 export interface StepOutputValue {

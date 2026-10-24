@@ -29,6 +29,7 @@ import {
   NotebookPen,
   Play,
   Plus,
+  Workflow,
 } from 'lucide-react';
 import type {
   EdgeCondition,
@@ -61,6 +62,7 @@ const STEP_ICONS: Record<StepType, React.ElementType> = {
   notebook: NotebookPen,
   webhook: Globe,
   raw_sql: Database,
+  pipeline: Workflow,
 };
 
 const STEP_LABELS: Record<StepType, string> = {
@@ -70,6 +72,7 @@ const STEP_LABELS: Record<StepType, string> = {
   notebook: 'Notebook',
   webhook: 'Webhook',
   raw_sql: 'Raw SQL',
+  pipeline: 'Pipeline run',
 };
 
 const STATUS_STYLES: Record<

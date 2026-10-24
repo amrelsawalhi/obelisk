@@ -59,6 +59,7 @@ const STEP_TEMPLATES: Array<{ type: StepType; name: string; target: string }> = 
   { type: 'notebook', name: 'Notebook', target: '' },
   { type: 'raw_sql', name: 'SQL', target: 'SELECT 1 AS ok' },
   { type: 'webhook', name: 'Webhook', target: '' },
+  { type: 'pipeline', name: 'Pipeline run', target: '' },
 ];
 
 const TERMINAL: ExecutionStatus[] = ['success', 'failed', 'cancelled', 'interrupted', 'skipped'];
@@ -793,6 +794,19 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
               {monitorActive && <Loader2 className="mr-1 inline h-2.5 w-2.5 animate-spin" />}
               {runningLabel}
             </span>
+            {monitor?.parent?.pipeline_name && (
+              <button
+                type="button"
+                onClick={() =>
+                  monitor.parent?.pipeline_id && setSelectedId(monitor.parent.pipeline_id)
+                }
+                className="shrink-0 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                title="Open the pipeline that started this run"
+              >
+                Started by {monitor.parent.pipeline_name}
+                {monitor.parent.step_name ? ` ? ${monitor.parent.step_name}` : ""}
+              </button>
+            )}
             {dirty && (
               <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase text-amber-700">
                 Unsaved
@@ -1077,6 +1091,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     stepRun={selectedStepRun}
                     editable={!watching}
                     targets={targets}
+                    pipelines={pipelines.filter((item) => item.id !== detail.id)}
                     parents={selectedStepKey ? parentsByStep[selectedStepKey] ?? [] : []}
                     connections={connections}
                     onEditEdge={(from, to) => setEdgeDialog({ from, to, existing: true })}

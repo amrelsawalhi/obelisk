@@ -298,6 +298,7 @@ async def test_targets_lists_real_workspace_files():
             "script",
             "notebook",
             "webhook",
+            "pipeline",
             "raw_sql",
         }
         assert set(targets["edge_conditions"]) == {

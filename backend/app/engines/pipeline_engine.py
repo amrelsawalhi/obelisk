@@ -57,7 +57,15 @@ TICK_SECONDS = 5
 MAX_DEPENDENCY_WAIT_SECONDS = 24 * 3600
 MAX_LOG_CHARS = 2_000_000
 
-STEP_TYPES = ("dbt_run", "dbt_test", "script", "notebook", "webhook", "raw_sql")
+STEP_TYPES = (
+    "dbt_run",
+    "dbt_test",
+    "script",
+    "notebook",
+    "webhook",
+    "raw_sql",
+    "pipeline",
+)
 EDGE_CONDITIONS = ("success", "failure", "completion", "skipped")
 OVERLAP_POLICIES = ("skip", "queue", "kill")
 
@@ -67,6 +75,9 @@ RUN_TERMINAL = frozenset({"success", "failed", "cancelled", "interrupted", "skip
 
 
 OUTPUT_MAX_CHARS = 4096
+
+# How deep a chain of 'pipeline' steps may nest before we call it a design smell.
+MAX_PIPELINE_DEPTH = 8
 
 # {{steps.<step>.<output>}} in a raw SQL target, {steps.<step>.<output>} in a webhook
 # template. Both are validated at save time against declared outputs and real edges.
@@ -123,6 +134,10 @@ def declared_outputs(step_type: str, args: Dict[str, Any]) -> Dict[str, str]:
         declared.setdefault("rows", "scalar")
     if step_type in ("dbt_run", "dbt_test"):
         declared.setdefault("dbt_summary", "scalar")
+    if step_type == "pipeline":
+        # The child run is the handle a downstream step may want to link to.
+        declared.setdefault("run_id", "scalar")
+        declared.setdefault("status", "scalar")
     return declared
 
 
@@ -1091,7 +1106,7 @@ class PipelineEngine:
             produced = (
                 await self._dispatch(
                     step, step_args, params, pipeline, step_run.id, run.id,
-                    parents, output_path, log, timeout,
+                    parents, output_path, log, timeout, run,
                 )
                 or {}
             )
@@ -1181,6 +1196,7 @@ class PipelineEngine:
         output_path: Path,
         log: List[str],
         timeout: int,
+        run: PipelineRun,
     ) -> Dict[str, Dict[str, Any]]:
         """Runs the step and returns the outputs the engine derived itself."""
         if step.step_type in ("dbt_run", "dbt_test"):
@@ -1199,6 +1215,8 @@ class PipelineEngine:
             await self._run_webhook(step, args, params, parents, log, timeout)
         elif step.step_type == "raw_sql":
             return await self._run_raw_sql(step, args, params, parents, log, timeout)
+        elif step.step_type == "pipeline":
+            return await self._run_pipeline(step, args, parents, log, timeout, run, step_run_id)
         else:
             raise ValueError(f"Unsupported step type '{step.step_type}'.")
         return {}
@@ -1538,6 +1556,128 @@ class PipelineEngine:
         if len(text) <= MAX_LOG_CHARS:
             return text
         return "…[earlier output truncated]…\n" + text[-MAX_LOG_CHARS:]
+
+    async def _run_pipeline(
+        self,
+        step: PipelineStep,
+        args: Dict[str, Any],
+        parents: Dict[str, Dict[str, Dict[str, Any]]],
+        log: List[str],
+        timeout: int,
+        run: PipelineRun,
+        step_run_id: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Runs another pipeline as a step, optionally waiting for it.
+
+        ``wait: true`` makes this a real dependency: the step succeeds only if the child
+        run succeeds, its timeout bounds the wait, and cancelling the parent cancels the
+        child. ``wait: false`` is fire-and-forget chaining, which is what "pipeline B
+        follows pipeline A" means when B has its own schedule.
+        """
+        target_ref = (step.target or "").strip()
+        if not target_ref:
+            raise ValueError("Pipeline step has no target pipeline.")
+        wait = bool(args.get("wait", True))
+
+        async with AsyncSessionLocal() as session:
+            target = await session.get(Pipeline, target_ref)
+            if not target:
+                target = (
+                    await session.execute(
+                        select(Pipeline).where(Pipeline.name == target_ref)
+                    )
+                ).scalars().first()
+            parent = await session.get(Pipeline, run.pipeline_id)
+            depth = await self._run_depth(session, run.id)
+        if not target:
+            raise ValueError(f"Pipeline '{target_ref}' does not exist.")
+        if target.id == run.pipeline_id:
+            raise ValueError(f"Pipeline '{target.name}' cannot run itself.")
+        if depth >= MAX_PIPELINE_DEPTH:
+            raise ValueError(
+                f"Pipeline nesting is deeper than {MAX_PIPELINE_DEPTH} levels; "
+                "flatten the dependency chain."
+            )
+
+        overrides = {
+            key: render_plain_step_refs(value, parents) if isinstance(value, str) else value
+            for key, value in (args.get("params") or {}).items()
+        }
+        parent_label = parent.name if parent else run.pipeline_id
+        child_run_id = await self.run_now(
+            target.id,
+            params=overrides or None,
+            triggered_by=f"pipeline:{parent_label}/{step.name}",
+            kind="manual",
+        )
+        async with AsyncSessionLocal() as session:
+            child = await session.get(PipelineRun, child_run_id)
+            if child:
+                # Lineage is what makes the child's run explain itself.
+                child.parent_run_id = run.id
+                child.parent_step_run_id = step_run_id
+                await session.commit()
+
+        log.append(
+            f"Triggered pipeline '{target.name}' (run {child_run_id[:8]})"
+            + ("" if wait else "; not waiting for it")
+        )
+        produced: Dict[str, Dict[str, Any]] = {
+            "run_id": {"type": "scalar", "value": child_run_id}
+        }
+        if not wait:
+            produced["status"] = {"type": "scalar", "value": "started"}
+            return produced
+
+        deadline = time.monotonic() + timeout
+        status = "pending"
+        child_error: Optional[str] = None
+        announced = None
+        while True:
+            if run.id in self._cancel_runs:
+                await self.cancel_run(child_run_id)
+                raise StepCancelled()
+            async with AsyncSessionLocal() as session:
+                child = await session.get(PipelineRun, child_run_id)
+                if child is None:
+                    raise RuntimeError(f"Run {child_run_id[:8]} disappeared.")
+                status = child.status
+                child_error = child.error
+            if status != announced:
+                announced = status
+                log.append(f"[{utcnow().strftime('%H:%M:%S')}] child pipeline: {status}")
+            if status in RUN_TERMINAL:
+                break
+            if time.monotonic() > deadline:
+                # A thread cannot be killed and neither can a run; cancel the child so
+                # it does not outlive the step that asked for it.
+                await self.cancel_run(child_run_id)
+                raise asyncio.TimeoutError()
+            await asyncio.sleep(1.0)
+
+        produced["status"] = {"type": "scalar", "value": status}
+        if status != "success":
+            detail = f": {child_error}" if child_error else ""
+            raise RuntimeError(
+                f"Pipeline '{target.name}' finished as {status}{detail}"
+            )
+        return produced
+
+    @staticmethod
+    async def _run_depth(session, run_id: str) -> int:
+        """How many pipelines deep this run already is (0 for a root run)."""
+        depth = 0
+        current: Optional[str] = run_id
+        seen: set = set()
+        while current and depth < MAX_PIPELINE_DEPTH + 2:
+            if current in seen:
+                break
+            seen.add(current)
+            parent_run = await session.get(PipelineRun, current)
+            current = parent_run.parent_run_id if parent_run else None
+            if current:
+                depth += 1
+        return depth
 
     # ------------------------------------------------------------- outputs
 

@@ -478,6 +478,67 @@ class Verifier:
             "/api/lakehouse/tables", params={"folder": "bronze", "name": table_name}
         )
 
+    def check_pipeline_dependencies(self) -> None:
+        """A pipeline step runs another pipeline and records lineage."""
+        child = self.create(
+            {
+                "name": "Demo - child run",
+                "description": "Runs one query.",
+                "cron_expression": "0 8 * * *",
+                "timezone": "UTC",
+                "is_enabled": False,
+                "graph": {
+                    "steps": [step("q", "query", "raw_sql", "select 1 as n", x=40, y=120)],
+                    "edges": [],
+                    "params": [],
+                },
+            }
+        )
+        if not child:
+            return
+        parent = self.create(
+            {
+                "name": "Demo - parent run",
+                "description": "Runs the child pipeline and waits.",
+                "cron_expression": "0 9 * * *",
+                "timezone": "UTC",
+                "is_enabled": False,
+                "graph": {
+                    "steps": [
+                        step("run", "run child", "pipeline", child["id"], x=40, y=120),
+                    ],
+                    "edges": [],
+                    "params": [],
+                },
+            }
+        )
+        if not parent:
+            return
+        run = self.run(parent["id"])
+        if not run:
+            return
+        steps = self.by_name(run)
+        detail = self.client.get(f"/api/pipeline-runs/{run['id']}").json()
+        outputs = (detail["step_runs"][0].get("outputs") or {})
+        child_run_id = (outputs.get("run_id") or {}).get("value")
+        child_run = (
+            self.client.get(f"/api/pipeline-runs/{child_run_id}").json()
+            if child_run_id
+            else {}
+        )
+        self.report.add(
+            "a pipeline step ran another pipeline and waited",
+            steps["run child"]["status"] == "success"
+            and (outputs.get("status") or {}).get("value") == "success",
+            f"step={steps['run child']['status']}",
+        )
+        self.report.add(
+            "the child run records which pipeline and step started it",
+            child_run.get("parent_run_id") == run["id"]
+            and (child_run.get("parent") or {}).get("step_name") == "run child",
+            str(child_run.get("parent")),
+        )
+
     def check_schedule_and_history(self, pipeline_id: str) -> None:
         preview = self.client.get(
             "/api/pipelines/preview",
@@ -555,6 +616,7 @@ class Verifier:
         self.check_params_and_retries()
         self.check_dbt_pipeline()
         self.check_materialize_and_outputs()
+        self.check_pipeline_dependencies()
 
         pipelines = self.client.get("/api/pipelines").json()
         etl = next((p for p in pipelines if p["name"] == "Demo · lakehouse ETL"), None)

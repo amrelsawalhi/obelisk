@@ -13,6 +13,7 @@ import {
 import type {
   EdgeCondition,
   PipelineStepDef,
+  PipelineSummary,
   PipelineTargets,
   StepRunItem,
   StepType,
@@ -27,6 +28,7 @@ const TYPE_OPTIONS: StepType[] = [
   'notebook',
   'webhook',
   'raw_sql',
+  'pipeline',
 ];
 
 interface PipelineInspectorProps {
@@ -35,6 +37,8 @@ interface PipelineInspectorProps {
   stepRun?: StepRunItem | null;
   editable: boolean;
   targets: PipelineTargets | null;
+  /** Offered as targets for a 'pipeline' step (this pipeline excluded). */
+  pipelines?: PipelineSummary[];
   /** Names of the direct parents, used to suggest the tokens this step may read. */
   parents?: string[];
   /** Edges touching this step, so they can be re-conditioned or removed here. */
@@ -140,6 +144,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
   stepRun,
   editable,
   targets,
+  pipelines,
   parents,
   connections,
   onEditEdge,
@@ -217,6 +222,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
   const isProcess = step.step_type === "script" || step.step_type === "notebook";
   const style = statusStyle(runtime?.status);
 
+  const isPipeline = step.step_type === "pipeline";
   const targetOptions =
     step.step_type === "script"
       ? targets?.scripts ?? []
@@ -225,6 +231,11 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
         : isDbt
           ? ["*", ...(targets?.dbt_directories ?? []), ...(targets?.dbt_models ?? [])]
           : [];
+  const pipelineOptions = (pipelines ?? []).map((pipeline) => ({
+    id: pipeline.id,
+    label: `${pipeline.name}${pipeline.is_enabled ? " (scheduled)" : ""}`,
+    enabled: pipeline.is_enabled,
+  }));
 
   const available = [
     ...Object.entries(declared).map(([name, spec]) => ({
@@ -297,7 +308,24 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                       : "File name inside git_repo/"
               }
             >
-              {isRawSql ? (
+              {isPipeline ? (
+                <select
+                  className={inputClass}
+                  value={step.target}
+                  onChange={(event) => onChange({ target: event.target.value })}
+                >
+                  <option value="">Choose a pipeline?</option>
+                  {!pipelineOptions.some((option) => option.id === step.target) &&
+                    step.target && (
+                      <option value={step.target}>{step.target} (missing)</option>
+                    )}
+                  {pipelineOptions.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : isRawSql ? (
                 <textarea
                   ref={targetRef}
                   className={`${inputClass} h-32 font-mono`}
@@ -327,6 +355,24 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                 />
               )}
             </Field>
+
+            {isPipeline && (
+              <div className="space-y-1 rounded-lg bg-slate-50 px-2 py-1.5">
+                <label className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={args.wait !== false}
+                    onChange={(event) => setArgs({ wait: event.target.checked })}
+                  />
+                  Wait for the child run
+                </label>
+                <p className="text-[10px] leading-snug text-slate-500">
+                  {args.wait === false
+                    ? "Starts it and moves on: its failures will not reach this pipeline."
+                    : "This step succeeds only if the child run succeeds; cancelling here cancels there."}
+                </p>
+              </div>
+            )}
 
             {step.step_type === "webhook" && (
               <Field label="Request body (JSON)" hint="Use {param} placeholders for parameters.">

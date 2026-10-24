@@ -27,6 +27,7 @@ from sqlalchemy import delete, func, select
 from app.database import AsyncSessionLocal
 from app.engines.pipeline_engine import (
     EDGE_CONDITIONS,
+    MAX_PIPELINE_DEPTH,
     OVERLAP_POLICIES,
     RUN_ACTIVE,
     RUN_TERMINAL,
@@ -187,7 +188,107 @@ def _iter_refs(text: str):
                 yield pair
 
 
-def _validate_graph(graph: GraphIn) -> None:
+async def _validate_pipeline_dependencies(
+    steps: List[StepIn],
+    names_by_key: Dict[str, str],
+    pipeline_id: Optional[str],
+) -> None:
+    """Checks 'pipeline' steps against the rest of the workspace.
+
+    Three failures are caught here, all of them cheap to make and expensive to debug at
+    run time: a target that does not exist, parameters the child never declared, and a
+    dependency cycle (A runs B runs A) or a chain deep enough to be a design mistake.
+    """
+    if not steps:
+        return
+    async with AsyncSessionLocal() as session:
+        pipelines = (await session.execute(select(Pipeline))).scalars().all()
+        existing = (
+            await session.execute(
+                select(PipelineStep).where(PipelineStep.step_type == "pipeline")
+            )
+        ).scalars().all()
+        params = (await session.execute(select(PipelineParam))).scalars().all()
+
+    by_id = {row.id: row for row in pipelines}
+    by_name = {row.name: row for row in pipelines}
+    declared_params: Dict[str, set] = {}
+    for param in params:
+        declared_params.setdefault(param.pipeline_id, set()).add(param.name)
+
+    def resolve(ref: str):
+        ref = (ref or "").strip()
+        return by_id.get(ref) or by_name.get(ref)
+
+    targets: Dict[str, str] = {}
+    for step in steps:
+        label = names_by_key.get(step.key, step.key)
+        target = resolve(step.target)
+        if target is None:
+            raise _invalid(
+                f"Step '{label}' runs pipeline '{step.target}', which does not exist.",
+                steps=[step.key],
+            )
+        if pipeline_id and target.id == pipeline_id:
+            raise _invalid(
+                f"Step '{label}' makes this pipeline run itself.", steps=[step.key]
+            )
+        provided = set((step.args or {}).get("params") or {})
+        unknown = provided - declared_params.get(target.id, set())
+        if unknown:
+            raise _invalid(
+                f"Step '{label}' passes {', '.join(sorted(unknown))} to '{target.name}', "
+                "which declares no such parameter.",
+                steps=[step.key],
+            )
+        targets[step.key] = target.id
+
+    # Pipeline → pipeline edges, from the saved workspace plus this candidate graph.
+    edges: Dict[str, List[str]] = {}
+    for row in existing:
+        resolved = resolve(row.target or "")
+        if resolved:
+            edges.setdefault(row.pipeline_id, []).append(resolved.id)
+    if pipeline_id:
+        edges[pipeline_id] = [targets[step.key] for step in steps]
+
+    start = pipeline_id or next(iter(targets.values()))
+    if pipeline_id:
+        path: List[str] = []
+
+        def visit(node: str) -> None:
+            if node in path:
+                cycle = path[path.index(node):] + [node]
+                raise _invalid(
+                    "Pipeline dependency cycle: "
+                    + " -> ".join(by_id[n].name for n in cycle)
+                    + ".",
+                    steps=[step.key for step in steps if targets.get(step.key) in cycle],
+                )
+            path.append(node)
+            for child in edges.get(node, []):
+                visit(child)
+            path.pop()
+
+        visit(start)
+
+    def longest(node: str, seen: set) -> int:
+        if node in seen:
+            return 0
+        children = edges.get(node, [])
+        if not children:
+            return 1
+        return 1 + max(longest(child, seen | {node}) for child in children)
+
+    if longest(start, set()) > MAX_PIPELINE_DEPTH:
+        raise _invalid(
+            f"This dependency chain is deeper than {MAX_PIPELINE_DEPTH} pipelines; "
+            "flatten it or run the pieces on their own schedules.",
+            steps=[step.key for step in steps],
+        )
+
+
+async def _validate_graph(graph: GraphIn, pipeline_id: Optional[str] = None) -> None:
     """Rejects everything the engine could not execute, naming what is wrong."""
     if not graph.steps:
         raise _invalid("A pipeline needs at least one step.")
@@ -218,7 +319,7 @@ def _validate_graph(graph: GraphIn) -> None:
                 f"Expected one of {', '.join(STEP_TYPES)}.",
                 steps=[step.key],
             )
-        if step.step_type in ("script", "notebook", "webhook", "raw_sql") and not (
+        if step.step_type in ("script", "notebook", "webhook", "raw_sql", "pipeline") and not (
             step.target or ""
         ).strip():
             raise _invalid(
@@ -387,6 +488,14 @@ def _validate_graph(graph: GraphIn) -> None:
                     steps=[step.key, ref_key],
                 )
 
+    # 'pipeline' steps depend on other pipelines, so their targets live outside
+    # this graph and have to be checked against the workspace.
+    await _validate_pipeline_dependencies(
+        [step for step in graph.steps if step.step_type == 'pipeline'],
+        names_by_key,
+        pipeline_id,
+    )
+
 
 
 # ---------------------------------------------------------------- serializing
@@ -450,6 +559,28 @@ def _pipeline_out(
     }
 
 
+async def _parent_lineage(session, run: PipelineRun) -> Optional[Dict[str, Any]]:
+    """The run and step that started this one, if a pipeline step did."""
+    if not run.parent_run_id:
+        return None
+    parent = await session.get(PipelineRun, run.parent_run_id)
+    if not parent:
+        return {"run_id": run.parent_run_id, "pipeline_name": None, "step_name": None}
+    parent_pipeline = await session.get(Pipeline, parent.pipeline_id)
+    step_name = None
+    if run.parent_step_run_id:
+        step_run = await session.get(StepRun, run.parent_step_run_id)
+        if step_run:
+            step = await session.get(PipelineStep, step_run.step_id)
+            step_name = step.name if step else None
+    return {
+        "run_id": parent.id,
+        "pipeline_id": parent.pipeline_id,
+        "pipeline_name": parent_pipeline.name if parent_pipeline else None,
+        "step_name": step_name,
+    }
+
+
 def _run_out(
     run: PipelineRun,
     pipeline_name: Optional[str] = None,
@@ -469,6 +600,8 @@ def _run_out(
         "duration_seconds": run.duration_seconds,
         "error": run.error,
         "step_counts": step_counts or {},
+        "parent_run_id": run.parent_run_id,
+        "parent_step_run_id": run.parent_step_run_id,
     }
 
 
@@ -509,7 +642,7 @@ async def _replace_graph(session, pipeline: Pipeline, graph: GraphIn) -> None:
     earlier runs still resolve to a name. Steps that disappear leave their history
     behind as ``(deleted step)`` rather than cascading into old runs.
     """
-    _validate_graph(graph)
+    await _validate_graph(graph, pipeline.id)
 
     await session.execute(delete(PipelineEdge).where(PipelineEdge.pipeline_id == pipeline.id))
     old_steps = (
@@ -1017,6 +1150,9 @@ async def get_run(run_id: str):
             _step_run_out(sr, step_names.get(sr.step_id), include_logs=False)
             for sr in step_runs
         ]
+        # A run started by a pipeline step explains itself: which pipeline, which
+        # step. Without this the child looks like a manual trigger.
+        payload["parent"] = await _parent_lineage(session, run)
         return payload
 
 

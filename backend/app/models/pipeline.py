@@ -141,6 +141,11 @@ class PipelineRun(Base):
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Lineage for a run started by a 'pipeline' step in another pipeline.
+    parent_run_id: Mapped[Optional[str]] = mapped_column(
+        String(36), nullable=True, index=True
+    )
+    parent_step_run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
 
 class StepRun(Base):
