@@ -122,6 +122,16 @@ class PipelinePatch(BaseModel):
     auto_rerun_interrupted: Optional[bool] = None
 
 
+class LayoutStep(BaseModel):
+    key: str
+    x: float
+    y: float
+
+
+class LayoutRequest(BaseModel):
+    positions: List[LayoutStep]
+
+
 class RunNowRequest(BaseModel):
     params: Optional[Dict[str, Any]] = None
 
@@ -1026,6 +1036,37 @@ async def run_pipeline_now(pipeline_id: str, req: Optional[RunNowRequest] = None
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"run_id": run_id, "pipeline_id": pipeline_id, "status": "pending"}
+
+
+@router.put("/pipelines/{pipeline_id}/layout")
+async def save_layout(pipeline_id: str, req: LayoutRequest):
+    """Persists node positions on their own.
+
+    Where a node sits is presentation, not structure: it needs no graph validation and
+    it should not require the operator to press Save. Dragging a node and arranging the
+    graph therefore write here directly, while the graph PUT stays for real edits.
+    """
+    async with AsyncSessionLocal() as session:
+        pipeline = await session.get(Pipeline, pipeline_id)
+        if not pipeline:
+            raise HTTPException(status_code=404, detail="Pipeline not found.")
+        steps = (
+            await session.execute(
+                select(PipelineStep).where(PipelineStep.pipeline_id == pipeline_id)
+            )
+        ).scalars().all()
+        by_key = {step.id: step for step in steps}
+        updated = 0
+        for entry in req.positions:
+            step = by_key.get(entry.key)
+            if not step:
+                # A stale node id is not worth failing a layout save over.
+                continue
+            step.position_x = entry.x
+            step.position_y = entry.y
+            updated += 1
+        await session.commit()
+        return {"status": "updated", "updated": updated}
 
 
 @router.post("/pipelines/{pipeline_id}/toggle")

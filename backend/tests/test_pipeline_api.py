@@ -308,3 +308,51 @@ async def test_targets_lists_real_workspace_files():
             "skipped",
         }
 
+
+
+
+@pytest.mark.asyncio
+async def test_node_positions_save_without_touching_the_graph():
+    """Layout is presentation: it persists on its own, with no validation in the way."""
+    async with _client() as client:
+        created = (
+            await client.post(
+                "/api/pipelines",
+                json={
+                    "name": f"layout-{uuid.uuid4().hex[:6]}",
+                    "graph": _graph([_step("a", "one"), _step("b", "two")]),
+                },
+            )
+        ).json()
+
+        # Keys are the row ids the API hands back, which is what the canvas sends.
+        initial = (await client.get(f"/api/pipelines/{created['id']}")).json()
+        first, second = initial["steps"][0]["key"], initial["steps"][1]["key"]
+
+        moved = await client.put(
+            f"/api/pipelines/{created['id']}/layout",
+            json={
+                "positions": [
+                    {"key": first, "x": 100, "y": 40},
+                    {"key": second, "x": 500, "y": 40},
+                    {"key": "ghost", "x": 9, "y": 9},
+                ]
+            },
+        )
+        assert moved.status_code == 200
+        assert moved.json()["updated"] == 2
+
+        detail = (await client.get(f"/api/pipelines/{created['id']}")).json()
+        positions = {step["key"]: (step["position_x"], step["position_y"]) for step in detail["steps"]}
+        assert positions == {first: (100, 40), second: (500, 40)}
+        # The graph itself is untouched, so nothing is marked as needing a save.
+        assert len(detail["steps"]) == 2
+        assert detail["edges"] == []
+
+        missing = await client.put(
+            "/api/pipelines/does-not-exist/layout",
+            json={"positions": [{"key": "a", "x": 1, "y": 1}]},
+        )
+        assert missing.status_code == 404
+
+        await client.delete(f"/api/pipelines/{created['id']}")

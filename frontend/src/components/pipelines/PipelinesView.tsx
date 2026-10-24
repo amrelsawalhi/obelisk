@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ChevronRight,
@@ -222,8 +222,6 @@ const graphSignature = (state: DraftState): string =>
       timeout_seconds: step.timeout_seconds,
       max_retries: step.max_retries,
       retry_delay_seconds: step.retry_delay_seconds,
-      position_x: step.position_x,
-      position_y: step.position_y,
     })),
     edges: [...state.edges]
       .map((edge) => `${edge.from_key}->${edge.to_key}:${edge.condition}`)
@@ -301,6 +299,29 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
   });
 
   // ------------------------------------------------------------------ derived
+
+  const layoutTimer = useRef<number | null>(null);
+
+  const persistLayout = useCallback(
+    (steps: PipelineStepDef[], immediate = false) => {
+      if (!detail) return;
+      const pipelineId = detail.id;
+      const payload = steps.map((step) => ({
+        key: step.key,
+        x: step.position_x,
+        y: step.position_y,
+      }));
+      if (layoutTimer.current) window.clearTimeout(layoutTimer.current);
+      const send = () => {
+        api.savePipelineLayout(pipelineId, payload).catch(() => {
+          /* a lost position is not worth interrupting the operator */
+        });
+      };
+      if (immediate) send();
+      else layoutTimer.current = window.setTimeout(send, 500);
+    },
+    [detail],
+  );
 
   const dirty = useMemo(() => {
     if (!detail) return false;
@@ -409,8 +430,35 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     clearProblems();
     try {
       const data = await api.getPipeline(pipelineId);
+      const loaded = draftFrom(data);
+      // A pipeline created through the API can have every node at the same point; it
+      // would open as one box and read as broken. That is legacy data, not intent, so
+      // lay it out and remember it.
+      const slots = new Set(
+        loaded.steps.map((step) => `${step.position_x}:${step.position_y}`),
+      );
+      if (loaded.steps.length > 1 && slots.size < loaded.steps.length) {
+        const positions = arrangeGraph(loaded.steps, loaded.edges);
+        loaded.steps = loaded.steps.map((step) => ({
+          ...step,
+          position_x: positions[step.key]?.x ?? step.position_x,
+          position_y: positions[step.key]?.y ?? step.position_y,
+        }));
+        void api
+          .savePipelineLayout(
+            pipelineId,
+            loaded.steps.map((step) => ({
+              key: step.key,
+              x: step.position_x,
+              y: step.position_y,
+            })),
+          )
+          .catch(() => {
+            /* the repair is cosmetic; a failed write must not block opening */
+          });
+      }
       setDetail(data);
-      setDraft(draftFrom(data));
+      setDraft(loaded);
       setSelectedStepKey(null);
       setEdgeDialog(null);
       setMonitor(null);
@@ -776,16 +824,15 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     setDraft((current) => {
       if (current.steps.length < 2) return current;
       const positions = arrangeGraph(current.steps, current.edges);
-      return {
-        ...current,
-        steps: current.steps.map((step) => ({
-          ...step,
-          position_x: positions[step.key]?.x ?? step.position_x,
-          position_y: positions[step.key]?.y ?? step.position_y,
-        })),
-      };
+      const steps = current.steps.map((step) => ({
+        ...step,
+        position_x: positions[step.key]?.x ?? step.position_x,
+        position_y: positions[step.key]?.y ?? step.position_y,
+      }));
+      persistLayout(steps, true);
+      return { ...current, steps };
     });
-  }, []);
+  }, [persistLayout]);
 
   const updateStep = (patch: Partial<PipelineStepDef>) => {
     if (!selectedStepKey) return;
@@ -798,12 +845,13 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
   };
 
   const moveStep = (stepKey: string, position: { x: number; y: number }) => {
-    setDraft((current) => ({
-      ...current,
-      steps: current.steps.map((step) =>
+    setDraft((current) => {
+      const steps = current.steps.map((step) =>
         step.key === stepKey ? { ...step, position_x: position.x, position_y: position.y } : step,
-      ),
-    }));
+      );
+      persistLayout(steps);
+      return { ...current, steps };
+    });
   };
 
   const removeStep = (stepKey: string) => {

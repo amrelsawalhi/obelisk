@@ -320,6 +320,18 @@ export const api = {
     );
     return res.data;
   },
+  // Layout is presentation: it saves on its own, without the graph's validation.
+  savePipelineLayout: async (
+    id: string,
+    positions: Array<{ key: string; x: number; y: number }>,
+  ): Promise<{ status: string; updated: number }> => {
+    const res = await apiClient.put<{ status: string; updated: number }>(
+      `/pipelines/${id}/layout`,
+      { positions },
+    );
+    return res.data;
+  },
+
   deletePipeline: async (id: string): Promise<{ status: string; id: string }> => {
     const res = await apiClient.delete<{ status: string; id: string }>(`/pipelines/${id}`);
     return res.data;
