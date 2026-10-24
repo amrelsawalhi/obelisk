@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom';
+import { Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import { Sidebar } from './components/layout/Sidebar';
 import { Header } from './components/layout/Header';
 import { CommandMenu } from './components/layout/CommandMenu';
 import { IngestActivityDock } from './components/layout/IngestActivityDock';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
+import { ViewActivityProvider } from './lib/viewActivity';
 
 import { HomeView } from './components/home/HomeView';
 import { CatalogView } from './components/catalog/CatalogView';
@@ -69,6 +70,25 @@ const AppLayout: React.FC = () => {
   const activeTab: NavigationTab = tabFromPath(location.pathname);
   const [isCommandOpen, setIsCommandOpen] = useState(false);
 
+  // A view mounts on first visit and then stays mounted, so switching tabs is a
+  // visibility change instead of a teardown: unsaved SQL, open dbt tabs, the
+  // selected catalog object and dock sizes all survive. Only visited tabs are
+  // mounted, so the lazy route chunks still load on first use, not at startup.
+  const [mountedTabs, setMountedTabs] = useState<NavigationTab[]>([activeTab]);
+
+  useEffect(() => {
+    setMountedTabs((prev) => (prev.includes(activeTab) ? prev : [...prev, activeTab]));
+  }, [activeTab]);
+
+  // The old <Route path="*"> sent unknown URLs home; keep that behaviour now
+  // that the router is not doing the rendering.
+  useEffect(() => {
+    const clean = location.pathname.replace(/\/+$/, '') || '/';
+    if (!Object.values(TAB_PATHS).includes(clean)) {
+      navigate('/', { replace: true });
+    }
+  }, [location.pathname, navigate]);
+
   const navigateToTab = (tab: NavigationTab) => navigate(TAB_PATHS[tab]);
 
   // Single source of truth for the command palette shortcut (fixes the old
@@ -88,6 +108,45 @@ const AppLayout: React.FC = () => {
 
   const routeState = (location.state ?? {}) as RouteState;
 
+  const renderView = (tab: NavigationTab): React.ReactNode => {
+    switch (tab) {
+      case 'home':
+        return <HomeView onNavigate={navigateToTab} />;
+      case 'catalog':
+        return <CatalogView />;
+      case 'query':
+        return <QueryStudio initialSql={routeState.sql} />;
+      case 'dbt':
+        return <DbtStudio />;
+      case 'notebooks':
+        return (
+          <NotebooksView
+            target={routeState.target ?? null}
+            onClearTarget={() => navigate('/notebooks', { replace: true })}
+          />
+        );
+      case 'pipelines':
+        return (
+          <PipelinesView
+            onOpenInQuery={(sql) => navigate('/query', { state: { sql } })}
+            onNavigateToSettings={() => navigate('/settings')}
+          />
+        );
+      case 'dashboards':
+        return <DashboardsView />;
+      case 'files':
+        return <FileManagerView />;
+      case 'terminal':
+        return <TerminalView />;
+      case 'services':
+        return <ServicesView />;
+      case 'settings':
+        return <SettingsView />;
+      default:
+        return null;
+    }
+  };
+
   return (
     <div className="flex h-screen w-full overflow-hidden bg-white text-slate-900 font-sans antialiased">
       {/* Primary Left Navigation */}
@@ -98,46 +157,32 @@ const AppLayout: React.FC = () => {
         {/* Global Header */}
         <Header activeTab={activeTab} onOpenCommand={() => setIsCommandOpen(true)} />
 
-        {/* Route View */}
+        {/* Mounted views. Inactive ones stay laid out but invisible: `visibility`
+            keeps their real size, so Monaco and xterm come back without a
+            relayout, which `display: none` would force. */}
         <main className="flex-1 flex min-h-0 overflow-hidden relative">
-          <ErrorBoundary key={location.pathname}>
-            <React.Suspense fallback={<RouteFallback />}>
-              <Routes>
-              <Route path="/" element={<ViewShell><HomeView onNavigate={navigateToTab} /></ViewShell>} />
-              <Route path="/catalog" element={<ViewShell><CatalogView /></ViewShell>} />
-              <Route path="/query" element={<ViewShell><QueryStudio initialSql={routeState.sql} /></ViewShell>} />
-              <Route path="/dbt" element={<ViewShell><DbtStudio /></ViewShell>} />
-              <Route
-                path="/notebooks"
-                element={
-                  <ViewShell>
-                    <NotebooksView
-                      target={routeState.target ?? null}
-                      onClearTarget={() => navigate('/notebooks', { replace: true })}
-                    />
-                  </ViewShell>
-                }
-              />
-              <Route
-                path="/pipelines"
-                element={
-                  <ViewShell>
-                    <PipelinesView
-                      onOpenInQuery={(sql) => navigate('/query', { state: { sql } })}
-                      onNavigateToSettings={() => navigate('/settings')}
-                    />
-                  </ViewShell>
-                }
-              />
-              <Route path="/dashboards" element={<ViewShell><DashboardsView /></ViewShell>} />
-              <Route path="/files" element={<ViewShell><FileManagerView /></ViewShell>} />
-              <Route path="/terminal" element={<ViewShell><TerminalView /></ViewShell>} />
-              <Route path="/services" element={<ViewShell><ServicesView /></ViewShell>} />
-              <Route path="/settings" element={<ViewShell><SettingsView /></ViewShell>} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-              </Routes>
-            </React.Suspense>
-          </ErrorBoundary>
+          {mountedTabs.map((tab) => {
+            const isActive = tab === activeTab;
+            return (
+              <div
+                key={tab}
+                aria-hidden={!isActive}
+                className={`absolute inset-0 flex min-h-0 overflow-hidden ${
+                  isActive ? 'z-10 visible' : 'invisible pointer-events-none'
+                }`}
+              >
+                <ViewActivityProvider value={isActive}>
+                  {/* One boundary per view: a crash in one tab cannot take the
+                      others down, and the mounted state of the rest survives. */}
+                  <ErrorBoundary>
+                    <React.Suspense fallback={<RouteFallback />}>
+                      <ViewShell>{renderView(tab)}</ViewShell>
+                    </React.Suspense>
+                  </ErrorBoundary>
+                </ViewActivityProvider>
+              </div>
+            );
+          })}
         </main>
       </div>
 

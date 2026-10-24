@@ -11,7 +11,7 @@ import shutil
 import urllib.request
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import psutil
 
 from app.config import settings
@@ -35,6 +35,11 @@ class MarimoService:
         self.base_url = base_url if base_url.startswith("/") else f"/{base_url}"
         self._process: Optional[subprocess.Popen] = None
         self._started_at: Optional[float] = None
+        # `get_status` is polled by the home dashboard and the notebooks view, and
+        # each call pays a socket probe against a server that is usually off. Short
+        # cache keeps those polls cheap without making a start/stop look stale
+        # (both invalidate it).
+        self._status_cache: Optional[Tuple[float, Dict[str, Any]]] = None
         # Marimo logs continuously. Draining that output into a file instead of an
         # unread PIPE keeps the child from blocking on write() once the ~64 KB pipe
         # buffer fills up, which used to freeze the notebook server.
@@ -60,7 +65,7 @@ class MarimoService:
             return 0
         return max(0, configured)
 
-    def is_running(self) -> bool:
+    def is_running(self, timeout: float = 1.5) -> bool:
         """Checks if process is alive and responds to HTTP probe."""
         if self._process is not None:
             if self._process.poll() is not None:
@@ -69,7 +74,7 @@ class MarimoService:
 
         try:
             req = urllib.request.Request(self.url, headers={"User-Agent": "ObeliskHealthCheck"})
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status in (200, 302)
         except Exception:
             return False
@@ -127,6 +132,7 @@ class MarimoService:
             cwd=str(self.notebooks_dir),
         )
         self._started_at = time.time()
+        self._status_cache = None
 
         # Wait for HTTP readiness
         deadline = time.time() + wait_timeout
@@ -221,16 +227,28 @@ class MarimoService:
 
         self._process = None
         self._started_at = None
+        self._status_cache = None
         self._close_log_handle()
         return {"status": "stopped", "previous_pid": pid}
 
     def get_status(self) -> Dict[str, Any]:
-        """Returns live server status and metadata."""
-        running = self.is_running()
+        """Returns live server status and metadata, cached for thirty seconds.
+
+        Every call otherwise pays a socket probe, which is ~1.8 s when the server
+        is down - and the home dashboard polls this endpoint every 15 s. The probe
+        itself uses a short timeout because this is a status light, not a
+        lifecycle decision (`start` keeps the longer timeout, and both `start` and
+        `stop` drop this cache).
+        """
+        cached = self._status_cache
+        if cached is not None and (time.monotonic() - cached[0]) < 30.0:
+            return dict(cached[1])
+
+        running = self.is_running(timeout=0.4)
         uptime_seconds = round(time.time() - self._started_at, 1) if (running and self._started_at) else 0.0
         notebooks = self.list_notebooks()
 
-        return {
+        status = {
             "is_running": running,
             "port": self.port,
             "base_url": self.base_url,
@@ -241,6 +259,8 @@ class MarimoService:
             "notebooks_dir": str(self.notebooks_dir),
             "session_ttl_seconds": self.session_ttl_seconds,
         }
+        self._status_cache = (time.monotonic(), status)
+        return dict(status)
 
     def list_notebooks(self) -> List[Dict[str, Any]]:
         """Lists all reactive Marimo notebook files in git_repo/notebooks."""

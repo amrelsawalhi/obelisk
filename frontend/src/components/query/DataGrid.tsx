@@ -10,7 +10,13 @@ interface DataGridProps {
 const ROW_HEIGHT = 33; // Fixed row height in px
 const BUFFER_ROWS = 25; // Pre-render buffer above and below viewport
 
-export const DataGrid: React.FC<DataGridProps> = ({ columns, rows, loading }) => {
+// Memoised: the dbt studio and query view re-render as the user types, and the
+// grid only needs to repaint when the result set changes.
+export const DataGrid = React.memo(function DataGrid({
+  columns,
+  rows,
+  loading,
+}: DataGridProps) {
   const [copiedCell, setCopiedCell] = useState<string | null>(null);
   const [columnWidths, setColumnWidths] = useState<Record<string, number>>({});
 
@@ -277,4 +283,4 @@ export const DataGrid: React.FC<DataGridProps> = ({ columns, rows, loading }) =>
       </div>
     </div>
   );
-};
+});

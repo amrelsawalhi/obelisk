@@ -25,15 +25,54 @@ class DagsterServiceUnavailable(RuntimeError):
     pass
 
 
-def service_status(timeout: float = 3.0) -> Dict[str, Any]:
-    """Probes the Dagster webserver (/server_info)."""
+# See service_status(): the probe is cached because a stopped Dagster costs the
+# full connect timeout on every dashboard poll. The window has to outlive that
+# poll (15 s on the dashboard) or every poll pays for a fresh probe.
+#
+# The entry is one immutable (checked_at, payload) tuple published by assignment,
+# so readers see either the old entry or the new one - no lock, and invalidation
+# stays a single store that is safe to call from the event loop.
+_STATUS_TTL_SECONDS = 30.0
+_status_cache: Optional[tuple] = None
+
+
+def service_status(timeout: float = 1.0) -> Dict[str, Any]:
+    """Probes the Dagster webserver (/server_info), cached briefly.
+
+    The probe is on the hot path for the home dashboard and the pipelines panel.
+    When nothing is deployed the Docker host blackholes the connection and the
+    call burns the full timeout, so an uncached probe cost seconds on every poll.
+    A short window is invisible on a status light; a start/stop drops the cache
+    explicitly.
+    """
+    global _status_cache
+
+    now = time.monotonic()
+    cached = _status_cache
+    if cached is not None and (now - cached[0]) < _STATUS_TTL_SECONDS:
+        return dict(cached[1])
+
     try:
         resp = _http_client.get(f"http://{DAGSTER_HOST}:{DAGSTER_PORT}{DAGSTER_PATH_PREFIX}/server_info", timeout=timeout)
         if resp.status_code == 200:
-            return {"available": True, "info": resp.json()}
-        return {"available": False, "info": f"HTTP {resp.status_code}"}
+            payload: Dict[str, Any] = {"available": True, "info": resp.json()}
+        else:
+            payload = {"available": False, "info": f"HTTP {resp.status_code}"}
     except Exception as e:
-        return {"available": False, "info": str(e)}
+        payload = {"available": False, "info": str(e)}
+
+    _status_cache = (time.monotonic(), payload)
+    return dict(payload)
+
+
+def invalidate_status_cache() -> None:
+    """Drops the cached probe so the next call talks to Dagster again.
+
+    A single reference store: no I/O and no lock, so an async route can call it
+    without a thread hop (see `ALLOWED_CALLS` in scripts/find_blocking_calls.py).
+    """
+    global _status_cache
+    _status_cache = None
 
 
 def _graphql(query: str, variables: Optional[dict] = None, timeout: float = 15.0) -> dict:
@@ -444,6 +483,7 @@ def list_recent_runs(limit: int = 20, timeout: float = 10.0) -> List[Dict[str, A
 
 class DagsterClient:
     service_status = staticmethod(service_status)
+    invalidate_status_cache = staticmethod(invalidate_status_cache)
     discover_workspace = staticmethod(discover_workspace)
     reload_workspace = staticmethod(reload_workspace)
     launch_job = staticmethod(launch_job)

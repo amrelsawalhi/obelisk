@@ -15,11 +15,13 @@ interface DbtLineageGraphProps {
   onSelectModel?: (modelName: string) => void;
 }
 
-export const DbtLineageGraph: React.FC<DbtLineageGraphProps> = ({
+// Memoised: the studio re-renders on every keystroke in the model editor, and
+// this SVG only changes when a new lineage response arrives.
+export const DbtLineageGraph = React.memo(function DbtLineageGraph({
   lineage,
   loading,
   onSelectModel,
-}) => {
+}: DbtLineageGraphProps) {
   if (loading) {
     return (
       <div className="h-full flex items-center justify-center p-8 text-xs text-slate-400">
@@ -216,4 +218,4 @@ export const DbtLineageGraph: React.FC<DbtLineageGraphProps> = ({
       </div>
     </div>
   );
-};
+});

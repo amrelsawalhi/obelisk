@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   Cpu,
   HardDrive,
@@ -14,6 +14,7 @@ import {
   Activity,
 } from 'lucide-react';
 import { useTelemetry } from '../../lib/useTelemetry';
+import { usePolling } from '../../lib/viewActivity';
 import { api } from '../../lib/api';
 import type {
   ServiceStatus,
@@ -84,11 +85,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
     }
   };
 
-  useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 10000);
-    return () => clearInterval(interval);
-  }, []);
+  // Refreshes only while the Home tab is on screen; coming back to it triggers
+  // one immediate refresh, and the previous values stay on screen meanwhile.
+  usePolling(loadData, 15000);
 
   // Dynamic Asset & Platform Metrics (100% Real, Zero Hardcoding)
   const externalConnsCount = connections.length > 0 ? connections.length : catalogNodes.filter((n) => n.id !== 'bronze').length;

@@ -281,6 +281,7 @@ async def _deploy_process_mode(svc_name: str, bp, req, db) -> DeployLocalRespons
         await asyncio.sleep(1.0)
     status_value = "ready" if ready else "starting"
     deploy_tracker.finish(svc_name, status_value, probe_detail)
+    dagster_client.invalidate_status_cache()
 
     if ready and svc_name == "dagster":
         # Amortize Dagster's code-location cold load into the deploy, so the
@@ -506,6 +507,7 @@ async def deploy_local_service(
             await asyncio.sleep(2.0)
         status_value = "ready" if ready else "starting"
         deploy_tracker.finish(svc_name, status_value, probe_detail)
+        dagster_client.invalidate_status_cache()
         config_json.update({"image": req.image or bp.image, "host_port": host_port, "volume_name": bp.volume_name})
         if not svc_record:
             svc_record = ServiceConfig(
@@ -684,6 +686,10 @@ async def stop_service(
         svc_record.status = "stopped"
         svc_record.container_id = None
         await db.commit()
+
+    # The engines panel caches the Dagster probe; a stop must not leave it
+    # reporting "running" for the rest of the window.
+    dagster_client.invalidate_status_cache()
 
     return {"service_name": svc_name, "status": "stopped"}
 

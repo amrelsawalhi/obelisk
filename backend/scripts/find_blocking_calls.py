@@ -76,8 +76,10 @@ BLOCKING_ATTRS = {
 OFFLOADERS = {"to_thread", "run_in_executor", "run_in_threadpool"}
 
 # Pure computation with no I/O: croniter evaluating an expression against "now". A
-# thread hop would cost more than the call it is meant to protect.
-ALLOWED_CALLS = {"cron_engine.compute_next_run"}
+# thread hop would cost more than the call it is meant to protect. Same for the
+# Dagster probe cache, which is a single reference store (see its docstring) and is
+# dropped by the service deploy/stop handlers on the event loop.
+ALLOWED_CALLS = {"cron_engine.compute_next_run", "dagster_client.invalidate_status_cache"}
 
 
 def _call_name(node: ast.Call) -> str:

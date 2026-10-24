@@ -75,57 +75,47 @@ export const DbtStudio: React.FC = () => {
   const [isRunningTest, setIsRunningTest] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
-  // Results State
+  // Results State. Each panel records the model that produced it, so switching
+  // models can never display the previous model's rows or graph while the new
+  // request is still running.
   const [previewData, setPreviewData] = useState<DbtPreviewResponse | null>(null);
+  const [previewModel, setPreviewModel] = useState<string | null>(null);
   const [lineageData, setLineageData] = useState<DbtLineageResponse | null>(null);
+  const [lineageModel, setLineageModel] = useState<string | null>(null);
   const [lineageLoading, setLineageLoading] = useState(false);
+  const lineageRequestId = useRef(0);
   const [terminalLogs, setTerminalLogs] = useState<string>('');
   const [lastExecutionStatus, setLastExecutionStatus] = useState<'success' | 'failed' | null>(null);
 
   const activeTab = openTabs.find((t) => t.path === activeTabPath);
   const isSqlModel = activeTab?.name.endsWith('.sql');
   const activeModelName = activeTab ? activeTab.name.replace(/\.sql$/, '') : '';
+  const previewForActiveModel = previewModel === activeModelName ? previewData : null;
+  const lineageForActiveModel = lineageModel === activeModelName ? lineageData : null;
 
-  // 1. Fetch Project Tree
+  // 1. Fetch Project Tree. Opening the studio lands on a blank canvas: the
+  // tree is loaded for browsing, but no file is opened (and nothing is
+  // compiled) until the user picks one.
   const fetchTree = useCallback(async () => {
     try {
       setTreeLoading(true);
-      const tree = await api.getDbtTree();
-      setTreeRoot(tree);
-
-      // Auto-open first model if no tabs open
-      if (openTabs.length === 0) {
-        const findFirstSql = (node: DbtTreeNode): DbtTreeNode | null => {
-          if (node.type === 'file' && node.name.endsWith('.sql')) return node;
-          if (node.children) {
-            for (const c of node.children) {
-              const f = findFirstSql(c);
-              if (f) return f;
-            }
-          }
-          return null;
-        };
-
-        const firstSql = findFirstSql(tree);
-        if (firstSql) {
-          handleOpenFile(firstSql.path, firstSql.name);
-        }
-      }
+      setTreeRoot(await api.getDbtTree());
     } catch (err) {
       console.error('Failed to load dbt project tree', err);
     } finally {
       setTreeLoading(false);
     }
-  }, [openTabs.length]);
+  }, []);
 
   useEffect(() => {
     fetchTree();
   }, [fetchTree]);
 
-  // 2. Open File into Tab
+  // 2. Open File into Tab. Idempotent by path, including when two opens race
+  // (StrictMode mounts every effect twice in dev), which used to leave the same
+  // file open in two tabs.
   const handleOpenFile = async (path: string, _name?: string) => {
-    const existing = openTabs.find((t) => t.path === path);
-    if (existing) {
+    if (openTabs.some((t) => t.path === path)) {
       setActiveTabPath(path);
       return;
     }
@@ -140,37 +130,44 @@ export const DbtStudio: React.FC = () => {
         isDirty: false,
       };
 
-      setOpenTabs((prev) => [...prev, newTab]);
+      setOpenTabs((prev) => (prev.some((t) => t.path === path) ? prev : [...prev, newTab]));
       setActiveTabPath(path);
-
-      // If it's a SQL model, auto-compile in background
-      if (fileData.name.endsWith('.sql')) {
-        const modelName = fileData.name.replace(/\.sql$/, '');
-        loadLineage(modelName);
-        compileInBackground(modelName, newTab.path);
-      }
     } catch (err) {
       console.error('Failed to open file', err);
     }
   };
 
-  // Compile in background to populate right pane immediately
-  const compileInBackground = async (modelName: string, tabPath: string) => {
-    try {
-      const res = await api.compileDbtModel(modelName, targetDb);
-      if (res.success && res.compiled_sql) {
-        setOpenTabs((prev) =>
-          prev.map((t) =>
-            t.path === tabPath
-              ? { ...t, compiledSql: res.compiled_sql, durationMs: res.duration_ms }
-              : t
-          )
-        );
+  /** Resolves a model name to its real path in the project tree. */
+  const findModelPath = useCallback(
+    (modelName: string): string | null => {
+      const target = `${modelName}.sql`;
+      const walk = (node: DbtTreeNode): string | null => {
+        if (node.type === 'file') return node.name === target ? node.path : null;
+        for (const child of node.children ?? []) {
+          const found = walk(child);
+          if (found) return found;
+        }
+        return null;
+      };
+      return treeRoot ? walk(treeRoot) : null;
+    },
+    [treeRoot]
+  );
+
+  // Clicking a lineage node opens that model. The path comes from the tree
+  // instead of being guessed, so models outside the staging folder resolve too.
+  const handleSelectModelFromLineage = useCallback(
+    (model: string) => {
+      const open = openTabs.find((t) => t.name === `${model}.sql`);
+      if (open) {
+        setActiveTabPath(open.path);
+        return;
       }
-    } catch {
-      // Ignored for background compile
-    }
-  };
+      const path = findModelPath(model);
+      if (path) handleOpenFile(path, `${model}.sql`);
+    },
+    [openTabs, findModelPath]
+  );
 
   // Close Tab
   const handleCloseTab = (path: string, e?: React.MouseEvent) => {
@@ -260,7 +257,7 @@ export const DbtStudio: React.FC = () => {
         setIsSplitView(true); // Open split view so user sees compiled SQL
       }
 
-      loadLineage(activeModelName);
+      if (dockTab === 'lineage') loadLineage(activeModelName);
     } catch (err: any) {
       const msg = err?.response?.data?.detail || err?.message || 'Compilation error';
       setTerminalLogs(`[Compilation Error]:\n${msg}`);
@@ -274,6 +271,9 @@ export const DbtStudio: React.FC = () => {
   // 5. Preview Data
   const handlePreviewData = async () => {
     if (!activeTab || !isSqlModel || isPreviewing) return;
+    // Capture the model: the preview endpoint compiles server-side and can take
+    // several seconds, during which the user may switch tabs.
+    const modelName = activeModelName;
     try {
       setIsPreviewing(true);
       // Auto-save if dirty
@@ -288,14 +288,11 @@ export const DbtStudio: React.FC = () => {
         );
       }
 
-      const res = await api.previewDbtModel(activeModelName, targetDb, 50);
+      const res = await api.previewDbtModel(modelName, targetDb, 50);
       setPreviewData(res);
+      setPreviewModel(modelName);
       setDockTab('preview');
       setIsDockCollapsed(false);
-
-      if (activeTab && (!activeTab.compiledSql || activeTab.isDirty)) {
-        handleCompile();
-      }
     } catch (err: any) {
       const msg = err?.response?.data?.detail || err?.message || 'Preview execution failed';
       setPreviewData({
@@ -338,7 +335,7 @@ export const DbtStudio: React.FC = () => {
       setLastExecutionStatus(res.success ? 'success' : 'failed');
 
       // Refresh lineage after run
-      loadLineage(activeModelName);
+      if (dockTab === 'lineage') loadLineage(activeModelName);
     } catch (err: any) {
       const msg = err?.response?.data?.detail || err?.message || 'dbt run failed';
       setTerminalLogs(`[ERROR]: ${msg}`);
@@ -369,19 +366,31 @@ export const DbtStudio: React.FC = () => {
     }
   };
 
-  // 8. Load Lineage DAG
-  const loadLineage = async (modelName: string) => {
+  // 8. Load Lineage DAG. Only the newest request may write: switching models
+  // mid-flight drops the older response instead of painting it over the new one.
+  const loadLineage = useCallback(async (modelName: string) => {
     if (!modelName) return;
+    const requestId = ++lineageRequestId.current;
+    setLineageLoading(true);
     try {
-      setLineageLoading(true);
       const lin = await api.getDbtLineage(modelName);
+      if (requestId !== lineageRequestId.current) return;
       setLineageData(lin);
+      setLineageModel(modelName);
     } catch (err) {
       console.error('Failed to load lineage', err);
     } finally {
-      setLineageLoading(false);
+      if (requestId === lineageRequestId.current) setLineageLoading(false);
     }
-  };
+  }, []);
+
+  // The dock follows the active model lazily: lineage is fetched when the panel
+  // is actually on screen, not as a side effect of opening a file.
+  useEffect(() => {
+    if (dockTab !== 'lineage' || isDockCollapsed) return;
+    if (!activeModelName || lineageModel === activeModelName) return;
+    loadLineage(activeModelName);
+  }, [dockTab, isDockCollapsed, activeModelName, lineageModel, loadLineage]);
 
   // 9. Delete File from Tree
   const handleDeleteFile = async (path: string) => {
@@ -397,21 +406,27 @@ export const DbtStudio: React.FC = () => {
     }
   };
 
-  // Keyboard shortcut listener (Ctrl+S / Cmd+S and Ctrl+Enter)
+  // Keyboard shortcuts read the latest handlers through a ref, so the listener
+  // is attached once instead of being torn down and rebuilt on every keystroke.
+  const shortcutsRef = useRef({ handleSaveActiveFile, handlePreviewData });
+  useEffect(() => {
+    shortcutsRef.current = { handleSaveActiveFile, handlePreviewData };
+  });
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 's') {
         e.preventDefault();
-        handleSaveActiveFile();
+        shortcutsRef.current.handleSaveActiveFile();
       }
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault();
-        handlePreviewData();
+        shortcutsRef.current.handlePreviewData();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeTab, activeTab?.content, isSaving, isPreviewing]);
+  }, []);
 
   // Bottom dock resizer mouse handlers
   const handleDockResizeStart = (e: React.MouseEvent) => {
@@ -467,12 +482,7 @@ export const DbtStudio: React.FC = () => {
               return (
                 <div
                   key={tab.path}
-                  onClick={() => {
-                    setActiveTabPath(tab.path);
-                    if (isSql) {
-                      loadLineage(tab.name.replace(/\.sql$/, ''));
-                    }
-                  }}
+                  onClick={() => setActiveTabPath(tab.path)}
                   className={`group h-8 px-2.5 rounded-t-md flex items-center gap-1.5 text-xs font-mono cursor-pointer transition-all border-t-2 ${
                     isActive
                       ? 'bg-white border-t-sky-600 text-slate-900 font-semibold shadow-2xs border-x border-slate-200 -mb-[1px] z-10'
@@ -755,9 +765,9 @@ export const DbtStudio: React.FC = () => {
               >
                 <Table2 className="w-3.5 h-3.5 text-sky-600" />
                 <span>Data Preview</span>
-                {previewData && (
+                {previewForActiveModel && (
                   <span className="text-[10px] font-mono px-1.5 py-0.2 bg-slate-100 rounded text-slate-600 border border-slate-200">
-                    {previewData.row_count} rows
+                    {previewForActiveModel.row_count} rows
                   </span>
                 )}
               </button>
@@ -767,7 +777,7 @@ export const DbtStudio: React.FC = () => {
                 onClick={() => {
                   setDockTab('lineage');
                   if (isDockCollapsed) setIsDockCollapsed(false);
-                  if (activeModelName && !lineageData) loadLineage(activeModelName);
+                  if (activeModelName && lineageModel !== activeModelName) loadLineage(activeModelName);
                 }}
                 className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-semibold transition-all ${
                   dockTab === 'lineage' && !isDockCollapsed
@@ -834,26 +844,26 @@ export const DbtStudio: React.FC = () => {
               {/* Data Preview Tab */}
               {dockTab === 'preview' && (
                 <div className="h-full flex flex-col overflow-hidden">
-                  {previewData?.error ? (
+                  {previewForActiveModel?.error ? (
                     <div className="p-4 bg-rose-50 text-rose-800 text-xs font-mono whitespace-pre-wrap overflow-auto">
                       <div className="flex items-center gap-2 font-bold mb-1 text-rose-900">
                         <AlertCircle className="w-4 h-4 text-rose-600" />
                         Preview Error
                       </div>
-                      {previewData.error}
+                      {previewForActiveModel.error}
                     </div>
-                  ) : previewData && previewData.columns.length > 0 ? (
+                  ) : previewForActiveModel && previewForActiveModel.columns.length > 0 ? (
                     <div className="h-full flex flex-col overflow-hidden">
                       <div className="px-3 py-1 border-b border-slate-200 bg-slate-50/50 flex items-center justify-between text-[11px] text-slate-500">
                         <span className="font-mono">
-                          {previewData.row_count} rows previewed in {previewData.duration_ms}ms (Target: {targetDb})
+                          {previewForActiveModel.row_count} rows previewed in {previewForActiveModel.duration_ms}ms (Target: {targetDb})
                         </span>
                         <span className="text-[10px] text-slate-400">SELECT * FROM ({activeModelName}) LIMIT 50</span>
                       </div>
                       <div className="flex-1 min-h-0">
                         <DataGrid
-                          columns={previewData.columns}
-                          rows={previewData.rows}
+                          columns={previewForActiveModel.columns}
+                          rows={previewForActiveModel.rows}
                           loading={isPreviewing}
                         />
                       </div>
@@ -878,16 +888,9 @@ export const DbtStudio: React.FC = () => {
               {dockTab === 'lineage' && (
                 <div className="h-full overflow-hidden">
                   <DbtLineageGraph
-                    lineage={lineageData}
+                    lineage={lineageForActiveModel}
                     loading={lineageLoading}
-                    onSelectModel={(model) => {
-                      const found = openTabs.find((t) => t.name.startsWith(model));
-                      if (found) {
-                        setActiveTabPath(found.path);
-                      } else {
-                        handleOpenFile(`models/staging/${model}.sql`, `${model}.sql`);
-                      }
-                    }}
+                    onSelectModel={handleSelectModelFromLineage}
                   />
                 </div>
               )}
