@@ -183,6 +183,29 @@ async def test_schedule_preview_toggle_and_graph_replacement():
         assert len(detail["steps"]) == 2
         assert detail["edges"][0]["condition"] == "completion"
 
+        # Re-conditioning and deleting an edge are the same save: the graph is
+        # replaced wholesale, so what the canvas sends is what is stored.
+        reconditioned = await client.put(
+            f"/api/pipelines/{pipeline_id}/graph",
+            json=_graph(
+                [_step(original_id, "only"), _step("new", "extra")],
+                [{"from_key": original_id, "to_key": "new", "condition": "failure"}],
+            ),
+        )
+        assert reconditioned.status_code == 200
+        changed = (await client.get(f"/api/pipelines/{pipeline_id}")).json()
+        assert [e["condition"] for e in changed["edges"]] == ["failure"]
+
+        removed = await client.put(
+            f"/api/pipelines/{pipeline_id}/graph",
+            json=_graph([_step(original_id, "only"), _step("new", "extra")], []),
+        )
+        assert removed.status_code == 200
+        after = (await client.get(f"/api/pipelines/{pipeline_id}")).json()
+        assert after["edges"] == []
+        # Removing the edge must not remove the steps it joined.
+        assert len(after["steps"]) == 2
+
         await client.delete(f"/api/pipelines/{pipeline_id}")
 
 

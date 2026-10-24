@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactFlow, {
   Background,
   MarkerType,
@@ -46,6 +46,13 @@ export const EDGE_COLOURS: Record<EdgeCondition, string> = {
 };
 
 export const PROBLEM_COLOUR = '#e11d48';
+
+/** An edge as the canvas reports it back to the view. */
+export interface CanvasEdge {
+  from_key: string;
+  to_key: string;
+  condition: EdgeCondition;
+}
 
 const STEP_ICONS: Record<StepType, React.ElementType> = {
   dbt_run: Play,
@@ -243,6 +250,10 @@ export interface PipelineCanvasProps {
   /** Step keys the server rejected; painted red so the toast has somewhere to point. */
   problemSteps?: string[];
   problemEdges?: Array<{ from_key: string; to_key: string }>;
+  /** The edge whose dialog is open, drawn emphasised. */
+  selectedEdge?: { from_key: string; to_key: string } | null;
+  onEdgeClick?: (edge: CanvasEdge) => void;
+  onEdgeDelete?: (fromKey: string, toKey: string) => void;
   onSelectStep?: (stepId: string | null) => void;
   onConnectRequest?: (fromKey: string, toKey: string) => void;
   onDeleteStep?: (stepId: string) => void;
@@ -266,6 +277,9 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
   selectedStepId,
   problemSteps,
   problemEdges,
+  selectedEdge,
+  onEdgeClick,
+  onEdgeDelete,
   onSelectStep,
   onConnectRequest,
   onDeleteStep,
@@ -307,7 +321,10 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
         const colour = problem ? PROBLEM_COLOUR : EDGE_COLOURS[edge.condition] ?? EDGE_COLOURS.success;
         // Labels are noise until asked for: success is the default path, so only an
         // exception branch or a hovered edge spells its condition out.
-        const showLabel = problem || edge.condition !== "success" || hoveredEdge === id;
+        const active =
+          selectedEdge?.from_key === edge.from_key && selectedEdge?.to_key === edge.to_key;
+        const showLabel =
+          problem || active || edge.condition !== "success" || hoveredEdge === id;
         const sourceStatus = runtimeByStep?.[edge.from_key]?.status;
         return {
           id,
@@ -320,19 +337,34 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
           labelBgBorderRadius: 3,
           style: problem
             ? { stroke: colour, strokeWidth: 2.5, strokeDasharray: "6 4" }
-            : { stroke: colour, strokeWidth: 2 },
+            : active
+              ? { stroke: colour, strokeWidth: 3.5 }
+              : { stroke: colour, strokeWidth: 2 },
+          // A 2px line is a 2px target; the hit area is deliberately wider.
+          interactionWidth: 26,
           markerEnd: { type: MarkerType.ArrowClosed, color: colour },
           animated: problem || sourceStatus === "running" || edge.condition === "failure",
         };
       }),
-    [edges, problemEdgeSet, hoveredEdge, runtimeByStep],
+    [edges, problemEdgeSet, hoveredEdge, runtimeByStep, selectedEdge],
   );
 
   const [liveNodes, setLiveNodes] = useState<Node<StepNodeData>[]>(nodes);
   const [liveEdges, setLiveEdges] = useState<Edge[]>(flowEdges);
 
   useEffect(() => setLiveNodes(nodes), [nodes]);
-  useEffect(() => setLiveEdges(flowEdges), [flowEdges]);
+  // A poll that repaints the run must not silently drop the edge the operator just
+  // selected: keyboard deletion of an edge works off that selection.
+  useEffect(() => {
+    setLiveEdges((current) => {
+      const selected = new Set(
+        current.filter((edge) => edge.selected).map((edge) => edge.id),
+      );
+      return flowEdges.map((edge) =>
+        selected.has(edge.id) ? { ...edge, selected: true } : edge,
+      );
+    });
+  }, [flowEdges]);
 
   // fitView on mount only covers the first render: opening another pipeline, or adding
   // a step to a graph that already fills the canvas, would leave boxes off screen.
@@ -362,6 +394,32 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
     return () => window.removeEventListener("keydown", onKey);
   }, [fitView]);
 
+  // The key handler reads the newest edges through a ref so it is registered once.
+  const edgesRef = useRef(liveEdges);
+  useEffect(() => {
+    edgesRef.current = liveEdges;
+  }, [liveEdges]);
+
+  // Delete/Backspace on a selected edge is handled here rather than through
+  // onEdgesDelete: React Flow also reports the edges of a node being deleted, which
+  // would tear the graph before the operator confirmed removing that node.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!editable || (event.key !== "Delete" && event.key !== "Backspace")) return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) {
+        return;
+      }
+      const selected = edgesRef.current.filter((edge) => edge.selected);
+      if (!selected.length) return;
+      event.preventDefault();
+      selected.forEach((edge) => onEdgeDelete?.(edge.source, edge.target));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [editable, onEdgeDelete]);
+
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
       setLiveNodes((current) => applyNodeChanges(changes, current));
@@ -375,10 +433,12 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
     [editable, onMoveStep],
   );
 
-  const handleEdgesChange = useCallback(
-    (changes: EdgeChange[]) => setLiveEdges((current) => applyEdgeChanges(changes, current)),
-    [],
-  );
+  const handleEdgesChange = useCallback((changes: EdgeChange[]) => {
+    // React Flow asks for local removals first; the draft is the source of truth, so
+    // removal is forwarded (onEdgesDelete) and the props re-render the edge away.
+    const local = changes.filter((change) => change.type !== "remove");
+    if (local.length) setLiveEdges((current) => applyEdgeChanges(local, current));
+  }, []);
 
   const handleConnect = useCallback(
     (connection: Connection) => {
@@ -405,6 +465,14 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
         onNodesDelete={(deleted) => deleted.forEach((node) => onDeleteStep?.(node.id))}
         onEdgeMouseEnter={(_event, edge) => setHoveredEdge(edge.id)}
         onEdgeMouseLeave={() => setHoveredEdge(null)}
+        onEdgeClick={(_event, edge) => {
+          if (!editable) return;
+          // Match on endpoints, not on id: an id is derived, endpoints are the data.
+          const match = edges.find(
+            (item) => item.from_key === edge.source && item.to_key === edge.target,
+          );
+          if (match) onEdgeClick?.(match);
+        }}
         nodesConnectable={editable}
         elementsSelectable
         deleteKeyCode={editable ? ["Backspace", "Delete"] : null}

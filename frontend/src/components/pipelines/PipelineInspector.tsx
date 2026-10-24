@@ -1,6 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { AlertCircle, Plus, RefreshCw, ScrollText, Terminal, Trash2, X } from 'lucide-react';
-import type { PipelineStepDef, PipelineTargets, StepRunItem, StepType } from '../../lib/types';
+import type {
+  EdgeCondition,
+  PipelineStepDef,
+  PipelineTargets,
+  StepRunItem,
+  StepType,
+} from '../../lib/types';
 import { statusStyle, stepTypeLabel } from './PipelineCanvas';
 import type { StepRuntime } from './PipelineCanvas';
 
@@ -21,6 +27,16 @@ interface PipelineInspectorProps {
   targets: PipelineTargets | null;
   /** Names of the direct parents, used to suggest the tokens this step may read. */
   parents?: string[];
+  /** Edges touching this step, so they can be re-conditioned or removed here. */
+  connections?: Array<{
+    direction: 'in' | 'out';
+    from_key: string;
+    to_key: string;
+    condition: EdgeCondition;
+    name: string;
+  }>;
+  onEditEdge?: (fromKey: string, toKey: string) => void;
+  onRemoveEdge?: (fromKey: string, toKey: string) => void;
   onChange: (patch: Partial<PipelineStepDef>) => void;
   onDelete: () => void;
   onRerunFrom?: () => void;
@@ -94,6 +110,9 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
   editable,
   targets,
   parents,
+  connections,
+  onEditEdge,
+  onRemoveEdge,
   onChange,
   onDelete,
   onRerunFrom,
@@ -296,6 +315,54 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                 />
               </Field>
             </div>
+            <div className="rounded-lg border border-slate-200">
+              <div className="flex items-center justify-between border-b border-slate-100 px-2.5 py-1.5">
+                <span className="text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
+                  Connections
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  {connections?.length ?? 0}
+                </span>
+              </div>
+              <div className="space-y-1 p-2">
+                {(connections ?? []).map((edge) => (
+                  <div
+                    key={`${edge.direction}-${edge.from_key}-${edge.to_key}`}
+                    className="flex items-center gap-1.5 rounded-md bg-slate-50 px-1.5 py-1"
+                  >
+                    <span className="w-3 shrink-0 text-center font-mono text-[10px] text-slate-400">
+                      {edge.direction === 'in' ? '?' : '?'}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-[11px] text-slate-700">
+                      {edge.name}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onEditEdge?.(edge.from_key, edge.to_key)}
+                      className="shrink-0 rounded border border-slate-300 bg-white px-1 text-[9px] font-bold uppercase text-slate-500 hover:border-indigo-300 hover:text-indigo-600"
+                      title="Change when this edge runs"
+                    >
+                      {edge.condition}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onRemoveEdge?.(edge.from_key, edge.to_key)}
+                      className="shrink-0 rounded p-0.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                      aria-label={`Remove connection to ${edge.name}`}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                ))}
+                {!(connections?.length) && (
+                  <p className="px-0.5 py-1 text-[10px] leading-snug text-slate-400">
+                    No connections. Drag from this step&apos;s right port to a step to add
+                    one, then click the line to change or remove it.
+                  </p>
+                )}
+              </div>
+            </div>
+
             <div className="rounded-lg border border-slate-200">
               <div className="flex items-center justify-between border-b border-slate-100 px-2.5 py-1.5">
                 <span className="text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">

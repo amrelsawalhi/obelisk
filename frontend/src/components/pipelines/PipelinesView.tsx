@@ -84,6 +84,43 @@ const draftFrom = (detail: PipelineDetail): DraftState => ({
   })),
 });
 
+/** Key-ordered JSON, so comparing two graphs cannot hinge on object key order. */
+const stable = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stable(record[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+};
+
+/**
+ * A comparison key for a graph. Edges are sorted and object keys normalised: the
+ * server may return edges in a different order after a save (a re-conditioned edge
+ * is deleted and re-inserted), and that must not read as an unsaved change.
+ */
+const graphSignature = (state: DraftState): string =>
+  stable({
+    steps: state.steps.map((step) => ({
+      key: step.key,
+      name: step.name.trim(),
+      step_type: step.step_type,
+      target: step.target,
+      args: step.args ?? {},
+      timeout_seconds: step.timeout_seconds,
+      max_retries: step.max_retries,
+      retry_delay_seconds: step.retry_delay_seconds,
+      position_x: step.position_x,
+      position_y: step.position_y,
+    })),
+    edges: [...state.edges]
+      .map((edge) => `${edge.from_key}->${edge.to_key}:${edge.condition}`)
+      .sort(),
+  });
+
 const newKey = () =>
   typeof crypto !== 'undefined' && 'randomUUID' in crypto
     ? crypto.randomUUID()
@@ -104,7 +141,13 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
   const [starting, setStarting] = useState(false);
 
   const [selectedStepKey, setSelectedStepKey] = useState<string | null>(null);
-  const [pendingEdge, setPendingEdge] = useState<{ from: string; to: string } | null>(null);
+  // A connection dialog. ``existing`` decides whether the condition is added or
+  // rewritten, so the same panel creates and edits.
+  const [edgeDialog, setEdgeDialog] = useState<{
+    from: string;
+    to: string;
+    existing: boolean;
+  } | null>(null);
   const [tab, setTab] = useState<ViewTab>("designer");
 
   const [executions, setExecutions] = useState<PipelineExecution[]>([]);
@@ -150,7 +193,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
 
   const dirty = useMemo(() => {
     if (!detail) return false;
-    return JSON.stringify(draftFrom(detail)) !== JSON.stringify(draft);
+    return graphSignature(draftFrom(detail)) !== graphSignature(draft);
   }, [detail, draft]);
 
   const selectedStep = useMemo(
@@ -208,6 +251,31 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     return map;
   }, [draft.steps, draft.edges]);
 
+  const connections = useMemo(() => {
+    if (!selectedStepKey) return [];
+    const name = (key: string) =>
+      draft.steps.find((step) => step.key === key)?.name ?? 'deleted step';
+    const incoming = draft.edges
+      .filter((edge) => edge.to_key === selectedStepKey)
+      .map((edge) => ({
+        direction: 'in' as const,
+        from_key: edge.from_key,
+        to_key: edge.to_key,
+        condition: edge.condition,
+        name: name(edge.from_key),
+      }));
+    const outgoing = draft.edges
+      .filter((edge) => edge.from_key === selectedStepKey)
+      .map((edge) => ({
+        direction: 'out' as const,
+        from_key: edge.from_key,
+        to_key: edge.to_key,
+        condition: edge.condition,
+        name: name(edge.to_key),
+      }));
+    return [...incoming, ...outgoing];
+  }, [draft.edges, draft.steps, selectedStepKey]);
+
   const clearProblems = useCallback(() => {
     setProblemSteps([]);
     setProblemEdges([]);
@@ -233,6 +301,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       setDetail(data);
       setDraft(draftFrom(data));
       setSelectedStepKey(null);
+      setEdgeDialog(null);
       setMonitor(null);
       setStepLogs("");
       setLogsOffset(0);
@@ -604,21 +673,24 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
           ),
         }));
         setSelectedStepKey((current) => (current === stepKey ? null : current));
+        // An edge dialog pointing at this step is now meaningless.
+        setEdgeDialog(null);
       },
     });
   };
 
-  const confirmEdge = (condition: EdgeCondition) => {
-    if (!pendingEdge) return;
-    const { from, to } = pendingEdge;
+  const setEdgeCondition = (condition: EdgeCondition) => {
+    if (!edgeDialog) return;
+    const { from, to } = edgeDialog;
     setDraft((current) => ({
       ...current,
       edges: [
+        // One edge per pair: a rewritten condition replaces the old edge.
         ...current.edges.filter((edge) => !(edge.from_key === from && edge.to_key === to)),
         { from_key: from, to_key: to, condition },
       ],
     }));
-    setPendingEdge(null);
+    setEdgeDialog(null);
   };
 
   const removeEdge = (fromKey: string, toKey: string) => {
@@ -628,7 +700,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
         (edge) => !(edge.from_key === fromKey && edge.to_key === toKey),
       ),
     }));
-    setPendingEdge(null);
+    setEdgeDialog(null);
   };
 
   // Shortcuts live here, not in the canvas: saving and running are view actions, and
@@ -647,7 +719,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
         return;
       }
       if (event.key === "Escape") {
-        setPendingEdge(null);
+        setEdgeDialog(null);
         setMenuOpen(false);
         setShowAdd(false);
         setShowNew(false);
@@ -916,11 +988,22 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     problemEdges={problemEdges}
                     onSelectStep={(key) => {
                       setSelectedStepKey(key);
+                      // Choosing a step means the edge panel is no longer the subject.
+                      setEdgeDialog(null);
                       // A step inside a run has output worth seeing; open the dock so
                       // clicking a node is enough to read it.
                       if (key && monitor) setDockOpen(true);
                     }}
-                    onConnectRequest={(from, to) => setPendingEdge({ from, to })}
+                    onConnectRequest={(from, to) =>
+                      setEdgeDialog({ from, to, existing: false })
+                    }
+                    selectedEdge={
+                      edgeDialog ? { from_key: edgeDialog.from, to_key: edgeDialog.to } : null
+                    }
+                    onEdgeClick={(edge) =>
+                      setEdgeDialog({ from: edge.from_key, to: edge.to_key, existing: true })
+                    }
+                    onEdgeDelete={removeEdge}
                     onDeleteStep={(key) => removeStep(key)}
                     onMoveStep={moveStep}
                     onAddStep={() => setShowAdd(true)}
@@ -942,6 +1025,9 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     editable={!watching}
                     targets={targets}
                     parents={selectedStepKey ? parentsByStep[selectedStepKey] ?? [] : []}
+                    connections={connections}
+                    onEditEdge={(from, to) => setEdgeDialog({ from, to, existing: true })}
+                    onRemoveEdge={removeEdge}
                     onChange={updateStep}
                     onDelete={() => selectedStepKey && removeStep(selectedStepKey)}
                     onOpenLogs={() => {
@@ -1020,47 +1106,75 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
         </main>
       </div>
 
-      {pendingEdge && (
+      {edgeDialog && (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/25 p-4">
-          <div className="w-[360px] max-w-full rounded-xl border border-slate-200 bg-white p-4 shadow-xl">
-            <h2 className="text-sm font-semibold text-slate-800">When should this run?</h2>
-            <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
-              {draft.steps.find((step) => step.key === pendingEdge.from)?.name ?? "Step"} →{" "}
-              {draft.steps.find((step) => step.key === pendingEdge.to)?.name ?? "step"}
+          <div className="w-[380px] max-w-full rounded-xl border border-slate-200 bg-white p-4 shadow-xl">
+            <h2 className="text-sm font-semibold text-slate-800">
+              {edgeDialog.existing ? "Edit connection" : "When should this run?"}
+            </h2>
+            <p className="mt-1 flex items-center gap-1 text-[11px] leading-relaxed text-slate-500">
+              <span className="truncate font-semibold text-slate-700">
+                {draft.steps.find((step) => step.key === edgeDialog.from)?.name ?? "Step"}
+              </span>
+              <ChevronRight className="h-3 w-3 shrink-0" />
+              <span className="truncate font-semibold text-slate-700">
+                {draft.steps.find((step) => step.key === edgeDialog.to)?.name ?? "step"}
+              </span>
             </p>
-            <div className="mt-3 grid grid-cols-2 gap-1.5">
+            <p className="mt-2 text-[10px] font-bold uppercase tracking-wide text-slate-400 font-mono">
+              Run the target when the source
+            </p>
+            <div className="mt-1 grid grid-cols-2 gap-1.5">
               {(
                 [
-                  ["success", "On success"],
-                  ["failure", "On failure"],
-                  ["completion", "On completion"],
-                  ["skipped", "On skip"],
+                  ["success", "Succeeds"],
+                  ["failure", "Fails"],
+                  ["completion", "Completes (either)"],
+                  ["skipped", "Is skipped"],
                 ] as Array<[EdgeCondition, string]>
-              ).map(([condition, label]) => (
-                <button
-                  key={condition}
-                  type="button"
-                  onClick={() => confirmEdge(condition)}
-                  className="rounded-lg border border-slate-300 px-2 py-1.5 text-[11px] font-semibold text-slate-700 hover:border-indigo-300 hover:bg-indigo-50"
-                >
-                  {label}
-                </button>
-              ))}
+              ).map(([condition, label]) => {
+                const current =
+                  draft.edges.find(
+                    (edge) =>
+                      edge.from_key === edgeDialog.from && edge.to_key === edgeDialog.to,
+                  )?.condition === condition;
+                return (
+                  <button
+                    key={condition}
+                    type="button"
+                    onClick={() => setEdgeCondition(condition)}
+                    className={`rounded-lg border px-2 py-1.5 text-[11px] font-semibold ${
+                      current
+                        ? "border-indigo-500 bg-indigo-50 text-indigo-700"
+                        : "border-slate-300 text-slate-700 hover:border-indigo-300 hover:bg-indigo-50"
+                    }`}
+                  >
+                    {label}
+                    {current && <span className="ml-1 text-[9px] uppercase">current</span>}
+                  </button>
+                );
+              })}
             </div>
             <div className="mt-3 flex items-center justify-between">
+              {edgeDialog.existing ? (
+                <button
+                  type="button"
+                  onClick={() => removeEdge(edgeDialog.from, edgeDialog.to)}
+                  className="flex items-center gap-1 text-[11px] font-semibold text-rose-600 hover:underline"
+                >
+                  <Trash2 className="h-3 w-3" /> Delete connection
+                </button>
+              ) : (
+                <span className="text-[10px] text-slate-400">
+                  Esc cancels
+                </span>
+              )}
               <button
                 type="button"
-                onClick={() => removeEdge(pendingEdge.from, pendingEdge.to)}
-                className="text-[11px] font-semibold text-rose-600 hover:underline"
-              >
-                Remove this connection
-              </button>
-              <button
-                type="button"
-                onClick={() => setPendingEdge(null)}
+                onClick={() => setEdgeDialog(null)}
                 className="rounded-lg border border-slate-300 px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
               >
-                Cancel
+                {edgeDialog.existing ? "Close" : "Cancel"}
               </button>
             </div>
           </div>
