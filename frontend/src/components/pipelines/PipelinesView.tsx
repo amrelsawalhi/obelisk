@@ -62,6 +62,110 @@ const STEP_TEMPLATES: Array<{ type: StepType; name: string; target: string }> = 
   { type: 'pipeline', name: 'Pipeline run', target: '' },
 ];
 
+/**
+ * Starting points, in the spirit of a template gallery: a new pipeline usually begins
+ * as one of three shapes, and scaffolding it beats an empty canvas.
+ */
+const PIPELINE_TEMPLATES: Array<{
+  key: string;
+  label: string;
+  hint: string;
+  build: () => DraftState;
+}> = [
+  {
+    key: "dbt",
+    label: "dbt build ? test",
+    hint: "Run the project, then test it.",
+    build: () => {
+      const run = newKey();
+      const test = newKey();
+      return {
+        steps: [
+          makeStep(run, "dbt run", "dbt_run", "*", 40, 80),
+          makeStep(test, "dbt test", "dbt_test", "*", 340, 80),
+        ],
+        edges: [{ from_key: run, to_key: test, condition: "success" }],
+      };
+    },
+  },
+  {
+    key: "ingest",
+    label: "Ingest ? gate ? publish",
+    hint: "Generate data, check it, then publish with dbt.",
+    build: () => {
+      const generate = newKey();
+      const gate = newKey();
+      const publish = newKey();
+      return {
+        steps: [
+          makeStep(generate, "generate orders", "script", "sample_generate_orders", 40, 80),
+          makeStep(gate, "quality gate", "script", "sample_quality_gate", 340, 80),
+          makeStep(publish, "publish", "dbt_run", "*", 640, 80),
+        ],
+        edges: [
+          { from_key: generate, to_key: gate, condition: "success" },
+          { from_key: gate, to_key: publish, condition: "success" },
+        ],
+      };
+    },
+  },
+  {
+    key: "alert",
+    label: "dbt with failure alert",
+    hint: "Test after the run; call a webhook when it fails.",
+    build: () => {
+      const run = newKey();
+      const test = newKey();
+      const alert = newKey();
+      return {
+        steps: [
+          makeStep(run, "dbt run", "dbt_run", "*", 40, 80),
+          makeStep(test, "dbt test", "dbt_test", "*", 340, 40),
+          makeStep(alert, "alert", "webhook", "https://example.com/alert", 340, 190),
+        ],
+        edges: [
+          { from_key: run, to_key: test, condition: "success" },
+          { from_key: run, to_key: alert, condition: "failure" },
+        ],
+      };
+    },
+  },
+];
+
+const makeStep = (
+  key: string,
+  name: string,
+  stepType: StepType,
+  target: string,
+  x: number,
+  y: number,
+): PipelineStepDef => ({
+  id: key,
+  key,
+  name,
+  step_type: stepType,
+  target,
+  args: {},
+  timeout_seconds: null,
+  max_retries: null,
+  retry_delay_seconds: null,
+  position_x: x,
+  position_y: y,
+});
+
+const toStepPayload = (step: PipelineStepDef) => ({
+  key: step.key,
+  name: step.name.trim(),
+  step_type: step.step_type,
+  target: step.target,
+  args: step.args ?? {},
+  timeout_seconds: step.timeout_seconds,
+  max_retries: step.max_retries,
+  retry_delay_seconds: step.retry_delay_seconds,
+  position_x: step.position_x,
+  position_y: step.position_y,
+});
+
 const TERMINAL: ExecutionStatus[] = ['success', 'failed', 'cancelled', 'interrupted', 'skipped'];
 
 const STATUS_TEXT: Record<string, string> = {
@@ -179,6 +283,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
   const [newName, setNewName] = useState("");
   const [newCron, setNewCron] = useState("0 2 * * *");
   const [newTimezone, setNewTimezone] = useState("UTC");
+  const [newTemplate, setNewTemplate] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
   const rail = useResizableSize("obelisk.pipelines.rail", 268, 190, 420);
@@ -431,18 +536,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     clearProblems();
     try {
       await api.replacePipelineGraph(detail.id, {
-        steps: draft.steps.map((step) => ({
-          key: step.key,
-          name: step.name.trim(),
-          step_type: step.step_type,
-          target: step.target,
-          args: step.args ?? {},
-          timeout_seconds: step.timeout_seconds,
-          max_retries: step.max_retries,
-          retry_delay_seconds: step.retry_delay_seconds,
-          position_x: step.position_x,
-          position_y: step.position_y,
-        })),
+        steps: draft.steps.map(toStepPayload),
         edges: draft.edges,
         params: detail.params,
       });
@@ -605,6 +699,10 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     }
     setCreating(true);
     try {
+      const template = newTemplate
+        ? PIPELINE_TEMPLATES.find((entry) => entry.key === newTemplate)
+        : null;
+      const scaffold = template ? template.build() : null;
       const created = await api.createPipeline({
         name: newName.trim(),
         cron_expression: newCron.trim() || "0 2 * * *",
@@ -617,8 +715,12 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
         max_retries: 0,
         retry_delay_seconds: 60,
         auto_rerun_interrupted: false,
+        graph: scaffold
+          ? { steps: scaffold.steps.map(toStepPayload), edges: scaffold.edges, params: [] }
+          : undefined,
       });
       setShowNew(false);
+      setNewTemplate(null);
       setNewName("");
       await refreshList();
       setSelectedId(created.id);
@@ -1340,6 +1442,44 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     {preset.label}
                   </button>
                 ))}
+              </div>
+              <div>
+                <span className="mb-1 block text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
+                  Start from
+                </span>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setNewTemplate(null)}
+                    className={`rounded-lg border px-2 py-1.5 text-left text-[11px] font-semibold ${
+                      newTemplate === null
+                        ? "border-indigo-500 bg-indigo-50 text-indigo-700"
+                        : "border-slate-300 text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    Empty graph
+                    <span className="mt-0.5 block text-[9px] font-normal text-slate-400">
+                      Build it yourself
+                    </span>
+                  </button>
+                  {PIPELINE_TEMPLATES.map((template) => (
+                    <button
+                      key={template.key}
+                      type="button"
+                      onClick={() => setNewTemplate(template.key)}
+                      className={`rounded-lg border px-2 py-1.5 text-left text-[11px] font-semibold ${
+                        newTemplate === template.key
+                          ? "border-indigo-500 bg-indigo-50 text-indigo-700"
+                          : "border-slate-300 text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      {template.label}
+                      <span className="mt-0.5 block text-[9px] font-normal leading-snug text-slate-400">
+                        {template.hint}
+                      </span>
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
             <div className="mt-4 flex items-center justify-between">
