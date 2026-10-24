@@ -344,6 +344,24 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
     );
     return () => window.clearTimeout(handle);
   }, [fitKey, stepKeys, fitView]);
+  // 'F' fits the graph, matching the toolbar button; ignored while typing.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "f" || event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) {
+        return;
+      }
+      event.preventDefault();
+      fitView({ padding: 0.25, maxZoom: 1, duration: 250 });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [fitView]);
+
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
       setLiveNodes((current) => applyNodeChanges(changes, current));
