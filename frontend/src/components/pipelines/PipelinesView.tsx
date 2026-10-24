@@ -11,6 +11,7 @@ import {
   Save,
   ScrollText,
   Trash2,
+  Wand2,
   Zap,
 } from 'lucide-react';
 import { api } from '../../lib/api';
@@ -33,6 +34,7 @@ import type {
 } from '../../lib/types';
 import { ConfirmDialog, type ConfirmRequest } from '../common/ConfirmDialog';
 import { EDGE_COLOURS, PipelineCanvas, type StepRuntime } from './PipelineCanvas';
+import { arrangeGraph } from '../../lib/graphLayout';
 import { PipelineInspector } from './PipelineInspector';
 import { PipelineRail } from './PipelineRail';
 import { PipelineRunsTable, fmtDuration } from './PipelineRunsTable';
@@ -74,7 +76,7 @@ const PIPELINE_TEMPLATES: Array<{
 }> = [
   {
     key: "dbt",
-    label: "dbt build ? test",
+    label: "dbt build \u2192 test",
     hint: "Run the project, then test it.",
     build: () => {
       const run = newKey();
@@ -90,7 +92,7 @@ const PIPELINE_TEMPLATES: Array<{
   },
   {
     key: "ingest",
-    label: "Ingest ? gate ? publish",
+    label: "Ingest \u2192 gate \u2192 publish",
     hint: "Generate data, check it, then publish with dbt.",
     build: () => {
       const generate = newKey();
@@ -740,6 +742,15 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     const index = draft.steps.length;
     const key = newKey();
     const duplicate = draft.steps.some((step) => step.step_type === type);
+    // Place it to the right of the selected step, or of the whole graph; stacking every
+    // new node at the same offset is what made a three-step graph look like one node.
+    const anchor = draft.steps.find((step) => step.key === selectedStepKey);
+    const rightmost = draft.steps.reduce(
+      (max, step) => Math.max(max, step.position_x),
+      anchor ? anchor.position_x : 0,
+    );
+    const x = draft.steps.length ? rightmost + 260 : 80;
+    const y = anchor ? anchor.position_y : 80;
     const step: PipelineStepDef = {
       id: key,
       key,
@@ -750,14 +761,31 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       timeout_seconds: null,
       max_retries: null,
       retry_delay_seconds: null,
-      position_x: 80 + (index % 4) * 260,
-      position_y: 80 + Math.floor(index / 4) * 170,
+      position_x: x,
+      position_y: y,
     };
     setDraft((current) => ({ ...current, steps: [...current.steps, step] }));
     setSelectedStepKey(key);
     setShowAdd(false);
     setTab("graph");
   };
+
+  // Tidy the draft. Positions are part of the graph, so this is a normal edit that
+  // needs saving like any other.
+  const arrange = useCallback(() => {
+    setDraft((current) => {
+      if (current.steps.length < 2) return current;
+      const positions = arrangeGraph(current.steps, current.edges);
+      return {
+        ...current,
+        steps: current.steps.map((step) => ({
+          ...step,
+          position_x: positions[step.key]?.x ?? step.position_x,
+          position_y: positions[step.key]?.y ?? step.position_y,
+        })),
+      };
+    });
+  }, []);
 
   const updateStep = (patch: Partial<PipelineStepDef>) => {
     if (!selectedStepKey) return;
@@ -906,7 +934,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 title="Open the pipeline that started this run"
               >
                 Started by {monitor.parent.pipeline_name}
-                {monitor.parent.step_name ? ` ? ${monitor.parent.step_name}` : ""}
+                {monitor.parent.step_name ? ` \u2192 ${monitor.parent.step_name}` : ""}
               </button>
             )}
             {dirty && (
@@ -1108,9 +1136,20 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                   <Plus className="h-3.5 w-3.5" /> Add step
                 </button>
                 <span className="text-[11px] text-slate-500">
-                  {draft.steps.length} step{draft.steps.length === 1 ? "" : "s"} ?{" "}
-                  {draft.edges.length} connection{draft.edges.length === 1 ? "" : "s"}
+                  {draft.steps.length} step{draft.steps.length === 1 ? "" : "s"}
                 </span>
+                <span className="hidden text-[11px] text-slate-500 sm:inline">
+                  {"\u00b7"} {draft.edges.length} connection{draft.edges.length === 1 ? "" : "s"}
+                </span>
+                <button
+                  type="button"
+                  onClick={arrange}
+                  disabled={draft.steps.length < 2}
+                  className="flex items-center gap-1.5 rounded-lg border border-slate-300 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+                  title="Lay the graph out left to right by dependency"
+                >
+                  <Wand2 className="h-3.5 w-3.5" /> Arrange
+                </button>
                 {!draft.steps.length && (
                   <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
                     Add a step before saving

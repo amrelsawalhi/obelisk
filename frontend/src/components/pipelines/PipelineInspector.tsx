@@ -440,7 +440,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                     className="flex items-center gap-1.5 rounded-md bg-slate-50 px-1.5 py-1"
                   >
                     <span className="w-3 shrink-0 text-center font-mono text-[10px] text-slate-400">
-                      {edge.direction === 'in' ? '?' : '?'}
+                      {edge.direction === 'in' ? '\u2190' : '\u2192'}
                     </span>
                     <span className="min-w-0 flex-1 truncate text-[11px] text-slate-700">
                       {edge.name}
