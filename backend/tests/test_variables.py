@@ -8,7 +8,7 @@ from app.sdk.obelisk import var as obelisk_var
 async def test_variables_lifecycle_and_vault_encryption():
     """
     Real integration test for Obelisk Variables & Secrets Engine:
-    - Verifies default seeded variables in SQLite
+    - Verifies the vault starts empty (the platform ships no seeded variables)
     - Creates plaintext and AES-128 Fernet encrypted variables
     - Verifies masking on list endpoint
     - Verifies reveal endpoint decrypts accurately
@@ -17,14 +17,10 @@ async def test_variables_lifecycle_and_vault_encryption():
     """
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. Fetch variables list (auto-seeds defaults if not present)
+        # 1. The vault starts empty: a fresh install ships no variables at all.
         res = await client.get("/api/variables")
         assert res.status_code == 200
-        vars_list = res.json()
-        assert len(vars_list) >= 3
-        keys = [v["key"] for v in vars_list]
-        assert "ENV" in keys
-        assert "DEFAULT_CURRENCY" in keys
+        assert res.json() == []
 
         # 2. Create a plaintext variable
         plain_payload = {

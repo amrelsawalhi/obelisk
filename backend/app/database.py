@@ -81,95 +81,16 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 async def seed_defaults(session: AsyncSession) -> None:
+    """Deliberately does nothing.
+
+    A fresh install used to ship three variables (ENV, DEFAULT_CURRENCY,
+    BATCH_SIZE) and a paused "Nightly dbt build" pipeline. Those are opinions about
+    someone else's workload: a currency, a batch size, and a dbt-shaped schedule the
+    operator never asked for. The platform ships empty; templates and the first-run
+    flow are where suggestions belong.
     """
-    Idempotently seeds default system variables and pipeline definitions on startup.
+    return
 
-    This used to live inside GET /api/variables and GET /api/pipelines handlers,
-    which raced under concurrent page-load requests (both saw empty tables, both
-    committed seeds) causing SQLite UNIQUE constraint / locking errors. Seeding
-    now happens exactly once, here, during the startup lifespan.
-    """
-    from sqlalchemy import select
-    from app.models.variable import Variable
-    from app.models.pipeline import Pipeline, PipelineEdge, PipelineStep
-
-    # Seed default variables if table is empty
-    v_res = await session.execute(select(Variable.id).limit(1))
-    if not v_res.scalars().first():
-        session.add_all([
-            Variable(
-                key="ENV",
-                value="development",
-                is_secret=False,
-                description="Active runtime environment mode (development / staging / production)",
-            ),
-            Variable(
-                key="DEFAULT_CURRENCY",
-                value="USD",
-                is_secret=False,
-                description="Base currency for analytical financial data marts",
-            ),
-            Variable(
-                key="BATCH_SIZE",
-                value="1000",
-                is_secret=False,
-                description="Default batch chunk size for pipeline data extraction",
-            ),
-        ])
-
-    # Seed one starter pipeline if the table is empty. It is disabled: a fresh install
-    # should not run dbt at 02:00 because a row was seeded. Enable it, retarget the
-    # selectors, or delete it — the orchestrator has no privileged pipelines.
-    p_res = await session.execute(select(Pipeline.id).limit(1))
-    if not p_res.scalars().first():
-        starter = Pipeline(
-            id=str(__import__("uuid").uuid4()),
-            name="Nightly dbt build",
-            description="Runs every dbt model, then tests the project. Disabled until you enable it.",
-            cron_expression="0 2 * * *",
-            timezone="UTC",
-            is_enabled=False,
-            next_run_at=None,
-        )
-        run_step_id = str(__import__("uuid").uuid4())
-        test_step_id = str(__import__("uuid").uuid4())
-        session.add(starter)
-        session.add_all(
-            [
-                PipelineStep(
-                    id=run_step_id,
-                    pipeline_id=starter.id,
-                    name="dbt run",
-                    step_type="dbt_run",
-                    target="*",
-                    position_x=80,
-                    position_y=120,
-                ),
-                PipelineStep(
-                    id=test_step_id,
-                    pipeline_id=starter.id,
-                    name="dbt test",
-                    step_type="dbt_test",
-                    target="*",
-                    position_x=400,
-                    position_y=120,
-                ),
-            ]
-        )
-        # Flush the foreign-key side first: these mappers declare no relationships,
-        # so the unit of work would otherwise be free to insert the edge before the
-        # steps it points at.
-        await session.flush()
-        session.add(
-            PipelineEdge(
-                pipeline_id=starter.id,
-                from_step=run_step_id,
-                to_step=test_step_id,
-                condition="success",
-            )
-        )
-
-    await session.commit()
 
 async def _migrate_assets_unique_constraint(conn) -> None:
     """Rebuild `assets` with UNIQUE(layer, name) when a legacy schema is found.
