@@ -74,6 +74,17 @@ STEP_REF = re.compile(r"\{\{\s*steps\.([A-Za-z0-9_\-]+)\.([A-Za-z0-9_]+)\s*\}\}"
 STEP_REF_PLAIN = re.compile(r"(?<!\{)\{steps\.([A-Za-z0-9_\-]+)\.([A-Za-z0-9_]+)\}(?!\})")
 
 
+def _stringify(value: Any) -> str:
+    """Text form of a captured value.
+
+    A dict or list is JSON, not Python repr: it is substituted into JSON request
+    bodies and SQL literals, where single quotes and ``None`` would be rejected.
+    """
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), default=str)
+    return "" if value is None else str(value)
+
+
 def _sql_literal(value: Any) -> str:
     if value is None:
         return "NULL"
@@ -81,7 +92,7 @@ def _sql_literal(value: Any) -> str:
         return "TRUE" if value else "FALSE"
     if isinstance(value, (int, float)):
         return str(value)
-    return "'" + str(value).replace("'", "''") + "'"
+    return "'" + _stringify(value).replace("'", "''") + "'"
 
 
 def declared_outputs(step_type: str, args: Dict[str, Any]) -> Dict[str, str]:
@@ -107,6 +118,9 @@ def declared_outputs(step_type: str, args: Dict[str, Any]) -> Dict[str, str]:
             declared[str(name)] = kind
     if isinstance(args.get("materialize"), dict):
         declared.setdefault("table", "table")
+    if step_type == "raw_sql":
+        # Every SQL step knows how many rows it touched; no declaration needed.
+        declared.setdefault("rows", "scalar")
     if step_type in ("dbt_run", "dbt_test"):
         declared.setdefault("dbt_summary", "scalar")
     return declared
@@ -136,8 +150,7 @@ def render_plain_step_refs(text: str, parents: Dict[str, Dict[str, Dict[str, Any
         entry = parents.get(match.group(1), {}).get(match.group(2))
         if entry is None:
             return match.group(0)
-        value = entry.get("value")
-        return "" if value is None else str(value)
+        return _stringify(entry.get("value"))
 
     return STEP_REF_PLAIN.sub(_replace, text)
 
@@ -761,6 +774,25 @@ class PipelineEngine:
                 await session.commit()
                 return
 
+            # A pipeline with no steps cannot do anything. Reporting 'success' for
+            # such a run would be a lie, and the scheduler can reach this state when
+            # a schedule is enabled before the graph is built.
+            step_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(StepRun)
+                    .where(StepRun.run_id == run.id)
+                )
+            ).scalar_one()
+            if not step_count:
+                run.status = "skipped"
+                run.error = "This pipeline has no steps."
+                run.started_at = run.started_at or utcnow()
+                run.ended_at = utcnow()
+                run.duration_seconds = 0.0
+                await session.commit()
+                return
+
             if run.status == "waiting":
                 others = (
                     await session.execute(
@@ -1345,7 +1377,7 @@ class PipelineEngine:
         log.append(f"Query OK: {rows} row(s), columns={columns}")
         for row in (result or {}).get("rows", [])[:25]:
             log.append(str(row))
-        return {}
+        return {"rows": {"type": "scalar", "value": rows}}
 
     async def _materialize_sql(
         self, sql: str, materialize: Dict[str, Any], log: List[str], timeout: int
@@ -1378,7 +1410,10 @@ class PipelineEngine:
             f"Materialized {outcome['rows']} row(s) -> {table} "
             f"({outcome['saved'].get('file_path', '?')})"
         )
-        return {"table": {"type": "table", "value": table}}
+        return {
+            "table": {"type": "table", "value": table},
+            "rows": {"type": "scalar", "value": outcome["rows"]},
+        }
 
     # ---------------------------------------------------------- child process
 

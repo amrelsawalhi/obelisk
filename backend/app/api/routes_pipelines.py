@@ -869,6 +869,23 @@ async def replace_graph(pipeline_id: str, graph: GraphIn):
 @router.post("/pipelines/{pipeline_id}/run", status_code=202)
 async def run_pipeline_now(pipeline_id: str, req: Optional[RunNowRequest] = None):
     """Queues an ad-hoc run. The engine picks it up on its next tick (or wake)."""
+    async with AsyncSessionLocal() as session:
+        step_count = (
+            await session.execute(
+                select(func.count())
+                .select_from(PipelineStep)
+                .where(PipelineStep.pipeline_id == pipeline_id)
+            )
+        ).scalar_one()
+    if not step_count:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                'message': 'This pipeline has no steps yet.',
+                'steps': [],
+                'edges': [],
+            },
+        )
     try:
         run_id = await pipeline_engine.run_now(
             pipeline_id, params=req.params if req else None, triggered_by="manual"

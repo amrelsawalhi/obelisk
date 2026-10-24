@@ -6,6 +6,7 @@ import {
   MoreHorizontal,
   Pause,
   Play,
+  Plus,
   RefreshCw,
   Save,
   ScrollText,
@@ -31,12 +32,13 @@ import type {
   StepType,
 } from '../../lib/types';
 import { ConfirmDialog, type ConfirmRequest } from '../common/ConfirmDialog';
-import { PipelineCanvas, type StepRuntime } from './PipelineCanvas';
+import { EDGE_COLOURS, PipelineCanvas, type StepRuntime } from './PipelineCanvas';
 import { PipelineInspector } from './PipelineInspector';
 import { PipelineRail } from './PipelineRail';
 import { PipelineRunsTable, fmtDuration } from './PipelineRunsTable';
 import { PipelineSettingsForm } from './PipelineSettingsForm';
 import { PipelineLogDock, type DockTab } from './PipelineLogDock';
+import { PipelineRunDialog } from './PipelineRunDialog';
 
 interface PipelinesViewProps {
   onOpenInQuery?: (sql: string) => void;
@@ -126,7 +128,7 @@ const newKey = () =>
     ? crypto.randomUUID()
     : `step-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-type ViewTab = "designer" | "runs" | "settings";
+type ViewTab = "graph" | "runs" | "settings";
 
 export const PipelinesView: React.FC<PipelinesViewProps> = () => {
   const [pipelines, setPipelines] = useState<PipelineSummary[]>([]);
@@ -143,12 +145,13 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
   const [selectedStepKey, setSelectedStepKey] = useState<string | null>(null);
   // A connection dialog. ``existing`` decides whether the condition is added or
   // rewritten, so the same panel creates and edits.
+  const [runDialogOpen, setRunDialogOpen] = useState(false);
   const [edgeDialog, setEdgeDialog] = useState<{
     from: string;
     to: string;
     existing: boolean;
   } | null>(null);
-  const [tab, setTab] = useState<ViewTab>("designer");
+  const [tab, setTab] = useState<ViewTab>("graph");
 
   const [executions, setExecutions] = useState<PipelineExecution[]>([]);
   const [monitor, setMonitor] = useState<PipelineExecutionDetail | null>(null);
@@ -465,31 +468,46 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     }
   }, [detail, draft, clearProblems, refreshList]);
 
-  const runNow = async () => {
+  const startRun = useCallback(
+    async (params?: Record<string, unknown>) => {
+      if (!detail) return;
+      setStarting(true);
+      try {
+        const { run_id } = await api.runPipelineNow(detail.id, params);
+        const fresh = await api.getPipelineExecution(run_id);
+        setMonitor(fresh);
+        setTab("graph");
+        setSelectedStepKey(fresh.step_runs[0]?.step_id ?? null);
+        setDockOpen(true);
+        setDockTab("step");
+        setRunDialogOpen(false);
+        void refreshExecutions();
+        void refreshList();
+      } catch (error) {
+        toast.error(readApiError(error, "Could not start the run.").message);
+      } finally {
+        setStarting(false);
+      }
+    },
+    [detail, refreshExecutions, refreshList],
+  );
+
+  // Required parameters cannot be guessed, so a pipeline that declares any asks for
+  // them first instead of failing with 'Parameter x is required.'
+  const requestRun = useCallback(() => {
     if (!detail) return;
-    setStarting(true);
-    try {
-      const { run_id } = await api.runPipelineNow(detail.id);
-      const fresh = await api.getPipelineExecution(run_id);
-      setMonitor(fresh);
-      setTab("designer");
-      setSelectedStepKey(fresh.step_runs[0]?.step_id ?? null);
-      setDockOpen(true);
-      setDockTab("step");
-      void refreshExecutions();
-      void refreshList();
-    } catch (error) {
-      toast.error(readApiError(error, "Could not start the run.").message);
-    } finally {
-      setStarting(false);
+    if (detail.params.length) {
+      setRunDialogOpen(true);
+      return;
     }
-  };
+    void startRun();
+  }, [detail, startRun]);
 
   const openRun = useCallback(async (run: PipelineExecution) => {
     try {
       const fresh = await api.getPipelineExecution(run.id);
       setMonitor(fresh);
-      setTab("designer");
+      setTab("graph");
       setSelectedStepKey(fresh.step_runs[0]?.step_id ?? null);
       setDockOpen(true);
       setDockTab("step");
@@ -603,7 +621,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       setNewName("");
       await refreshList();
       setSelectedId(created.id);
-      setTab("designer");
+      setTab("graph");
       toast.success("Pipeline created. Add its first step.");
     } catch (error) {
       toast.error(readApiError(error, "Could not create the pipeline.").message);
@@ -635,7 +653,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     setDraft((current) => ({ ...current, steps: [...current.steps, step] }));
     setSelectedStepKey(key);
     setShowAdd(false);
-    setTab("designer");
+    setTab("graph");
   };
 
   const updateStep = (patch: Partial<PipelineStepDef>) => {
@@ -715,11 +733,12 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       }
       if (meta && event.key === "Enter") {
         event.preventDefault();
-        if (!starting) void runNow();
+        if (!starting) requestRun();
         return;
       }
       if (event.key === "Escape") {
         setEdgeDialog(null);
+        setRunDialogOpen(false);
         setMenuOpen(false);
         setShowAdd(false);
         setShowNew(false);
@@ -728,13 +747,13 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [dirty, saveGraph, starting, clearProblems]);
+  }, [dirty, saveGraph, starting, clearProblems, requestRun]);
 
   // ---------------------------------------------------------------------- view
 
   const status = painted?.status ?? detail?.last_status ?? "idle";
   const runningLabel = monitorActive ? STATUS_TEXT.running : STATUS_TEXT[status] ?? "Never run";
-  const showDock = dockOpen && tab === "designer";
+  const showDock = dockOpen && tab === "graph";
 
   return (
     <div className="flex h-full w-full min-h-0 flex-1 flex-col bg-slate-50">
@@ -787,7 +806,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             <>
               <button
                 type="button"
-                onClick={() => void runNow()}
+                onClick={requestRun}
                 disabled={starting}
                 className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
                 title="Run now (Ctrl+Enter)"
@@ -881,7 +900,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             selectedId={selectedId}
             onSelect={(id) => {
               setSelectedId(id);
-              setTab("designer");
+              setTab("graph");
             }}
             onNew={() => setShowNew(true)}
           />
@@ -895,7 +914,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
         <main className="flex min-w-0 flex-1 flex-col">
           <div className="flex items-center gap-1 border-b border-slate-200 bg-white px-3">
             {([
-              ["designer", "Designer"],
+              ["graph", "Graph"],
               ["runs", `Runs${executions.length ? ` · ${executions.length}` : ""}`],
               ["settings", "Settings"],
             ] as Array<[ViewTab, string]>).map(([key, label]) => (
@@ -912,7 +931,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 {label}
               </button>
             ))}
-            {detail && tab === "designer" && (
+            {detail && tab === "graph" && (
               <div className="ml-auto flex items-center gap-2 py-1">
                 {watching && (
                   <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500">
@@ -933,17 +952,6 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     </button>
                   </span>
                 )}
-                <button
-                  type="button"
-                  onClick={() => setDockOpen((open) => !open)}
-                  className={`flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-semibold ${
-                    dockOpen
-                      ? "border-indigo-200 bg-indigo-50 text-indigo-700"
-                      : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                  }`}
-                >
-                  <ScrollText className="h-3 w-3" /> Logs
-                </button>
               </div>
             )}
           </div>
@@ -973,8 +981,53 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             </div>
           )}
 
-          {detail && tab === "designer" && (
+          {detail && tab === "graph" && (
             <div className="flex min-h-0 flex-1 flex-col">
+              <div className="flex items-center gap-2 border-b border-slate-200 bg-white px-3 py-1.5">
+                <button
+                  type="button"
+                  onClick={() => setShowAdd(true)}
+                  className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700"
+                >
+                  <Plus className="h-3.5 w-3.5" /> Add step
+                </button>
+                <span className="text-[11px] text-slate-500">
+                  {draft.steps.length} step{draft.steps.length === 1 ? "" : "s"} ?{" "}
+                  {draft.edges.length} connection{draft.edges.length === 1 ? "" : "s"}
+                </span>
+                {!draft.steps.length && (
+                  <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                    Add a step before saving
+                  </span>
+                )}
+                <div className="ml-auto flex items-center gap-2">
+                  <div className="hidden items-center gap-2 xl:flex">
+                    {(["success", "failure", "completion", "skipped"] as const).map((condition) => (
+                      <span
+                        key={condition}
+                        className="flex items-center gap-1 text-[10px] text-slate-400"
+                      >
+                        <span
+                          className="h-1.5 w-3 rounded-full"
+                          style={{ background: EDGE_COLOURS[condition] }}
+                        />
+                        {condition}
+                      </span>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDockOpen((open) => !open)}
+                    className={`flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-semibold ${
+                      dockOpen
+                        ? "border-indigo-200 bg-indigo-50 text-indigo-700"
+                        : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    <ScrollText className="h-3 w-3" /> Logs
+                  </button>
+                </div>
+              </div>
               <div className={`min-h-0 flex-1 ${dockExpanded && showDock ? "hidden" : "flex"}`}>
                 <div className="min-w-0 flex-1 bg-slate-50">
                   <PipelineCanvas
@@ -1294,6 +1347,16 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {detail && runDialogOpen && (
+        <PipelineRunDialog
+          pipeline={detail}
+          open={runDialogOpen}
+          running={starting}
+          onClose={() => setRunDialogOpen(false)}
+          onRun={(params) => void startRun(params)}
+        />
       )}
 
       <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />

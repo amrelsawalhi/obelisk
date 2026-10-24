@@ -1,5 +1,15 @@
-import React, { useEffect, useState } from 'react';
-import { AlertCircle, Plus, RefreshCw, ScrollText, Terminal, Trash2, X } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  AlertCircle,
+  Copy,
+  CornerDownLeft,
+  Plus,
+  RefreshCw,
+  ScrollText,
+  Terminal,
+  Trash2,
+  X,
+} from 'lucide-react';
 import type {
   EdgeCondition,
   PipelineStepDef,
@@ -78,6 +88,10 @@ const OutputValue: React.FC<{ name: string; output: { type: string; value: unkno
       : typeof output.value === 'string'
         ? output.value
         : JSON.stringify(output.value);
+  const summary =
+    name === 'dbt_summary' && output.value && typeof output.value === 'object'
+      ? (output.value as Record<string, unknown>)
+      : null;
 
   return (
     <div className="rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5">
@@ -87,9 +101,26 @@ const OutputValue: React.FC<{ name: string; output: { type: string; value: unkno
           {output.type}
         </span>
       </div>
-      <p className="mt-0.5 break-words font-mono text-[10px] leading-snug text-slate-700">
-        {hidden ? '••••••••' : rendered}
-      </p>
+      {summary && !hidden ? (
+        <div className="mt-1 flex flex-wrap gap-1">
+          {(['total', 'ok', 'failed', 'skipped'] as const).map((key) => (
+            <span
+              key={key}
+              className={`rounded px-1 py-0.5 font-mono text-[9px] ${
+                key === 'failed' && Number(summary.failed) > 0
+                  ? 'bg-rose-100 text-rose-700'
+                  : 'bg-white text-slate-600'
+              }`}
+            >
+              {key} {String(summary[key] ?? 0)}
+            </span>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-0.5 break-words font-mono text-[10px] leading-snug text-slate-700">
+          {hidden ? 'masked' : rendered}
+        </p>
+      )}
       {sensitive && (
         <button
           type="button"
@@ -120,6 +151,36 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
 }) => {
   const [argsText, setArgsText] = useState("");
   const [newOutput, setNewOutput] = useState("");
+  const targetRef = useRef<HTMLTextAreaElement | null>(null);
+  const [copiedToken, setCopiedToken] = useState<string | null>(null);
+
+  const copyToken = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedToken(value);
+      window.setTimeout(() => setCopiedToken(null), 1500);
+    } catch {
+      setCopiedToken(null);
+    }
+  };
+
+  // Insert at the caret rather than appending: the token usually belongs inside a
+  // WHERE clause the operator has already started typing.
+  const insertToken = (value: string) => {
+    if (!step) return;
+    const field = targetRef.current;
+    if (!field) {
+      onChange({ target: `${step.target} ${value}`.trim() });
+      return;
+    }
+    const start = field.selectionStart ?? step.target.length;
+    const end = field.selectionEnd ?? start;
+    onChange({ target: step.target.slice(0, start) + value + step.target.slice(end) });
+    window.requestAnimationFrame(() => {
+      field.focus();
+      field.setSelectionRange(start + value.length, start + value.length);
+    });
+  };
 
   useEffect(() => {
     setArgsText(
@@ -171,6 +232,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
       type: spec?.type === "table" ? "table" : "scalar",
       derived: false,
     })),
+    ...(isRawSql ? [{ name: "rows", type: "scalar", derived: true }] : []),
     ...(materialize ? [{ name: "table", type: "table", derived: true }] : []),
     ...(isDbt ? [{ name: "dbt_summary", type: "scalar", derived: true }] : []),
   ];
@@ -237,6 +299,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
             >
               {isRawSql ? (
                 <textarea
+                  ref={targetRef}
                   className={`${inputClass} h-32 font-mono`}
                   value={step.target}
                   onChange={(event) => onChange({ target: event.target.value })}
@@ -368,8 +431,12 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                 <span className="text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
                   Outputs
                 </span>
-                <span className="text-[10px] text-slate-400">{available.length} declared</span>
+                <span className="text-[10px] text-slate-400">{available.length} available</span>
               </div>
+              <p className="border-b border-slate-100 px-2.5 py-1 text-[10px] leading-snug text-slate-400">
+                A result for child steps: a value, not data (at most 4 KB). Rows belong in a
+                table.
+              </p>
               <div className="space-y-2 p-2.5">
                 {isRawSql && (
                   <div className="space-y-1.5">
@@ -499,26 +566,45 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                   </div>
                 )}
                 {available.length > 0 && (
-                  <div className="space-y-1 rounded-lg bg-slate-50 px-2 py-1.5">
+                  <div className="space-y-1.5 rounded-lg bg-slate-50 px-2 py-1.5">
                     <p className="text-[10px] font-semibold text-slate-500">
-                      Children can read these:
+                      Children can read these
                     </p>
-                    {available.map((entry) => (
-                      <code
-                        key={entry.name}
-                        className="block truncate font-mono text-[10px] text-indigo-700"
-                      >
-                        {token(slug(step.name), entry.name)}
-                        {entry.derived ? "  (automatic)" : "  (below, in the child)"}
-                      </code>
-                    ))}
-                    {isProcess && (
-                      <p className="text-[10px] leading-snug text-slate-500">
-                        Write JSON to <code className="font-mono">os.environ["OBELISK_OUTPUT_FILE"]</code>;
-                        direct parents also arrive as{" "}
-                        <code className="font-mono">OBELISK_STEP_&lt;STEP&gt;_&lt;OUTPUT&gt;</code>.
-                      </p>
-                    )}
+                    {available.map((entry) => {
+                      const value = token(slug(step.name), entry.name);
+                      return (
+                        <div key={entry.name} className="flex items-center gap-1">
+                          <code className="min-w-0 flex-1 truncate font-mono text-[10px] text-indigo-700">
+                            {value}
+                          </code>
+                          {entry.derived && (
+                            <span className="shrink-0 rounded bg-white px-1 text-[8px] font-bold uppercase text-slate-400">
+                              auto
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => void copyToken(value)}
+                            className="shrink-0 rounded p-0.5 text-slate-400 hover:bg-white hover:text-slate-600"
+                            aria-label={`Copy ${entry.name}`}
+                          >
+                            <Copy className="h-3 w-3" />
+                          </button>
+                          {isRawSql && (
+                            <button
+                              type="button"
+                              onClick={() => insertToken(value)}
+                              className="shrink-0 rounded p-0.5 text-slate-400 hover:bg-white hover:text-indigo-600"
+                              aria-label={`Insert ${entry.name}`}
+                              title="Insert at the caret"
+                            >
+                              <CornerDownLeft className="h-3 w-3" />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {copiedToken && <p className="text-[9px] text-emerald-600">Copied {copiedToken}</p>}
                     {!parents?.length && (
                       <p className="text-[10px] leading-snug text-slate-400">
                         No parent steps yet, so nothing flows in.
@@ -526,6 +612,25 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                     )}
                   </div>
                 )}
+
+                {isProcess && (
+                  <details className="rounded-lg bg-slate-50 px-2 py-1.5">
+                    <summary className="cursor-pointer text-[10px] font-semibold text-slate-500">
+                      How to publish a value
+                    </summary>
+                    <pre className="mt-1 overflow-x-auto whitespace-pre-wrap font-mono text-[9px] leading-relaxed text-slate-600">
+{`import json, os
+
+with open(os.environ["OBELISK_OUTPUT_FILE"], "w") as fh:
+    json.dump({"max_id": max_id}, fh)`}
+                    </pre>
+                    <p className="mt-1 text-[9px] leading-snug text-slate-400">
+                      Direct parents arrive as OBELISK_STEP_&lt;STEP&gt;_&lt;OUTPUT&gt;. Use a table
+                      for rows.
+                    </p>
+                  </details>
+                )}
+
                 {available.length > 0 && slug(step.name) !== step.name && (
                   <p className="rounded bg-slate-50 px-1.5 py-1 text-[10px] leading-snug text-slate-500">
                     Children address this step as{" "}

@@ -499,6 +499,8 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
         )}
       </ReactFlow>
 
+      {/* Zoom and fit only. 'Add step' lives in the graph bar above the canvas: one
+          primary action, in the place people look for it. */}
       {/* A floating toolbar replaces the boxy default control stack, and hides the
           buttons that do nothing in read-only mode. */}
       <div className="absolute bottom-3 left-3 z-10 flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white/95 p-0.5 shadow-sm backdrop-blur">
@@ -527,18 +529,6 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
         >
           <Maximize2 className="h-3.5 w-3.5" />
         </button>
-        {editable && onAddStep && (
-          <>
-            <span className="mx-0.5 h-4 w-px bg-slate-200" />
-            <button
-              type="button"
-              onClick={onAddStep}
-              className="flex items-center gap-1 rounded px-1.5 py-1 text-[11px] font-semibold text-indigo-600 hover:bg-indigo-50"
-            >
-              <Plus className="h-3.5 w-3.5" /> Step
-            </button>
-          </>
-        )}
       </div>
 
       {!steps.length && (

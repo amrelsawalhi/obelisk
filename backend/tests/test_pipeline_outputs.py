@@ -40,9 +40,10 @@ def _graph(steps, edges=None):
 
 def test_declared_outputs_includes_derived_ones():
     assert declared_outputs("dbt_run", {}) == {"dbt_summary": "scalar"}
+    # raw SQL always knows its row count; materialising adds the table name.
     assert declared_outputs(
         "raw_sql", {"materialize": {"layer": "bronze", "name": "orders"}}
-    ) == {"table": "table"}
+    ) == {"rows": "scalar", "table": "table"}
     assert declared_outputs(
         "script", {"outputs": {"rows": {"type": "scalar"}, "sneaky": "table"}}
     ) == {"rows": "scalar", "sneaky": "table"}
@@ -93,7 +94,8 @@ async def test_undeclared_or_non_parent_output_references_are_rejected():
         )
         assert undeclared.status_code == 400
         detail = undeclared.json()["detail"]
-        assert "declares none" in detail["message"]
+        # The message names what the parent does publish, not just that it is wrong.
+        assert "declares rows" in detail["message"]
         assert sorted(detail["steps"]) == ["load", "use"]
 
         # With no edge the referenced step is not a parent at all.
@@ -212,6 +214,8 @@ async def test_materialize_writes_a_dataset_and_publishes_its_name():
             ).scalars().one()
         outputs = json.loads(step_run.output_json or "{}")
         assert outputs["table"]["value"] == f"{layer}.numbers"
+        # Row count is published without being declared.
+        assert outputs["rows"]["value"] == 2
         assert "Materialized 2 row(s)" in (step_run.logs or "")
         assert (settings.lakehouse_root_path / layer).exists()
     finally:
@@ -374,3 +378,35 @@ async def test_a_name_with_a_space_is_reachable_by_its_slug():
         )
         assert created.status_code == 201, created.text
         await client.delete(f"/api/pipelines/{created.json()['id']}")
+
+
+
+def test_structured_values_are_interpolated_as_json():
+    """A dict must not reach a webhook body as Python repr (single quotes, None)."""
+    parents = {
+        "dbt": {
+            "dbt_summary": {
+                "type": "scalar",
+                "value": {"total": 9, "failed": 0, "failures": []},
+            }
+        }
+    }
+    rendered = render_plain_step_refs('{"summary": "{steps.dbt.dbt_summary}"}', parents)
+    assert rendered == '{"summary": "{\"total\":9,\"failed\":0,\"failures\":[]}"}'
+    sql = render_step_refs("select {{steps.dbt.dbt_summary}} as s", parents)
+    assert chr(34) + "total" + chr(34) + ":9" in sql
+    assert "None" not in sql
+
+
+@pytest.mark.asyncio
+async def test_a_pipeline_without_steps_refuses_to_run():
+    async with _client() as client:
+        created = await client.post(
+            "/api/pipelines", json={"name": f"empty-{uuid.uuid4().hex[:6]}"}
+        )
+        assert created.status_code == 201
+        pipeline_id = created.json()["id"]
+        refused = await client.post(f"/api/pipelines/{pipeline_id}/run", json={})
+        assert refused.status_code == 400
+        assert "no steps" in refused.json()["detail"]["message"]
+        await client.delete(f"/api/pipelines/{pipeline_id}")
