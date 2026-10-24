@@ -6,8 +6,10 @@ import ReactFlow, {
   MiniMap,
   Position,
   Handle,
+  ReactFlowProvider,
   applyEdgeChanges,
   applyNodeChanges,
+  useReactFlow,
   type Connection,
   type Edge,
   type EdgeChange,
@@ -150,6 +152,8 @@ export interface PipelineCanvasProps {
   steps: PipelineStepDef[];
   edges: Array<EdgePayload & { id?: string }>;
   editable: boolean;
+  /** Changes when a different pipeline is opened, so the view refits. */
+  fitKey?: string;
   runtimeByStep?: Record<string, StepRuntime>;
   selectedStepId?: string | null;
   onSelectStep?: (stepId: string | null) => void;
@@ -165,10 +169,11 @@ export interface PipelineCanvasProps {
  * ``runtimeByStep`` paints the same boxes with a run's outcome. That is the point —
  * the picture an operator edits is the picture they watch run.
  */
-export const PipelineCanvas: React.FC<PipelineCanvasProps> = ({
+const CanvasInner: React.FC<PipelineCanvasProps> = ({
   steps,
   edges,
   editable,
+  fitKey,
   runtimeByStep,
   selectedStepId,
   onSelectStep,
@@ -176,6 +181,7 @@ export const PipelineCanvas: React.FC<PipelineCanvasProps> = ({
   onDeleteStep,
   onMoveStep,
 }) => {
+  const { fitView } = useReactFlow();
   const nodes: Node<StepNodeData>[] = useMemo(
     () =>
       steps.map((step) => ({
@@ -204,7 +210,9 @@ export const PipelineCanvas: React.FC<PipelineCanvasProps> = ({
           target: edge.to_key,
           label: edge.condition === 'success' ? undefined : edge.condition,
           labelStyle: { fill: colour, fontSize: 10, fontWeight: 700 },
-          labelBgStyle: { fill: '#ffffff', fillOpacity: 0.9 },
+          labelBgStyle: { fill: '#ffffff', fillOpacity: 0.95 },
+          labelBgPadding: [4, 2] as [number, number],
+          labelBgBorderRadius: 3,
           style: { stroke: colour, strokeWidth: 2 },
           markerEnd: { type: MarkerType.ArrowClosed, color: colour },
           animated: edge.condition === 'failure',
@@ -218,6 +226,19 @@ export const PipelineCanvas: React.FC<PipelineCanvasProps> = ({
 
   useEffect(() => setLiveNodes(nodes), [nodes]);
   useEffect(() => setLiveEdges(flowEdges), [flowEdges]);
+
+  // `fitView` on mount only covers the first render: opening another pipeline, or
+  // adding a step to a graph that already fills the canvas, would leave boxes off
+  // screen. Refitting whenever the step set or the pipeline changes keeps the whole
+  // graph visible — including the node the user just added.
+  const stepKeys = useMemo(() => steps.map((step) => step.key).join(','), [steps]);
+  useEffect(() => {
+    const handle = window.setTimeout(
+      () => fitView({ padding: 0.25, maxZoom: 1, duration: 200 }),
+      80,
+    );
+    return () => window.clearTimeout(handle);
+  }, [fitKey, stepKeys, fitView]);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -262,6 +283,9 @@ export const PipelineCanvas: React.FC<PipelineCanvasProps> = ({
         elementsSelectable
         deleteKeyCode={editable ? ['Backspace', 'Delete'] : null}
         fitView
+        fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+        minZoom={0.3}
+        maxZoom={1.6}
         proOptions={{ hideAttribution: true }}
         className="bg-slate-50"
       >
@@ -274,12 +298,25 @@ export const PipelineCanvas: React.FC<PipelineCanvasProps> = ({
             const runtime = (node.data as StepNodeData)?.runtime;
             return runtime?.status ? STATUS_STYLES[runtime.status]?.ring ?? '#cbd5e1' : '#cbd5e1';
           }}
-          className="!bg-white"
+          maskColor="rgba(241, 245, 249, 0.55)"
+          style={{ width: 150, height: 100 }}
+          className="!rounded-lg !border !border-slate-200 !bg-white"
         />
       </ReactFlow>
     </div>
   );
 };
+
+/**
+ * The canvas is wrapped in its own provider so the inner component can call
+ * ``useReactFlow().fitView`` — needed to refit when the pipeline or step set changes,
+ * not just on first mount.
+ */
+export const PipelineCanvas: React.FC<PipelineCanvasProps> = (props) => (
+  <ReactFlowProvider>
+    <CanvasInner {...props} />
+  </ReactFlowProvider>
+);
 
 export const stepTypeLabel = (type: StepType) => STEP_LABELS[type] ?? type;
 export const stepTypeIcon = (type: StepType) => STEP_ICONS[type] ?? Activity;

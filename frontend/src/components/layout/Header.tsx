@@ -35,7 +35,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand }) => {
     },
     pipelines: {
       title: 'Pipelines',
-      subtitle: 'Schedule dbt models, scripts, and notebooks or connect Dagster',
+      subtitle: 'Drag dependencies, schedule runs and watch every step execute',
     },
     dashboards: {
       title: 'Dashboards & BI',

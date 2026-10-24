@@ -137,6 +137,10 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
 
   const [executions, setExecutions] = useState<PipelineExecution[]>([]);
   const [monitor, setMonitor] = useState<PipelineExecutionDetail | null>(null);
+  // The newest finished run, used to paint the canvas while designing. Without it
+  // a pipeline that ran a minute ago still shows "Not run yet" on every step, which
+  // makes the picture disagree with the history underneath it.
+  const [latestRun, setLatestRun] = useState<PipelineExecutionDetail | null>(null);
   const [stepLogs, setStepLogs] = useState('');
   const [logsOffset, setLogsOffset] = useState(0);
   const [loadingLogs, setLoadingLogs] = useState(false);
@@ -158,9 +162,16 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
     return map;
   }, [monitor]);
 
+  const paintedByStep = useMemo(() => {
+    const source = monitor ?? latestRun;
+    const map: Record<string, StepRunItem> = {};
+    for (const stepRun of source?.step_runs ?? []) map[stepRun.step_id] = stepRun;
+    return map;
+  }, [monitor, latestRun]);
+
   const runtimeByStep = useMemo(() => {
     const map: Record<string, StepRuntime> = {};
-    for (const [stepId, stepRun] of Object.entries(monitorByStep)) {
+    for (const [stepId, stepRun] of Object.entries(paintedByStep)) {
       map[stepId] = {
         status: stepRun.status,
         duration_seconds: stepRun.duration_seconds,
@@ -169,7 +180,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
       };
     }
     return map;
-  }, [monitorByStep]);
+  }, [paintedByStep]);
 
   const selectedStepRun = selectedStepKey ? monitorByStep[selectedStepKey] ?? null : null;
   const monitorActive = monitor != null && !TERMINAL.includes(monitor.status);
@@ -197,6 +208,8 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
       setLogsOffset(0);
       const runs = await api.listPipelineExecutions({ pipeline_id: pipelineId, limit: 40 });
       setExecutions(runs);
+      const newest = runs.find((run) => TERMINAL.includes(run.status)) ?? runs[0] ?? null;
+      setLatestRun(newest ? await api.getPipelineExecution(newest.id) : null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not load this pipeline.');
     } finally {
@@ -227,7 +240,11 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
     try {
       const fresh = await api.getPipelineExecution(monitor.id);
       setMonitor(fresh);
-      if (TERMINAL.includes(fresh.status)) refreshExecutions();
+      if (TERMINAL.includes(fresh.status)) {
+        // Keep the design view painted with the run the operator just watched.
+        setLatestRun(fresh);
+        refreshExecutions();
+      }
     } catch {
       /* keep the last known picture */
     }
@@ -450,7 +467,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
   // --------------------------------------------------------------------- view
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-slate-50">
+    <div className="flex h-full w-full min-h-0 flex-1 flex-col bg-slate-50">
       <div className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
         <div>
           <h1 className="text-sm font-bold text-slate-800">Pipelines</h1>
@@ -705,6 +722,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
                         steps={draft.steps}
                         edges={draft.edges}
                         editable={!monitor}
+                        fitKey={detail.id}
                         runtimeByStep={runtimeByStep}
                         selectedStepId={selectedStepKey}
                         onSelectStep={setSelectedStepKey}
