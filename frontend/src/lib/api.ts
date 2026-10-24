@@ -390,6 +390,17 @@ export const api = {
     }>(`/step-runs/${stepRunId}/logs`, { params: { after } });
     return res.data;
   },
+  getRunLogs: async (
+    runId: string,
+  ): Promise<{ run_id: string; status: string; size: number; logs: string }> => {
+    const res = await apiClient.get<{
+      run_id: string;
+      status: string;
+      size: number;
+      logs: string;
+    }>(`/pipeline-runs/${runId}/logs`);
+    return res.data;
+  },
   getAssetGraph: async (selector?: string): Promise<AssetGraphResponse> => {
     const res = await apiClient.get<AssetGraphResponse>('/pipelines/assets', {
       params: selector ? { selector } : {},

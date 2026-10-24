@@ -12,6 +12,7 @@ import {
   Save,
   Settings2,
   Square,
+  Terminal,
   Trash2,
   X,
 } from 'lucide-react';
@@ -144,6 +145,8 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
   const [stepLogs, setStepLogs] = useState('');
   const [logsOffset, setLogsOffset] = useState(0);
   const [loadingLogs, setLoadingLogs] = useState(false);
+  const [runLog, setRunLog] = useState<string | null>(null);
+  const [runLogOpen, setRunLogOpen] = useState(false);
 
   const dirty = useMemo(() => {
     if (!detail) return false;
@@ -282,7 +285,25 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
   useEffect(() => {
     setStepLogs('');
     setLogsOffset(0);
-  }, [selectedStepKey, monitor?.id]);
+    // Load the selected step's log once. The poller below only runs while the step
+    // is still executing, so without this a finished run showed "No output yet"
+    // forever — which is exactly why the logs were impossible to find.
+    if (!selectedStepRun?.id) return;
+    let cancelled = false;
+    api
+      .getStepRunLogs(selectedStepRun.id, 0)
+      .then((tail) => {
+        if (cancelled) return;
+        setStepLogs(tail.logs);
+        setLogsOffset(tail.size);
+      })
+      .catch(() => {
+        if (!cancelled) setStepLogs('');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedStepRun?.id]);
 
 
   // ------------------------------------------------------------------ actions
@@ -333,7 +354,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
       const { run_id } = await api.runPipelineNow(detail.id);
       const fresh = await api.getPipelineExecution(run_id);
       setMonitor(fresh);
-      setSelectedStepKey(null);
+      setSelectedStepKey(fresh.step_runs[0]?.step_id ?? null);
       await refreshExecutions();
       await refreshList();
     } catch (err) {
@@ -352,6 +373,17 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
       setError(err instanceof Error ? err.message : 'Could not cancel this run.');
     }
   };
+
+  const openRunLog = useCallback(async () => {
+    if (!monitor?.id) return;
+    setRunLogOpen(true);
+    try {
+      const res = await api.getRunLogs(monitor.id);
+      setRunLog(res.logs);
+    } catch {
+      setRunLog('Could not load this run log.');
+    }
+  }, [monitor?.id]);
 
   const rerunFromSelected = async () => {
     if (!monitor || !selectedStepKey) return;
@@ -468,13 +500,9 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
 
   return (
     <div className="flex h-full w-full min-h-0 flex-1 flex-col bg-slate-50">
-      <div className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
-        <div>
-          <h1 className="text-sm font-bold text-slate-800">Pipelines</h1>
-          <p className="text-[11px] text-slate-500">
-            Dependencies, schedules and run history for everything Obelisk executes.
-          </p>
-        </div>
+      {/* The page title lives in the app header; repeating it here read as two
+          headlines. This bar only carries the actions. */}
+      <div className="flex items-center justify-end gap-2 border-b border-slate-200 bg-white px-6 py-2">
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -670,6 +698,13 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
                     ))}
                   </div>
                   <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={openRunLog}
+                      className="flex items-center gap-1 rounded-lg border border-indigo-300 bg-white px-2 py-1 text-[11px] font-semibold text-indigo-700 hover:bg-indigo-50"
+                    >
+                      <Terminal className="h-3 w-3" /> Run log
+                    </button>
                     {monitorActive && (
                       <button
                         type="button"
@@ -693,20 +728,17 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
               <div className="flex min-h-0 flex-1">
                 <div className="flex min-w-0 flex-1 flex-col">
                   {!monitor && (
-                    <div className="flex flex-wrap items-center gap-1.5 border-b border-slate-200 bg-white px-3 py-2">
-                      <span className="mr-1 flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide text-slate-400 font-mono">
-                        <Plus className="h-3 w-3" /> Add step
+                    <div className="flex items-center gap-2 border-b border-slate-200 bg-white px-3 py-2">
+                      <button
+                        type="button"
+                        onClick={() => addStep('dbt_run')}
+                        className="flex items-center gap-1.5 rounded-lg border border-dashed border-indigo-300 bg-indigo-50/40 px-2.5 py-1.5 text-[11px] font-semibold text-indigo-700 hover:bg-indigo-50"
+                      >
+                        <Plus className="h-3.5 w-3.5" /> Add step
+                      </button>
+                      <span className="text-[10px] text-slate-400">
+                        Pick the step type and target in the panel on the right.
                       </span>
-                      {STEP_TEMPLATES.map((template) => (
-                        <button
-                          key={template.type}
-                          type="button"
-                          onClick={() => addStep(template.type)}
-                          className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
-                        >
-                          {template.name}
-                        </button>
-                      ))}
                     </div>
                   )}
 
@@ -803,11 +835,11 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
                           onClick={async () => {
                             const fresh = await api.getPipelineExecution(run.id);
                             setMonitor(fresh);
-                            setSelectedStepKey(null);
+                            setSelectedStepKey(fresh.step_runs[0]?.step_id ?? null);
                           }}
                           className="rounded border border-slate-300 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-white"
                         >
-                          Watch
+                          Logs
                         </button>
                         {!TERMINAL.includes(run.status) && (
                           <button
@@ -828,6 +860,44 @@ export const PipelinesView: React.FC<PipelinesViewProps> = ({ onNavigateToSettin
         </section>
       </div>
 
+
+      {runLogOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="flex h-[80vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-2.5">
+              <div className="flex items-center gap-2">
+                <Terminal className="h-4 w-4 text-indigo-600" />
+                <div>
+                  <p className="text-xs font-bold text-slate-800">Run log</p>
+                  <p className="font-mono text-[10px] text-slate-400">
+                    {monitor?.id} · {monitor?.status} · {monitor?.kind}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={openRunLog}
+                  className="flex items-center gap-1 rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                >
+                  <RefreshCw className="h-3 w-3" /> Refresh
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRunLogOpen(false)}
+                  aria-label="Close"
+                  className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <pre className="flex-1 select-text overflow-auto whitespace-pre-wrap bg-slate-950 p-3 text-[11px] leading-relaxed text-slate-100">
+              {runLog ?? 'Loading…'}
+            </pre>
+          </div>
+        </div>
+      )}
 
       {pendingEdge && (
         <EdgeConditionModal

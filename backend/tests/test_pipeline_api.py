@@ -222,6 +222,41 @@ async def test_run_now_appears_in_history_with_step_logs():
 
 
 @pytest.mark.asyncio
+async def test_run_log_concatenates_every_step():
+    """The whole-run log keeps step boundaries so it can be read as a narrative."""
+    async with _client() as client:
+        pipeline = (
+            await client.post(
+                "/api/pipelines",
+                json={
+                    "name": f"logs-{uuid.uuid4().hex[:6]}",
+                    "graph": _graph(
+                        [_step("a", "first", target="zz_missing_a"), _step("b", "second")],
+                        [{"from_key": "a", "to_key": "b"}],
+                    ),
+                },
+            )
+        ).json()
+
+        run_id = (await client.post(f"/api/pipelines/{pipeline['id']}/run", json={})).json()[
+            "run_id"
+        ]
+        payload = (await client.get(f"/api/pipeline-runs/{run_id}/logs")).json()
+
+        assert payload["run_id"] == run_id
+        assert payload["size"] == len(payload["logs"])
+        assert "Pipeline :" in payload["logs"]
+        # Both steps appear with their status, even before anything executed.
+        assert "STEP first" in payload["logs"]
+        assert "STEP second" in payload["logs"]
+
+        missing = await client.get("/api/pipeline-runs/does-not-exist/logs")
+        assert missing.status_code == 404
+
+        await client.delete(f"/api/pipelines/{pipeline['id']}")
+
+
+@pytest.mark.asyncio
 async def test_targets_lists_real_workspace_files():
     async with _client() as client:
         targets = (await client.get("/api/pipelines/targets")).json()

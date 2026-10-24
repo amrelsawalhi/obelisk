@@ -168,7 +168,7 @@ const AppLayout: React.FC = () => {
                 key={tab}
                 aria-hidden={!isActive}
                 className={`absolute inset-0 flex min-h-0 overflow-hidden ${
-                  isActive ? 'z-10 visible' : 'invisible pointer-events-none'
+                  isActive ? 'z-10 visible' : 'obelisk-inactive-view pointer-events-none'
                 }`}
               >
                 <ViewActivityProvider value={isActive}>

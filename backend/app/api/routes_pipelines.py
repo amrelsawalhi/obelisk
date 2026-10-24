@@ -850,6 +850,68 @@ async def rerun_from(run_id: str, step_id: str):
     return {"run_id": new_run_id, "source_run_id": run_id, "from_step": step_id}
 
 
+@router.get("/pipeline-runs/{run_id}/logs")
+async def run_logs(run_id: str):
+    """The whole run in one log: every step's output, in execution order.
+
+    Per-step logs are what the inspector shows; this is the answer to "what did this
+    run actually do", with the step boundaries kept so the text stays readable.
+    """
+    async with AsyncSessionLocal() as session:
+        run = await session.get(PipelineRun, run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        pipeline = await session.get(Pipeline, run.pipeline_id)
+        step_runs = (
+            await session.execute(
+                select(StepRun)
+                .where(StepRun.run_id == run_id)
+                .order_by(StepRun.started_at.asc(), StepRun.id.asc())
+            )
+        ).scalars().all()
+        names = dict(
+            (
+                await session.execute(
+                    select(PipelineStep.id, PipelineStep.name).where(
+                        PipelineStep.pipeline_id == run.pipeline_id
+                    )
+                )
+            ).all()
+        )
+
+    lines = [
+        f"Run {run.id}  ({run.kind}, triggered by {run.triggered_by or 'unknown'})",
+        f"Pipeline : {pipeline.name if pipeline else '(deleted)'}",
+        f"Status   : {run.status}"
+        + (f"   duration {run.duration_seconds}s" if run.duration_seconds is not None else ""),
+        f"Started  : {run.started_at or '—'}",
+        f"Ended    : {run.ended_at or '—'}",
+    ]
+    if run.error:
+        lines.append(f"Error    : {run.error}")
+
+    for step_run in step_runs:
+        lines.append("")
+        lines.append("=" * 78)
+        lines.append(
+            f"STEP {names.get(step_run.step_id, '(deleted step)')}  "
+            f"[{step_run.status}]  attempt {step_run.attempt}"
+            + (f"  {step_run.duration_seconds}s" if step_run.duration_seconds is not None else "")
+        )
+        if step_run.error:
+            lines.append(f"error: {step_run.error}")
+        lines.append("-" * 78)
+        lines.append(step_run.logs or "(no output)")
+
+    text = "\n".join(lines)
+    return {
+        "run_id": run.id,
+        "status": run.status,
+        "size": len(text),
+        "logs": text,
+    }
+
+
 @router.get("/step-runs/{step_run_id}/logs")
 async def step_logs(step_run_id: str, after: int = Query(0, ge=0)):
     """Incremental log tail: poll with ``after=<previous size>`` while running."""

@@ -270,7 +270,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
               <p className="mb-1 text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
                 Logs
               </p>
-              <pre className="h-64 overflow-auto rounded-lg bg-slate-900 p-2 text-[10px] leading-relaxed text-slate-100">
+              <pre className="h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-900 p-2 text-[10px] leading-relaxed text-slate-100">
                 {loadingLogs && !logs ? 'Loading…' : logs || 'No output yet.'}
               </pre>
             </div>

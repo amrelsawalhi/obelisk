@@ -1,3 +1,4 @@
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -31,4 +32,14 @@
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #94a3b8;
+}
+
+/* React Flow writes inline `visibility: visible` on measured nodes, and an inline
+   style beats the inherited `visibility: hidden` of an ancestor. App keeps every
+   visited tab mounted (hidden with visibility, not display, so Monaco and xterm
+   survive a switch), which let a pipeline canvas paint itself over other tabs.
+   Force the whole subtree of an inactive view hidden. */
+.obelisk-inactive-view,
+.obelisk-inactive-view * {
+  visibility: hidden !important;
 }
