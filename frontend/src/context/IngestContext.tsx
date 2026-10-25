@@ -117,6 +117,7 @@ export const IngestProvider: React.FC<{ children: React.ReactNode }> = ({ childr
               completed_tables: payload.completed_tables ?? current.completed_tables,
               total_tables: payload.total_tables ?? current.total_tables,
               total_rows: payload.total_rows ?? current.total_rows,
+              staged_rows: payload.staged_rows ?? current.staged_rows,
             },
           };
         });

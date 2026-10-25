@@ -292,6 +292,8 @@ export interface IngestJobInfo {
   current_phase?: string | null;
   percent: number;
   total_rows: number;
+  /** Rows staged for the table in flight; not yet committed, so kept out of total_rows. */
+  staged_rows?: number;
   logs: string[];
   results: BatchIngestResultItem[];
   errors: BatchIngestErrorItem[];

@@ -50,13 +50,20 @@ export const IngestActivityDock: React.FC = () => {
   const isSuccess = currentJob?.status === 'completed';
   const isCancelled = currentJob?.status === 'cancelled';
 
+  // Percent is completed/total tables, so a single-table job can only be 0 or 100: the bar
+  // sat empty while 500k rows streamed in. Show it as indeterminate and let rows carry it.
+  const indeterminate = isRunning && (currentJob?.total_tables ?? 1) <= 1;
+
   // Calculate aggregate stats across all jobs
   const totalJobs = jobList.length;
   const completedCount = jobList.filter((j) => j.status === 'completed').length;
   const avgPercent = Math.round(
     jobList.reduce((acc, j) => acc + (j.percent || 0), 0) / Math.max(totalJobs, 1)
   );
-  const totalExtractedRows = jobList.reduce((acc, j) => acc + (j.total_rows || 0), 0);
+  const totalExtractedRows = jobList.reduce(
+    (acc, j) => acc + (j.total_rows || 0) + (j.staged_rows || 0),
+    0
+  );
 
   // 1. Minimized Floating Pill View (Option A Collapsed)
   if (isMinimized) {
@@ -246,22 +253,28 @@ export const IngestActivityDock: React.FC = () => {
               {isRunning && <RefreshCw className="w-3 h-3 text-indigo-600 animate-spin shrink-0" />}
               <span className="truncate">{currentJob.current_phase || (isRunning ? 'Processing...' : 'Completed')}</span>
             </span>
-            <span className="font-mono text-indigo-600 font-bold shrink-0">{currentJob.percent}%</span>
+            <span className="font-mono text-indigo-600 font-bold shrink-0">
+              {indeterminate ? '—' : `${currentJob.percent}%`}
+            </span>
           </div>
 
           <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
-            <div
-              className={`h-full transition-all duration-300 ${
-                isRunning
-                  ? 'bg-gradient-to-r from-indigo-500 to-indigo-600'
-                  : isSuccess
-                  ? 'bg-emerald-500'
-                  : isCancelled
-                  ? 'bg-amber-500'
-                  : 'bg-rose-500'
-              }`}
-              style={{ width: `${currentJob.percent}%` }}
-            />
+            {indeterminate ? (
+              <div className="h-full w-full bg-gradient-to-r from-indigo-400 via-indigo-600 to-indigo-400 animate-pulse" />
+            ) : (
+              <div
+                className={`h-full transition-all duration-300 ${
+                  isRunning
+                    ? 'bg-gradient-to-r from-indigo-500 to-indigo-600'
+                    : isSuccess
+                    ? 'bg-emerald-500'
+                    : isCancelled
+                    ? 'bg-amber-500'
+                    : 'bg-rose-500'
+                }`}
+                style={{ width: `${currentJob.percent}%` }}
+              />
+            )}
           </div>
         </div>
 
@@ -281,7 +294,9 @@ export const IngestActivityDock: React.FC = () => {
               Rows Extracted
             </div>
             <div className="text-sm font-bold text-indigo-600 font-mono mt-0.5">
-              {currentJob.total_rows.toLocaleString()}
+              {(
+                (currentJob.total_rows || 0) + (currentJob.staged_rows || 0)
+              ).toLocaleString()}
             </div>
           </div>
 

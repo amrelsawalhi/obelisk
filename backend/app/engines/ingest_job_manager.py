@@ -32,6 +32,9 @@ class IngestJob:
     current_phase: Optional[str] = None
     percent: int = 0
     total_rows: int = 0
+    # Rows staged for the table in flight. Kept apart from total_rows so a failed write
+    # cannot leave the job claiming rows that were never committed.
+    staged_rows: int = 0
     logs: List[str] = field(default_factory=list)
     results: List[Dict[str, Any]] = field(default_factory=list)
     errors: List[Dict[str, str]] = field(default_factory=list)
@@ -163,6 +166,7 @@ class IngestJobManager:
         completed_tables: Optional[int] = None,
         failed_tables: Optional[int] = None,
         total_rows: Optional[int] = None,
+        staged_rows: Optional[int] = None,
     ):
         job = self._jobs.get(job_id)
         if not job:
@@ -178,6 +182,8 @@ class IngestJobManager:
             job.failed_tables = failed_tables
         if total_rows is not None:
             job.total_rows = total_rows
+        if staged_rows is not None:
+            job.staged_rows = staged_rows
 
         if job.total_tables > 0:
             done = job.completed_tables + job.failed_tables
@@ -194,6 +200,7 @@ class IngestJobManager:
             "current_table": job.current_table,
             "current_phase": job.current_phase,
             "total_rows": job.total_rows,
+            "staged_rows": job.staged_rows,
             "status": job.status,
         })
         for q in list(self._subscribers.get(job_id, [])):
@@ -202,9 +209,7 @@ class IngestJobManager:
             except Exception:
                 pass
 
-    def _batch_progress(
-        self, job_id: str, job: IngestJob, label: Optional[str] = None
-    ) -> Callable[[int], None]:
+    def _batch_progress(self, job_id: str, label: Optional[str] = None) -> Callable[[int], None]:
         """A per-batch progress hook that is safe to call from the worker thread.
 
         ``update_progress`` writes to the SSE queues, which belong to the event loop, so
@@ -219,7 +224,9 @@ class IngestJobManager:
                     self.update_progress,
                     job_id,
                     current_phase=phase,
-                    total_rows=job.total_rows + staged,
+                    # Deliberately not total_rows: these rows are in the temp table, and a
+                    # write that fails must not leave them counted as ingested.
+                    staged_rows=staged,
                 )
             )
 
@@ -349,11 +356,12 @@ class IngestJobManager:
                 limit=limit,
                 write_strategy=write_strategy,
                 primary_key=primary_key,
-                on_batch=self._batch_progress(job_id, job),
+                on_batch=self._batch_progress(job_id),
             )
 
             job.results.append(res)
             job.total_rows += res.get("num_rows", 0)
+            job.staged_rows = 0
             job.completed_tables = 1
             job.percent = 100
             job.status = "completed"
@@ -370,6 +378,9 @@ class IngestJobManager:
         except Exception as e:
             job.status = "failed"
             job.failed_tables = 1
+            # Whatever was staged was never committed: nothing is written until the final
+            # statement runs, and that is the statement that just failed.
+            job.staged_rows = 0
             job.completed_at = datetime.now(timezone.utc).isoformat()
             job.duration_ms = int((time.time() - start_time) * 1000)
             err_msg = str(e)
@@ -429,13 +440,14 @@ class IngestJobManager:
                         write_strategy=write_strategy,
                         primary_key=primary_key,
                         on_batch=self._batch_progress(
-                            job_id, job, label=f"Extracting ({idx + 1}/{len(tables)})"
+                            job_id, label=f"Extracting ({idx + 1}/{len(tables)})"
                         ),
                     )
                     t_duration = int((time.time() - table_start) * 1000)
                     job.results.append(res)
                     job.completed_tables += 1
                     job.total_rows += res.get("num_rows", 0)
+                    job.staged_rows = 0
 
                     self.append_log(
                         job_id,
@@ -445,6 +457,7 @@ class IngestJobManager:
                 except Exception as table_err:
                     err_msg = str(table_err)
                     job.failed_tables += 1
+                    job.staged_rows = 0
                     job.errors.append({"table": table_name, "error": err_msg})
                     self.append_log(job_id, f"  ✗ Failed '{table_name}': {err_msg}")
 

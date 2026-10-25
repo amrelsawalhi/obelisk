@@ -75,15 +75,55 @@ def test_batch_progress_lands_when_called_from_a_worker_thread() -> None:
     )
 
     async def run() -> None:
-        hook = manager._batch_progress(job.id, job)
+        hook = manager._batch_progress(job.id)
         await asyncio.to_thread(hook, 150_000)
         await asyncio.sleep(0.05)
 
     try:
         asyncio.run(run())
 
-        assert job.total_rows == 150_000
+        # Staged, not written: the rows sit in the temp table until the write statement runs,
+        # so they must not be added to the rows this job claims to have ingested.
+        assert job.staged_rows == 150_000
+        assert job.total_rows == 0
         assert job.current_phase == "Staged 150,000 rows"
+    finally:
+        _cleanup(("ingest", job.id))
+
+
+def test_a_failed_write_does_not_leave_staged_rows_counted() -> None:
+    """A table that fails after staging reports the rows it actually wrote: none."""
+    manager = IngestJobManager()
+    job = manager.create_job(
+        title="failure probe",
+        job_type="single",
+        connection_id="conn-1",
+        source_name="source",
+        source_type="not-a-real-source",
+        mode="snapshot",
+    )
+
+    async def run() -> None:
+        hook = manager._batch_progress(job.id)
+        await asyncio.to_thread(hook, 250_000)
+        await asyncio.sleep(0.05)
+        assert job.staged_rows == 250_000
+
+        # The driver rejects the unknown source, so the write never happens.
+        await manager.execute_single_job_async(
+            job_id=job.id,
+            connection_params={},
+            entity="orders",
+            mode="snapshot",
+        )
+        await asyncio.sleep(0.05)
+
+    try:
+        asyncio.run(run())
+
+        assert job.status == "failed"
+        assert job.staged_rows == 0
+        assert job.total_rows == 0
     finally:
         _cleanup(("ingest", job.id))
 
@@ -102,7 +142,7 @@ def test_batch_progress_keeps_the_table_position() -> None:
     )
 
     async def run() -> None:
-        hook = manager._batch_progress(job.id, job, label="Extracting (2/5)")
+        hook = manager._batch_progress(job.id, label="Extracting (2/5)")
         await asyncio.to_thread(hook, 1_500)
         await asyncio.sleep(0.05)
 
