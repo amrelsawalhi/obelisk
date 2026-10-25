@@ -112,7 +112,10 @@ class IngestEngine:
                 SELECT * FROM raw_batch
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY "{primary_key}" {order_sql}) = 1
             '''
-            return dconn.execute(dedup_sql).arrow().read_all()
+            # fetch_arrow_table() exists across the whole duckdb range this project
+            # declares; DuckDBPyConnection.arrow() only appeared in later releases, so
+            # using it made a clean install fail where the dev box passed.
+            return dconn.execute(dedup_sql).fetch_arrow_table()
         finally:
             # Always close: a lingering DuckDB connection retains OS-level file
             # locks on Parquet files and triggers [WinError 32] on Windows when

@@ -19,7 +19,11 @@ import obelisk
 @pytest.fixture(scope="module")
 def sample_bronze_dataset():
     """Provisions a real Snappy Parquet table in Bronze storage for SDK verification."""
-    storage_dir = Path(settings.duckdb_storage_path)
+    # Both readers ask for "bronze.<table>", so the file belongs in the bronze folder.
+    # At the lakehouse root it was also in the path of the autouse cleanup, which
+    # deletes sdk_orders_* files after every test -- invisible while the Spark test was
+    # skipped for want of a JDK, and a FileNotFoundError as soon as one was installed.
+    storage_dir = Path(settings.duckdb_storage_path) / "bronze"
     storage_dir.mkdir(parents=True, exist_ok=True)
     table_name = f"sdk_orders_{uuid.uuid4().hex[:6]}"
     target_path = storage_dir / f"{table_name}.parquet"

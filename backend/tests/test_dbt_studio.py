@@ -33,10 +33,15 @@ async def test_dbt_studio_project_tree():
 
 
 @pytest.mark.asyncio
-async def test_dbt_studio_file_lifecycle_and_compile():
+async def test_dbt_studio_file_lifecycle_and_compile(source_postgres_params):
     """
     Tests creating a real model file models/staging/stg_test_unit.sql,
     reading it, compiling it with real dbt compile, and verifying output.
+
+    ``dbt compile`` opens a connection to the target to resolve relations, so this
+    needs a live warehouse -- the same fixture the preview and run tests use. Without
+    it the test failed on any machine that had no Postgres on 5434 instead of saying
+    what it actually required.
     """
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
