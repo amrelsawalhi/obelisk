@@ -267,7 +267,7 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
               <thead>
                 <tr className="bg-slate-100/80 border-b border-slate-200 text-slate-700 font-mono">
                   <th className="py-2.5 px-4 font-semibold">Column Name</th>
-                  <th className="py-2.5 px-4 font-semibold">Physical Data Type</th>
+                  <th className="py-2.5 px-4 font-semibold">Data Type</th>
                   <th className="py-2.5 px-4 font-semibold">Nullable</th>
                 </tr>
               </thead>
