@@ -125,7 +125,7 @@ hardcoded. Details in [docs/testing.md](docs/testing.md).
 
 ## Learn more
 
-- [Architecture](docs/architecture.md) -- control plane, storage seam, catalog projection
+- [How it works](docs/how-it-works.md) -- the control plane, the seven seams, the run model
 - [Python SDK](docs/sdk.md) -- `table`, `query`, `save`, `var`, `spark`
 - [Configuration](docs/configuration.md) -- every environment variable, ports, installs
 - [Testing](docs/testing.md) -- the zero-mock discipline and both verification harnesses
