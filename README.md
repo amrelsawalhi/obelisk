@@ -1,366 +1,138 @@
-# 🏛️ Obelisk
+# Obelisk
 
 <div align="center">
 
 **The Pluggable On-Premise Data Platform & Control Plane**
 
-*Run a complete modern data stack on any workstation, single server, or air-gapped appliance with zero cloud tax.*
+Run a complete modern data stack on a workstation, a single server, or an air-gapped appliance.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-In--Process%20OLAP-FFF000?logo=duckdb&logoColor=black)](https://duckdb.org/)
-[![React 18](https://img.shields.io/badge/Frontend-React%2018%20%2B%20Tailwind-61DAFB?logo=react&logoColor=black)](https://react.dev/)
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI%20Async-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![dbt-core](https://img.shields.io/badge/Transformations-dbt--core-FF694B?logo=dbt&logoColor=white)](https://www.getdbt.com/)
-[![Marimo](https://img.shields.io/badge/Notebooks-Marimo%20Reactive-8A2BE2)](https://marimo.io/)
-
-[Key Features](#-key-features) •
-[Architecture](#-architecture) •
-[Quickstart](#-quickstart) •
-[Python SDK (`obelisk`)](#-the-obelisk-python-sdk) •
-[Service Catalog](#-pluggable-service-catalog) •
-[Configuration](#-zero-cost-storage-uri-abstraction)
-
-<br/>
+[![React 18](https://img.shields.io/badge/Frontend-React%2018%20%2B%20Tailwind-61DAFB?logo=react&logoColor=black)](https://react.dev/)
 
 <p align="center">
-  <img src="docs/images/hero_query_studio.png" alt="Obelisk Monaco Query Studio & DuckDB Execution" width="100%">
+  <img src="docs/images/data_catalog.png" alt="Obelisk workspace: the data catalog with lakehouse folders and connected Postgres, MongoDB and Supabase sources, a 50-row Parquet preview, and the full tool rail -- plus the query studio, dbt studio, notebooks, pipelines, service catalog and terminal" width="100%">
 </p>
 
 </div>
 
 ---
 
-## 🌟 Vision & Overview
+## What it is
 
-Enterprise data teams often face a painful dilemma: either pay exorbitant cloud bills for multi-tenant SaaS warehouses (Snowflake, Databricks, BigQuery) with vendor lock-in and steep egress fees, or spend months stitching together fragile, self-hosted open-source tools with manual networking and configuration drift.
+Obelisk ingests from your databases, keeps the data as Parquet in a local lakehouse, queries
+it in-process with DuckDB, and runs dbt, notebooks and scripts on a schedule. No cloud
+warehouse, no cluster to operate, no egress bill.
 
-**Obelisk** is a unified, self-hosted data platform and control plane that brings the entire modern data stack to a single host. From raw ingestion and in-process OLAP querying to Git-controlled reactive notebooks, dbt modeling, and automated pipelines — Obelisk gives you complete control over your data with zero cloud tax.
+- **In-process DuckDB over Parquet.** Vectorized analytical SQL straight off the files.
+- **The catalog is a projection.** A table address *is* its folder (`lakehouse.raw.orders`).
+  Nothing is registered, so a table can never be listed with no file behind it.
+- **One orchestrator, in-process.** Scripts, notebooks, dbt, raw SQL, webhooks and other
+  pipelines, wired with `success` / `failure` / `completion` / `skipped` edges.
+- **Federation when you need it.** Postgres sources attach live into DuckDB, so one query
+  can join them to lakehouse tables. The editor and every pipeline step share the resolver.
+- **Batteries included.** Monaco SQL studio, dbt Studio with lineage, reactive Marimo
+  notebooks stored as `.py`, an encrypted vault, and hardware-aware container sizing.
 
-<p align="center">
-  <img src="docs/images/overview_telemetry.png" alt="Obelisk Real-Time Telemetry & Hardware Resource Advisor" width="100%">
-</p>
+## Status
 
-### Core Tenets:
-* ⚡ **Zero-Cost Storage URI Abstraction (`STORAGE_URI`):** Scale from an NVMe SSD (`file:///data/lakehouse`) to enterprise S3/MinIO (`s3://lakehouse`) with zero code rewrites.
-* 🦆 **In-Process DuckDB Engine:** Sub-second vectorized analytical SQL across local Snappy Parquet files and remote databases without ETL overhead.
-* 📦 **Strictly Real Localhost Provisioning:** 1-Click deploy local containers with dynamic hardware-aware memory sizing, or seamlessly connect existing remote databases.
-* 📓 **Git-Controlled Reactive Notebooks:** Interactive Marimo notebooks saved as clean Python files (`.py`) under version control.
-* 🔐 **Zero-Knowledge Security:** In-memory AES-256 Fernet crypto vault for all credentials and secrets.
+Under active development.
 
----
+**No authentication is enforced yet.** The seam exists (`OBELISK_AUTH_ENABLED`) and every
+request already resolves a principal, but until you turn it on, treat the API as
+trusted-network only.
 
-## 🏗️ Architecture
+The in-app terminal is a **real shell on the host** -- origin-gated, session-capped and
+audited, but a shell. Set `OBELISK_TERMINAL=0` to remove it on a shared deployment.
 
-```mermaid
-graph TD
-    subgraph Clients ["Client Browsers / Engineers"]
-        Browser["Chrome / Edge / Firefox / Safari"]
-    end
+## Quickstart
 
-    subgraph Gateway ["Reverse Proxy & Auth Gateway (:80 / :443)"]
-        Caddy["Caddy Gateway (SSL + Subpath Routing)"]
-    end
-
-    subgraph ControlPlane ["Obelisk Control Plane (:8000 & :5173)"]
-        UI["React 18 Workspace (Catalog, Query, dbt, Notebooks, Pipelines)"]
-        API["FastAPI Async Core Engine"]
-        InternalDB[("SQLite Brain (data/obelisk.db - WAL Mode)")]
-        DuckEngine["DuckDB In-Process Engine (Federation & Parquet)"]
-        ResourceAdvisor["Hardware Sizing Engine (psutil)"]
-        DockerMgr["Localhost Docker Manager (/var/run/docker.sock)"]
-    end
-
-    subgraph StorageLayer ["Storage Layer (STORAGE_URI Abstraction)"]
-        Lakehouse[("Parquet Lakehouse<br/>STORAGE_URI=file:///data/lakehouse<br/>(or s3://company-lake)")]
-    end
-
-    subgraph Services ["Pluggable Companion Services"]
-        LocalPG[("PostgreSQL 16 Warehouse")]
-        MarimoServer["Marimo Reactive Server (:2718)"]
-        PipelineEng["Pipeline Orchestrator (built in)"]
-        SupersetBI["Apache Superset Dashboards"]
-        ClickHouseOLAP["ClickHouse Columnar Engine"]
-    end
-
-    subgraph RemoteSources ["Enterprise Ingestion Sources"]
-        Sources["Postgres • MySQL • Mongo • Oracle • REST APIs"]
-    end
-
-    Browser --> Gateway
-    Gateway --> ControlPlane
-
-    API --> InternalDB
-    API --> DuckEngine
-    API --> ResourceAdvisor
-    API --> DockerMgr
-
-    DockerMgr -->|Dynamic Provisioning| Services
-    API -->|Ingests Raw Data| Sources
-    Sources -->|Snappy Parquet Stream| Lakehouse
-    DuckEngine -->|Zero-Copy Fast Scans| Lakehouse
-    Services -->|Transforms & Dashboards| Lakehouse
-```
-
----
-
-## 🚀 Key Features
-
-### 1. Unified Data Catalog & 1-Click Ingest
-* Recursively introspects local Lakehouse Parquet folders and connected external databases (PostgreSQL, Supabase, MySQL, MongoDB, Oracle).
-* **1-Click Ingest:** Stream tables directly from source databases into Snappy Parquet files.
-* Supports **Full Snapshot** and **Incremental Watermark** modes.
-
-<p align="center">
-  <img src="docs/images/data_catalog.png" alt="Obelisk Data Catalog with Live Snappy Parquet Preview" width="100%">
-</p>
-
-### 2. Monaco Query Studio
-* In-browser SQL studio powered by in-process **DuckDB**.
-* Cross-source federated joins: join Lakehouse Parquet files directly with remote production databases in a single query.
-* **Instant Virtualized DataGrid:** Renders 10,000+ rows smoothly at 60 FPS using DOM windowing without browser lag.
-* Binary **CSV** and **Parquet** streaming exports directly from memory.
-
-<p align="center">
-  <img src="docs/images/hero_query_studio.png" alt="Monaco Query Studio with DuckDB In-Process SQL" width="100%">
-</p>
-
-### 3. Git-Controlled Marimo Notebooks
-* Embedded reactive Python notebooks running on `:2718` in headless directory server mode.
-* Stored as clean, readable Python scripts (`git_repo/notebooks/*.py`) that version-control cleanly in Git without noisy JSON diffs.
-* **1-Click [ Analyze in Notebook ]:** Launch an interactive exploratory session pre-loaded with `import obelisk` and your target dataset.
-
-<p align="center">
-  <img src="docs/images/marimo_notebook.png" alt="Interactive Reactive Marimo Notebooks with obelisk SDK" width="100%">
-</p>
-
-### 4. Browser-Based dbt Studio
-* Edit, compile, and run `dbt-core` models directly in the UI.
-* Visual DAG lineage graph displaying source-to-mart dependency trees.
-* Automated staging model generation and real-time execution logs.
-
-<p align="center">
-  <img src="docs/images/dbt_studio.png" alt="dbt Studio with Interactive Model Lineage DAG" width="100%">
-</p>
-
-### 5. Pipelines (built-in orchestrator)
-* One orchestrator for everything Obelisk executes: `dbt run`, `dbt test`, Python
-  scripts, Marimo notebooks, raw SQL and webhooks.
-* A visual canvas with conditional dependencies: a step runs on **success**,
-  **failure**, **completion** or **skip** of its parent.
-* Five-field cron schedules with a timezone, anchor-based next-run calculation and
-  one catch-up run after downtime, never a backfill storm.
-* Durable run history: every run and every step row survives a crash or a machine
-  restart, and anything that was mid-flight is reported as `interrupted` on boot.
-
-<p align="center">
-  <img src="docs/images/pipelines.png" alt="Automated Scheduled Pipelines and Batch Ingestion" width="100%">
-</p>
-
-### 6. Zero-Knowledge Connection & Variable Vault
-* Centralized storage for environment variables and secrets.
-* Confidential credentials encrypted at rest using **AES-256 Fernet** cryptography.
-* Auto-decrypted only in memory at execution time when accessed via `obelisk.var("KEY")`.
-
----
-
-## 💻 The Obelisk Python SDK
-
-Every Marimo notebook, dbt pipeline, and Python script has direct access to `obelisk` without manual database connection strings.
-
-<p align="center">
-  <img src="docs/images/sdk_guide.png" alt="Interactive Obelisk Python SDK & Platform Reference Guide" width="100%">
-</p>
-
-```python
-import obelisk
-import polars as pl
-
-# 1. Load any Lakehouse table (flat or folder-nested) or external database
-tbl = obelisk.table("venues")                       # 1-tier bare table auto-discovery
-tbl_bronze = obelisk.table("lakehouse.raw.orders")   # 3-tier canonical FQN
-tbl_remote = obelisk.table("supabase.public.users")  # Connected database table
-
-# Zero-copy conversions across analytical formats
-df_polars = tbl.to_polars()   # High-speed Polars DataFrame
-df_arrow  = tbl.to_arrow()    # Apache Arrow Table (zero-copy)
-df_pandas = tbl.to_df()       # Standard Pandas DataFrame
-duck_rel  = tbl.to_duckdb()   # DuckDB PyRelation
-
-# 2. Execute cross-source federated SQL in DuckDB
-df_joined = obelisk.query("""
-    SELECT 
-        o.order_id, 
-        o.amount, 
-        u.email, 
-        u.company 
-    FROM lakehouse.raw.orders o
-    JOIN supabase.public.users u ON o.customer_id = u.id
-    WHERE o.amount > 100.0
-    ORDER BY o.amount DESC
-    LIMIT 25;
-""")
-
-# 3. Atomically persist results to Lakehouse Snappy Parquet
-# Saves to data/lakehouse/analytics/high_value_orders.parquet and syncs metadata
-obelisk.save(df_joined, "analytics.high_value_orders")
-
-# 4. Access encrypted secrets & configuration from the vault
-api_key = obelisk.var("OPENAI_API_KEY")
-env_mode = obelisk.var("ENV", default="production")
-
-# 5. Initialize hardware-aware PySpark (local or remote)
-spark = obelisk.spark()
-```
-
----
-
-## 📂 Zero-Cost Storage URI Abstraction
-
-Obelisk enforces URI path abstraction across all engines so your analytical code never changes when scaling infrastructure:
+Python 3.12+ and Node 20+ (Node is only needed for the UI dev server).
 
 ```bash
-# In .env:
-STORAGE_URI=file:///data/lakehouse
-```
-
-* **Today on NVMe:** `STORAGE_URI=file:///data/lakehouse` delivers up to 4,000 MB/s native disk throughput.
-* **Tomorrow on S3/MinIO:** Update one environment variable: `STORAGE_URI=s3://my-enterprise-lakehouse`.
-* **Zero code rewrites.** Every notebook, dbt model, and pipeline continues working identically.
-
----
-
-## 🔌 Pluggable Service Catalog
-
-Obelisk manages containers on `localhost` via `/var/run/docker.sock` with dynamic RAM/CPU caps computed by `ResourceAdvisor` (preventing total memory allocation from exceeding 85% of host RAM).
-
-For every service, administrators can choose **[ 🚀 1-Click Deploy Locally ]** or **[ 🔗 Connect Remote Instance ]**:
-
-<p align="center">
-  <img src="docs/images/service_catalog.png" alt="Obelisk Service Catalog - 1-Click Local or Remote Connect" width="100%">
-</p>
-
-| Service | Engine Role | Local Default RAM | Remote Capability |
-| :--- | :--- | :--- | :--- |
-| **🐘 PostgreSQL (16)** | Relational Warehouse & dbt marts | 4 GB – 12 GB | Connect any RDS, Cloud SQL, or on-prem PG |
-| **📊 Apache Superset** | BI Dashboards & reporting | 2 GB – 4 GB | Connect existing enterprise Superset instance |
-| **🏎️ ClickHouse** | Columnar real-time OLAP | 2 GB – 6 GB | Connect external ClickHouse cluster |
-| **🐼 Redpanda** | C++ Kafka-compatible streaming | 500 MB – 2 GB | Connect enterprise Kafka or Redpanda |
-| **🐙 Gitea** | Air-gapped Git server for notebooks | 100 MB – 300 MB | Connect GitHub, GitLab, or Bitbucket |
-
----
-
-## ⚡ Quickstart
-
-### Prerequisites
-* **Operating System:** Linux (Ubuntu Server / Debian / RHEL), macOS, or Windows WSL2.
-* **Runtimes:** Docker Engine & Docker Compose (or Python 3.12+ & Node.js 18+ for manual dev).
-
----
-
-### Option A: 1-Click Docker Deployment (Production / Self-Hosted)
-
-Run the full production stack (FastAPI Core, Marimo Server, DuckDB, Caddy Gateway, and React 18 SPA) with a single command:
-
-```bash
-git clone https://github.com/your-org/obelisk.git
+git clone https://github.com/amrelsawalhi/obelisk.git
 cd obelisk
-cp .env.example .env
+cp .env.example .env      # Windows: copy .env.example .env
 
-# Build and launch all services
-docker compose up --build -d
-```
-Visit **`http://localhost`** (or port 80/8000).
+# Windows
+run_obelisk.bat
 
----
-
-### Option B: Local Development Setup
-
-#### 1. Configure Environment
-```bash
-cp .env.example .env
+# Linux / macOS / WSL
+bash run_obelisk.sh
 ```
 
-#### 2. Backend Setup
-```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+One command starts the API on `:8000` and the UI on `:5173`, then opens the browser. The
+launcher guards port 8000 and replaces a stale listener (`run_obelisk.bat --restart`).
 
-# Launch FastAPI Control Plane
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+Other installs -- production Docker behind a Caddy gateway on `:80`, a systemd unit, or a
+manual venv -- are in [docs/configuration.md](docs/configuration.md).
+
+Want live sources to play with? `docker compose -f docker-compose.sources.yml up -d` starts
+Postgres on `:5434` and MongoDB on `:27018`.
+
+## What you can do
+
+**Catalog and ingest.** Introspect lakehouse folders and connected databases, then stream
+tables in as Snappy Parquet with `snapshot`, `incremental` (watermark) or `upsert`
+(primary key) semantics. Attachable sources (Postgres) can also be queried live, uncopied.
+
+**Query Studio.** DuckDB in-process, CSV and Parquet export, a virtualized grid, and
+federated joins in one statement:
+
+```sql
+SELECT c.region, count(*) AS events, round(sum(e.revenue), 2) AS revenue
+FROM pg_enterprise_warehouse.public.e2e_customers c
+JOIN bronze.e2e_clickstream e ON e.customer_id = c.customer_id
+GROUP BY 1 ORDER BY 1;
 ```
 
-#### 3. Frontend Setup
-```bash
-cd ../frontend
-npm install
-npm run dev
-```
+<p align="center">
+  <img src="docs/images/hero_query_studio.png" alt="Query Studio: one federated join across Postgres and the lakehouse returning four regions in 314 ms, with Lakehouse, Supabase, Postgres and MongoDB in the schema explorer" width="100%">
+</p>
 
-Visit **`http://localhost:5173`** in your browser.
+**Pipelines.** A canvas with conditional edges; step **outputs** bound downstream
+(`{{steps.build.table}}`); retries with attempt history; SQL that materializes to a table;
+pipelines that run other pipelines with recorded lineage; logs that stream while a step is
+still running; durable run history and re-run-from-step.
 
----
+<p align="center">
+  <img src="docs/images/pipelines.png" alt="Pipeline canvas and step inspector: six steps wired with conditional edges, a gate that retried and passed, and a SQL step materializing its output to a lakehouse table" width="100%">
+</p>
 
+**dbt Studio.** Edit, compile, preview and run models in the browser, with lineage. A
+`dbt_run` step can stage a lakehouse folder into the warehouse before it builds.
 
----
+**Notebooks.** Reactive Marimo notebooks saved as plain `.py` under `git_repo/notebooks/`,
+one click from any table, and runnable headlessly as a pipeline step.
 
-### Option C: Linux server install (systemd, recommended for production)
+**Vault.** Variables and credentials encrypted at rest with Fernet and decrypted only in
+memory, at execution time: `obelisk.var("OPENAI_API_KEY")`.
 
-The backend serves the built UI, so a Linux install is **one process** and needs no
-Node at runtime:
-
-```bash
-# 1. Build the SPA once, wherever Node is available
-cd frontend && npm ci && npm run build && cd ..
-
-# 2. Install as a systemd service (code -> /opt/obelisk, state -> /var/lib/obelisk)
-sudo scripts/install_service.sh install
-```
-
-The installer creates the `obelisk` system user, the virtualenv, `/etc/obelisk/obelisk.env`
-and a unit with `Restart=always`, then enables it at boot:
-
-```bash
-systemctl status obelisk          # running?
-journalctl -u obelisk -f          # service log
-sudo scripts/install_service.sh restart
-```
-
-Visit **http://<host>:8000**. Upgrades: replace `/opt/obelisk`, then restart - the
-database migrations run on startup.
-
-On Windows the equivalent is a startup task:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install_service.ps1 install
-```
-
----
-
-## Verifying the orchestrator
-
-`backend/scripts/verify_pipelines.py` builds real pipelines from the shipped sample
-assets (Python scripts, a notebook, dbt, raw SQL and a webhook), runs them against a
-live backend and prints a pass/fail report:
-
-```bash
-python backend/scripts/verify_pipelines.py --base-url http://127.0.0.1:8000
-```
-
-## 🧪 Testing (Zero Mocks Discipline)
-
-Obelisk adheres to a strict **Zero-Mock Verification Discipline**: all automated tests run against real SQLite (`data/obelisk.db`), real DuckDB in-memory relations, real Snappy Parquet files, and active Docker sockets.
+## Verify it works
 
 ```bash
 cd backend
-pytest -v
+python -m pytest tests -q                        # the backend suite, no external services needed
+python scripts/verify_pipelines.py               # every step type, every edge condition
+python scripts/e2e/verify_e2e.py --scale small   # full journey, live Postgres + Mongo
 ```
 
----
+The end-to-end script seeds real sources, drives ingest, dbt and federated SQL, forces every
+edge condition, then reconciles the lakehouse against the sources -- no expected value is
+hardcoded. Details in [docs/testing.md](docs/testing.md).
 
-## 🛡️ License
+## Learn more
 
-Obelisk is distributed under the [MIT License](LICENSE).
+- [Architecture](docs/architecture.md) -- control plane, storage seam, catalog projection
+- [Python SDK](docs/sdk.md) -- `table`, `query`, `save`, `var`, `spark`
+- [Configuration](docs/configuration.md) -- every environment variable, ports, installs
+- [Testing](docs/testing.md) -- the zero-mock discipline and both verification harnesses
+- [`.env.example`](.env.example) -- the canonical settings list
+
+## License
+
+MIT -- see [LICENSE](LICENSE).
+
 Built with ❤️ for data engineers who value speed, autonomy, and simplicity.
