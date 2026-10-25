@@ -740,7 +740,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
                 label: col.name,
                 kind: monaco.languages.CompletionItemKind.Field,
                 insertText: col.name,
-                detail: `${col.type} • ${cleanName}`,
+                detail: `${col.data_type} • ${cleanName}`,
                 documentation: `Column from Lakehouse table '${fullTableName}'`,
                 sortText: `1_${col.name}`,
               });
@@ -779,7 +779,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
               label: col.name,
               kind: monaco.languages.CompletionItemKind.Field,
               insertText: col.name,
-              detail: `${col.type} • ${bareTable}`,
+              detail: `${col.data_type} • ${bareTable}`,
               documentation: `Column from external table '${node.name}.${schema}.${bareTable}'`,
               sortText: `1_${col.name}`,
             });
@@ -1145,7 +1145,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
                                                   title="Click to insert column name"
                                                 >
                                                   <span>{c.name}</span>
-                                                  <span className="text-slate-400 text-[9px]">{c.type}</span>
+                                                  <span className="text-slate-400 text-[9px]">{c.data_type}</span>
                                                 </div>
                                               ))}
                                             </div>
@@ -1299,7 +1299,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
                                                   title="Click to insert column name"
                                                 >
                                                   <span>{c.name}</span>
-                                                  <span className="text-slate-400 text-[9px]">{c.type}</span>
+                                                  <span className="text-slate-400 text-[9px]">{c.data_type}</span>
                                                 </div>
                                               ))}
                                             </div>

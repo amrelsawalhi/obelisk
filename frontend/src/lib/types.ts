@@ -122,8 +122,12 @@ export interface ConnectRemoteRequest {
 
 export interface CatalogTableColumn {
   name: string;
-  type: string;
-  nullable?: boolean;
+  /** Type as the source reports it: Arrow for Parquet (int64), SQL for Postgres
+   *  (uuid), BSON for Mongo. The API has always used data_type; the UI used to
+   *  read `type`, which silently rendered an empty cell. */
+  data_type: string;
+  is_nullable: boolean;
+  is_primary_key?: boolean;
 }
 
 export interface CatalogTable {

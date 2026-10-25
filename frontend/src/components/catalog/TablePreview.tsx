@@ -274,14 +274,21 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
               <tbody className="divide-y divide-slate-100 font-mono text-[11px]">
                 {(table.columns || []).map((col) => (
                   <tr key={col.name} className="hover:bg-slate-50 transition-colors">
-                    <td className="py-2.5 px-4 font-medium text-slate-900">{col.name}</td>
+                    <td className="py-2.5 px-4 font-medium text-slate-900">
+                      {col.name}
+                      {col.is_primary_key && (
+                        <span className="ml-2 rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[9px] font-semibold text-amber-700">
+                          PK
+                        </span>
+                      )}
+                    </td>
                     <td className="py-2.5 px-4 text-sky-700">
                       <span className="bg-sky-50 px-2 py-0.5 rounded border border-sky-200">
-                        {col.type}
+                        {col.data_type}
                       </span>
                     </td>
                     <td className="py-2.5 px-4 text-slate-500">
-                      {col.nullable !== undefined ? (col.nullable ? 'YES' : 'NO') : 'YES'}
+                      {col.is_nullable === undefined ? '—' : col.is_nullable ? 'YES' : 'NO'}
                     </td>
                   </tr>
                 ))}

@@ -167,7 +167,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({
                 >
                   {table.columns.map((c) => (
                     <option key={c.name} value={c.name}>
-                      {c.name} ({c.type})
+                      {c.name} ({c.data_type})
                     </option>
                   ))}
                 </select>
@@ -224,7 +224,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({
                   >
                     {table.columns.map((c) => (
                       <option key={c.name} value={c.name}>
-                        {c.name} ({c.type})
+                        {c.name} ({c.data_type})
                       </option>
                     ))}
                   </select>
