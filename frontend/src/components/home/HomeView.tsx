@@ -83,7 +83,12 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   usePolling(loadData, 15000);
 
   // Dynamic Asset & Platform Metrics (100% Real, Zero Hardcoding)
-  const externalConnsCount = connections.length > 0 ? connections.length : catalogNodes.filter((n) => n.id !== 'bronze').length;
+  // The native lakehouse node is in the tree but is not a source: counting it made a
+  // fresh install report one connection that never existed.
+  const externalConnsCount =
+    connections.length > 0
+      ? connections.length
+      : catalogNodes.filter((n) => n.id !== 'lakehouse' && n.type !== 'lakehouse').length;
   const sourceTypes = Array.from(new Set(connections.map((c) => c.source_type.toUpperCase())));
   const sourceTypesSummary = sourceTypes.length > 0 ? sourceTypes.join(', ') : 'Vault Connected';
 

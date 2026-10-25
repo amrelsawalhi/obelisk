@@ -105,8 +105,12 @@ export const api = {
   },
 
   // Catalog & Connections
-  getCatalogTree: async (): Promise<CatalogNode[]> => {
-    const res = await apiClient.get<CatalogNode[]>('/catalog/tree');
+  // `refresh` bypasses the backend's tree cache. An ingest writes into the catalog
+  // behind the view's back, so a copy taken before it must not be served afterwards.
+  getCatalogTree: async (refresh = false): Promise<CatalogNode[]> => {
+    const res = await apiClient.get<CatalogNode[]>('/catalog/tree', {
+      params: refresh ? { refresh: true } : undefined,
+    });
     return res.data;
   },
   getTablePreview: async (sourceId: string, tableName: string): Promise<TablePreviewResponse> => {

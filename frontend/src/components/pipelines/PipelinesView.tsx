@@ -354,9 +354,13 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
     return map;
   }, [paintedByStep]);
 
+  // With nothing picked, follow the step that is running: the dock reads the selected
+  // step, so during step 1 it used to sit empty while that step's output streamed past.
+  const runningStepRun =
+    (monitor?.step_runs ?? []).find((run) => run.status === 'running') ?? null;
   const selectedStepRun = selectedStepKey
     ? (monitor?.step_runs ?? []).find((run) => run.step_id === selectedStepKey) ?? null
-    : null;
+    : runningStepRun;
   const monitorActive = monitor != null && !TERMINAL.includes(monitor.status);
   // Watching any run (live or finished) is a read-only mode: the inspector shows what
   // happened, and 'Back to design' returns to editing the graph.
@@ -613,6 +617,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       setDraft(draftFrom(fresh));
       toast.success("Pipeline saved.");
       void refreshList();
+      return true;
     } catch (error) {
       const problem = readApiError(error, "Could not save the pipeline.");
       setProblemSteps(problem.steps);
@@ -626,6 +631,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
           ? "The offending step or edge is highlighted on the canvas."
           : undefined,
       );
+      return false;
     } finally {
       setSaving(false);
     }
@@ -657,14 +663,19 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
 
   // Required parameters cannot be guessed, so a pipeline that declares any asks for
   // them first instead of failing with 'Parameter x is required.'
-  const requestRun = useCallback(() => {
-    if (!detail) return;
+  const requestRun = useCallback(async () => {
+    // Guarding here (not only via the disabled button) matters because the save below is
+    // awaited: a second click during it would otherwise fire a second run.
+    if (!detail || starting || saving) return;
+    // A run executes the *saved* graph, so unsaved canvas edits have to be written first
+    // — otherwise the canvas shows one thing and the run does another.
+    if (dirty && !(await saveGraph())) return;
     if (detail.params.length) {
       setRunDialogOpen(true);
       return;
     }
     void startRun();
-  }, [detail, startRun]);
+  }, [detail, starting, saving, dirty, saveGraph, startRun]);
 
   const openRun = useCallback(async (run: PipelineExecution) => {
     try {
@@ -930,7 +941,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       }
       if (meta && event.key === "Enter") {
         event.preventDefault();
-        if (!starting) requestRun();
+        if (!starting) void requestRun();
         return;
       }
       if (event.key === "Escape") {
@@ -1016,7 +1027,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             <>
               <button
                 type="button"
-                onClick={requestRun}
+                onClick={() => void requestRun()}
                 disabled={starting}
                 className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
                 title="Run now (Ctrl+Enter)"

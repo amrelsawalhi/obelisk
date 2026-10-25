@@ -60,7 +60,11 @@ export const PipelineLogDock: React.FC<PipelineLogDockProps> = ({
   const [copied, setCopied] = useState(false);
   const bodyRef = useRef<HTMLPreElement>(null);
 
-  const index = steps.findIndex((step) => step.step_id === selectedStepId);
+  // Follow the running step until the operator picks one explicitly: during step 1 the
+  // dock used to read "Select a step" while that step's output streamed past it.
+  const followedStepId =
+    selectedStepId ?? steps.find((step) => step.status === 'running')?.step_id ?? null;
+  const index = steps.findIndex((step) => step.step_id === followedStepId);
   const current = index >= 0 ? steps[index] : null;
   const text = tab === 'step' ? stepLog : runLog ?? '';
   const loading = tab === 'step' ? loadingStep : loadingRun;

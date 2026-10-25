@@ -1,9 +1,10 @@
 import asyncio
+import functools
 import json
 import uuid
 import time
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, AsyncGenerator
+from typing import Callable, Dict, Any, List, Optional, AsyncGenerator
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 
@@ -201,6 +202,29 @@ class IngestJobManager:
             except Exception:
                 pass
 
+    def _batch_progress(
+        self, job_id: str, job: IngestJob, label: Optional[str] = None
+    ) -> Callable[[int], None]:
+        """A per-batch progress hook that is safe to call from the worker thread.
+
+        ``update_progress`` writes to the SSE queues, which belong to the event loop, so
+        the call is marshalled back instead of mutating them from the ingestion thread.
+        """
+        loop = asyncio.get_running_loop()
+
+        def report(staged: int) -> None:
+            phase = f"{label} - {staged:,} rows staged" if label else f"Staged {staged:,} rows"
+            loop.call_soon_threadsafe(
+                functools.partial(
+                    self.update_progress,
+                    job_id,
+                    current_phase=phase,
+                    total_rows=job.total_rows + staged,
+                )
+            )
+
+        return report
+
     def cancel_job(self, job_id: str) -> bool:
         job = self._jobs.get(job_id)
         if not job or job.status != "running":
@@ -310,7 +334,7 @@ class IngestJobManager:
             if job.is_cancelled:
                 return
 
-            self.update_progress(job_id, current_phase="Streaming data to Snappy Parquet")
+            self.update_progress(job_id, current_phase="Staging rows into the lakehouse")
 
             # Run in worker thread so DuckDB C++ / PyArrow doesn't block async loop
             res = await asyncio.to_thread(
@@ -325,6 +349,7 @@ class IngestJobManager:
                 limit=limit,
                 write_strategy=write_strategy,
                 primary_key=primary_key,
+                on_batch=self._batch_progress(job_id, job),
             )
 
             job.results.append(res)
@@ -403,6 +428,9 @@ class IngestJobManager:
                         limit=limit,
                         write_strategy=write_strategy,
                         primary_key=primary_key,
+                        on_batch=self._batch_progress(
+                            job_id, job, label=f"Extracting ({idx + 1}/{len(tables)})"
+                        ),
                     )
                     t_duration = int((time.time() - table_start) * 1000)
                     job.results.append(res)

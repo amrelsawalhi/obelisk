@@ -385,6 +385,15 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
     await executeQuerySql(activeTab.sql, activeTab.id);
   };
 
+  // Monaco registers its keymap once, when the editor mounts, so the action it calls has
+  // to read the handler through a ref. Captured directly, Ctrl+Enter kept running the tab
+  // — and the SQL text — that were active at mount time.
+  const runHandlerRef = useRef(handleExecute);
+  const formatHandlerRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    runHandlerRef.current = handleExecute;
+  });
+
   useEffect(() => {
     fetchTargets();
     fetchHistory();
@@ -626,6 +635,12 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
     window.open('/query/popout', '_blank', 'noopener,noreferrer');
   };
 
+  // Same mount-time closure problem as the run action: the formatter must read the
+  // current tab, not the one that was open when Monaco registered the key.
+  useEffect(() => {
+    formatHandlerRef.current = handleFormatQuery;
+  });
+
   // Draggable Schema Explorer Width Handler
   const handleStartSchemaResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -680,7 +695,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
       contextMenuGroupId: 'navigation',
       contextMenuOrder: 1,
       run: () => {
-        handleExecute();
+        runHandlerRef.current();
       },
     });
 
@@ -692,7 +707,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
       contextMenuGroupId: 'modification',
       contextMenuOrder: 1,
       run: () => {
-        handleFormatQuery();
+        formatHandlerRef.current();
       },
     });
   };

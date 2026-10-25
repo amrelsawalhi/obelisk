@@ -15,7 +15,7 @@ import itertools
 import json
 import logging
 import uuid
-from typing import Any, Dict, Iterable, Iterator, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional
 
 import httpx
 import oracledb
@@ -132,8 +132,15 @@ class IngestEngine:
     # -- staging -----------------------------------------------------------
 
     @staticmethod
-    def _stage_batches(conn, batches: Iterable[pa.Table]) -> int:
-        """Fills a temp table named ``staging`` from Arrow batches; returns rows read."""
+    def _stage_batches(
+        conn, batches: Iterable[pa.Table], on_batch: Optional[Callable[[int], None]] = None
+    ) -> int:
+        """Fills a temp table named ``staging`` from Arrow batches; returns rows read.
+
+        ``on_batch`` receives the running total after each batch. One large table is the
+        case where a status line with no counter looks wedged, and this is the only
+        progress signal it produces before the write statement runs.
+        """
         total = 0
         for batch in batches:
             if batch.num_rows == 0:
@@ -149,6 +156,8 @@ class IngestEngine:
             finally:
                 conn.unregister("_obelisk_batch")
             total += batch.num_rows
+            if on_batch is not None:
+                on_batch(total)
         return total
 
     def _stage(
@@ -162,6 +171,7 @@ class IngestEngine:
         watermark_column: Optional[str],
         watermark_value,
         limit: Optional[int],
+        on_batch: Optional[Callable[[int], None]] = None,
     ) -> int:
         """Lets the driver fill ``staging``; returns the rows extracted."""
         common = {
@@ -172,6 +182,7 @@ class IngestEngine:
             "watermark_column": watermark_column,
             "watermark_value": watermark_value,
             "limit": limit,
+            "on_batch": on_batch,
         }
         st = source_type.lower()
         if st == "postgres":
@@ -279,12 +290,16 @@ class IngestEngine:
         limit: Optional[int] = None,
         write_strategy: str = "append",  # "append" or "upsert"
         primary_key: Optional[str] = None,
+        on_batch: Optional[Callable[[int], None]] = None,
     ) -> Dict[str, Any]:
         """Ingests one entity into the lakehouse.
 
         The driver stages the rows in a temporary table; one statement then replaces,
         appends or merges them into the target. A failed run leaves the previous table
         exactly as it was, because nothing is written until that statement runs.
+
+        ``on_batch`` is called with the running row count as rows are staged, so a caller
+        can report progress on a table large enough to look stuck.
         """
         schema, table_stem = self._address(target_folder, entity, target_name)
         target = self._target_sql(schema, table_stem)
@@ -307,6 +322,7 @@ class IngestEngine:
                 watermark_column=watermark_column,
                 watermark_value=watermark_value,
                 limit=limit,
+                on_batch=on_batch,
             )
 
             if extracted == 0:
@@ -349,7 +365,8 @@ class IngestEngine:
     # -- drivers -----------------------------------------------------------
 
     def _stage_postgres(
-        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value, limit
+        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
+        limit, on_batch=None,
     ) -> int:
         """Postgres is read by DuckDB itself: one statement, no copies, no Python rows."""
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
@@ -377,12 +394,18 @@ class IngestEngine:
                 f'CREATE OR REPLACE TEMP TABLE staging AS SELECT * FROM '
                 f'{alias}."{schema_name}"."{table_name}" {where}{limit_clause}'
             )
-            return self._row_count(conn, "staging")
+            staged = self._row_count(conn, "staging")
+            # DuckDB stages Postgres in one statement, so there is nothing to report while
+            # it runs. The count still lands before the write, which is the slower half.
+            if on_batch is not None:
+                on_batch(staged)
+            return staged
         finally:
             conn.execute(f"DETACH {alias};")
 
     def _stage_mysql(
-        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value, limit
+        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
+        limit, on_batch=None,
     ) -> int:
         """MySQL/MariaDB: cursor batches in, one Arrow batch at a time."""
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
@@ -432,12 +455,13 @@ class IngestEngine:
                             )
                         yield _arrow_batch(columns, clean)
 
-                return self._stage_batches(conn, batches())
+                return self._stage_batches(conn, batches(), on_batch=on_batch)
         finally:
             connection.close()
 
     def _stage_mongodb(
-        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value, limit
+        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
+        limit, on_batch=None,
     ) -> int:
         """MongoDB: documents in batches, BSON types kept (dates, ints, floats)."""
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
@@ -487,12 +511,13 @@ class IngestEngine:
                         rows.append(tuple(values))
                     yield _arrow_batch(keys, rows)
 
-            return self._stage_batches(conn, batches())
+            return self._stage_batches(conn, batches(), on_batch=on_batch)
         finally:
             client.close()
 
     def _stage_oracle(
-        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value, limit
+        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
+        limit, on_batch=None,
     ) -> int:
         """Oracle: cursor batches, column names lowercased as the rest of the platform is."""
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
@@ -540,12 +565,13 @@ class IngestEngine:
                         )
                     yield _arrow_batch(columns, clean)
 
-            return self._stage_batches(conn, batches())
+            return self._stage_batches(conn, batches(), on_batch=on_batch)
         finally:
             connection.close()
 
     def _stage_api(
-        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value, limit
+        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
+        limit, on_batch=None,
     ) -> int:
         """A REST endpoint returns one document, so it is staged in one batch."""
         from app.engines.introspector import Introspector
@@ -603,7 +629,7 @@ class IngestEngine:
                     value = json.dumps(value, default=str)
                 values.append(value)
             rows.append(tuple(values))
-        return self._stage_batches(conn, [_arrow_batch(columns, rows)])
+        return self._stage_batches(conn, [_arrow_batch(columns, rows)], on_batch=on_batch)
 
 
 ingest_engine = IngestEngine()

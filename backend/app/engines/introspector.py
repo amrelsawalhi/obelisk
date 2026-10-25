@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, asdict
@@ -10,6 +11,22 @@ import oracledb
 import httpx
 
 from app.core.host_resolver import resolve_connection_host
+
+
+def _preview_payload(
+    columns: List[str], rows: List[Dict[str, Any]], start: float, row_count: Optional[int] = None
+) -> Dict[str, Any]:
+    """The preview dict every live source returns, timed so the UI can show a latency.
+
+    The lakehouse preview gets ``duration_ms`` from the query engine; this puts the same
+    field on the live-source previews, which had nothing there and rendered "Latency:  ms".
+    """
+    return {
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows) if row_count is None else row_count,
+        "duration_ms": int((time.perf_counter() - start) * 1000),
+    }
 
 
 def format_bytes(num_bytes: Optional[int]) -> Optional[str]:
@@ -184,6 +201,7 @@ class Introspector:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Fetches up to `limit` rows from a live PostgreSQL table for preview."""
+        start = time.perf_counter()
         actual_table = table or table_name or ""
         if options and "sslmode" in options:
             sslmode = options["sslmode"]
@@ -215,7 +233,7 @@ class Introspector:
                         else:
                             row_dict[col_name] = val
                     rows.append(row_dict)
-                return {"columns": columns, "rows": rows, "row_count": len(rows)}
+                return _preview_payload(columns, rows, start)
         finally:
             conn.close()
 
@@ -302,6 +320,7 @@ class Introspector:
         limit: int = 50,
     ) -> Dict[str, Any]:
         """Fetches up to `limit` documents from a live MongoDB collection."""
+        start = time.perf_counter()
         resolved_host = resolve_connection_host(host, port)
         # Kwargs avoid URI escaping problems in passwords (audit H5).
         client = MongoClient(
@@ -329,7 +348,7 @@ class Introspector:
                     else:
                         clean_row[k] = v
                 rows.append(clean_row)
-            return {"columns": list(all_cols), "rows": rows, "row_count": len(rows)}
+            return _preview_payload(list(all_cols), rows, start)
         finally:
             client.close()
 
@@ -429,6 +448,7 @@ class Introspector:
         limit: int = 50,
     ) -> Dict[str, Any]:
         """Fetches up to `limit` rows from a live MySQL table."""
+        start = time.perf_counter()
         resolved_host = resolve_connection_host(host, port)
         conn = pymysql.connect(
             host=resolved_host,
@@ -456,7 +476,7 @@ class Introspector:
                         else:
                             cr[k] = v
                     clean_rows.append(cr)
-                return {"columns": columns, "rows": clean_rows, "row_count": len(clean_rows)}
+                return _preview_payload(columns, clean_rows, start)
         finally:
             conn.close()
 
@@ -532,6 +552,7 @@ class Introspector:
         limit: int = 50,
     ) -> Dict[str, Any]:
         """Fetches up to `limit` rows from a live Oracle table."""
+        start = time.perf_counter()
         resolved_host = resolve_connection_host(host, port)
         dsn = f"{resolved_host}:{port}/{database}"
         conn = oracledb.connect(user=username, password=password, dsn=dsn, tcp_connect_timeout=3.0)
@@ -548,7 +569,7 @@ class Introspector:
                     else:
                         row_dict[col_name] = val
                 rows.append(row_dict)
-            return {"columns": columns, "rows": rows, "row_count": len(rows)}
+            return _preview_payload(columns, rows, start)
         finally:
             conn.close()
 
@@ -633,6 +654,7 @@ class Introspector:
         limit: int = 50,
     ) -> Dict[str, Any]:
         """Fetches records from REST API / ERP endpoint as table rows."""
+        start = time.perf_counter()
         url = base_url.strip()
         if not url.startswith(("http://", "https://")):
             url = f"http://{url}"
@@ -655,7 +677,7 @@ class Introspector:
         columns = []
         if slice_records:
             columns = list(slice_records[0].keys())
-        return {"columns": columns, "rows": slice_records, "row_count": len(slice_records)}
+        return _preview_payload(columns, slice_records, start)
 
     @staticmethod
     def _table_from_file(f: Path, schema_name: str, fqn: str) -> Optional[Dict[str, Any]]:

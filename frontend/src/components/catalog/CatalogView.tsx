@@ -6,6 +6,7 @@ import type { CatalogNode, CatalogTable, Connection } from '../../lib/types';
 import { CatalogTree } from './CatalogTree';
 import { TablePreview } from './TablePreview';
 import { IngestModal } from './IngestModal';
+import { useIngestTracker } from '../../context/IngestContext';
 import { BatchIngestModal } from './BatchIngestModal';
 import { AddConnectionModal } from './AddConnectionModal';
 
@@ -25,6 +26,7 @@ interface BatchTarget {
 
 export const CatalogView: React.FC = () => {
   const navigate = useNavigate();
+  const { catalogRevision } = useIngestTracker();
 
   const [catalogNodes, setCatalogNodes] = useState<CatalogNode[]>([]);
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -34,10 +36,12 @@ export const CatalogView: React.FC = () => {
   const [isAddConnectionOpen, setIsAddConnectionOpen] = useState(false);
   const [editingConnection, setEditingConnection] = useState<Connection | null>(null);
 
-  const fetchCatalog = async () => {
+  const fetchCatalog = async (force = false) => {
     try {
-      setCatalogLoading(true);
-      const data = await api.getCatalogTree();
+      // A forced fetch keeps the tree on screen: it is a background refresh of data the
+      // operator is already looking at, not a first load.
+      if (!force) setCatalogLoading(true);
+      const data = await api.getCatalogTree(force);
       setCatalogNodes(data);
 
       // Auto-select first table if nothing selected yet
@@ -66,6 +70,14 @@ export const CatalogView: React.FC = () => {
     fetchCatalog();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // An ingest writes into the catalog behind this view's back; the ingest stream bumps
+  // this revision the moment a job ends, which is exactly when the tree goes stale.
+  useEffect(() => {
+    if (catalogRevision === 0) return;
+    void fetchCatalog(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalogRevision]);
 
   const handleOpenInNotebook = (tableOrName: CatalogTable | string, customFqn?: string) => {
     let tableName: string;
@@ -119,7 +131,7 @@ export const CatalogView: React.FC = () => {
       <CatalogTree
         nodes={catalogNodes}
         loading={catalogLoading}
-        onRefresh={fetchCatalog}
+        onRefresh={() => fetchCatalog(true)}
         selectedTableKey={selectedTableKey}
         onSelectTable={(sourceId, table, isLakehouse, sourceName) => {
           setSelectedTableInfo({ sourceId, sourceName, table, isLakehouse });

@@ -11,6 +11,8 @@ interface IngestContextType {
   logs: Record<string, string[]>;
   activeLogs: string[];
   runningCount: number;
+  /** Bumped whenever a job ends, so views holding a catalog copy can refetch. */
+  catalogRevision: number;
   startJob: (jobId: string, initialTitle?: string) => void;
   selectJob: (jobId: string) => void;
   minimizeDrawer: () => void;
@@ -29,6 +31,8 @@ export const IngestProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [isMinimized, setIsMinimized] = useState<boolean>(false);
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
   const [logs, setLogs] = useState<Record<string, string[]>>({});
+  // Increments when a job ends. The catalog view reads it to know its tree is stale.
+  const [catalogRevision, setCatalogRevision] = useState<number>(0);
 
   const eventSourcesRef = useRef<Record<string, EventSource>>({});
 
@@ -135,6 +139,8 @@ export const IngestProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             [jobId]: jobData.logs,
           }));
         }
+        // The job wrote into the catalog: anything showing the tree is now stale.
+        setCatalogRevision((n) => n + 1);
       } catch (err) {
         console.error(`Failed to parse SSE complete event for job ${jobId}`, err);
       } finally {
@@ -151,6 +157,8 @@ export const IngestProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             [jobId]: payload.job,
           }));
         }
+        // A cancelled batch may still have written the tables it finished.
+        setCatalogRevision((n) => n + 1);
       } catch (err) {
         console.error(`Failed to parse SSE cancelled event for job ${jobId}`, err);
       } finally {
@@ -164,6 +172,8 @@ export const IngestProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           setJobs((prev) => ({ ...prev, [jobId]: latest }));
           if (latest.status !== 'running') {
             cleanupStream(jobId);
+            // The stream broke before 'complete' arrived; the job still wrote its rows.
+            setCatalogRevision((n) => n + 1);
           }
         })
         .catch(() => {});
@@ -286,6 +296,7 @@ export const IngestProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         logs,
         activeLogs,
         runningCount,
+        catalogRevision,
         startJob,
         selectJob,
         minimizeDrawer,
