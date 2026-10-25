@@ -113,6 +113,40 @@ class Settings(BaseSettings):
         default_factory=lambda: os.getenv("STORAGE_URI", "file:///data/lakehouse")
     )
 
+    # DuckDB session budget (Rule 5 of Rules_for_scalability.md). DuckDB spills to
+    # `temp_directory` when a query exceeds `memory_limit`; without a temp directory it
+    # raises Out of Memory instead of using the disk it was given. Spill space is capped
+    # so a runaway query cannot eat the volume, and threads are capped so concurrent
+    # queries do not each try to use every core.
+    DUCKDB_THREADS: int | None = Field(
+        default_factory=lambda: int(os.getenv("DUCKDB_THREADS", "0")) or None
+    )
+    DUCKDB_TEMP_SIZE_LIMIT: str = Field(
+        default_factory=lambda: os.getenv("DUCKDB_TEMP_SIZE_LIMIT", "50GB")
+    )
+
+    @property
+    def lakehouse_catalog_path(self) -> Path:
+        """DuckLake's metadata database, kept with the data it describes.
+
+        DuckLake records the data path inside its catalog and refuses to attach a catalog
+        to a different one, which is the right safety check — so the two must travel
+        together: move, copy or restore the lakehouse folder and its metadata comes with
+        it. It also means a second warehouse (a test's scratch directory, a second
+        install) gets its own catalog instead of fighting over one.
+
+        The dot-folder keeps it out of the table namespace: the warehouse walk skips
+        dot-directories, so the catalog is never mistaken for a table.
+        """
+        return Path(self.lakehouse_root_path) / ".obelisk" / "catalog.sqlite"
+
+    @property
+    def duckdb_temp_path(self) -> Path:
+        """Local scratch space for DuckDB's spills. Always local, never network storage."""
+        target = Path(self.sqlite_db_path).parent / "duckdb_tmp"
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
     # Marimo notebook kernel expiry: seconds a notebook's kernel survives after its
     # browser tab disconnects. In `marimo edit` mode Marimo disables this by default,
     # so every notebook ever opened leaves a kernel (~155 MB) resident until the

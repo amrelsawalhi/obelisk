@@ -1,86 +1,91 @@
-"""The warehouse is read once, by one walker.
+"""The catalog is read once, in one query, and the tree is grouped from that answer.
 
-The tree used to be built by an introspector that walked the lakehouse and read each
-footer; the catalog scan does exactly that now, so there is one definition of what a
-table is. These tests pin the batched shape that both the tree and the projection rely
-on: a single walk, one footer read per file, grouped by folder.
+The tree used to be built by walking the lakehouse and reading a footer per file. Now the
+catalog answers the question — schema, row count and byte size all come from its metadata —
+so there is one definition of what a table is and no per-file work.
+
+What remains here: the shape both the tree and the projection depend on (grouped by
+folder, addresses in three slots), plus the storage layer's own directory behaviour, which
+is still a filesystem concern.
 """
+from __future__ import annotations
+
+import uuid
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.parquet as pq
+import pytest
 
 from app.core.catalog import scan
 from app.core.storage import LocalWarehouse
 
-
-def _write(path: Path, rows: int = 1) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table({"id": list(range(rows))}), str(path))
+from lakehouse_helpers import drop_schema, write_table
 
 
-def _by_folder(root: Path) -> tuple[list[str], dict[str, list]]:
-    store = LocalWarehouse(root)
-    result = scan(store)
+def _by_folder() -> dict[str, list]:
     grouped: dict[str, list] = {}
-    for table in result.tables:
+    for table in scan().tables:
         grouped.setdefault(table.folder, []).append(table)
-    return store.list_directories(), grouped
+    return grouped
 
 
-def test_one_walk_groups_tables_by_folder(tmp_path: Path) -> None:
-    root = tmp_path / "lakehouse"
-    _write(root / "loose.parquet", rows=2)
-    _write(root / "raw" / "orders.parquet", rows=3)
-    _write(root / "marts" / "sales" / "daily.parquet", rows=4)
-    _write(root / ".hidden" / "skipped.parquet")
-
-    directories, tables = _by_folder(root)
-
-    assert directories == ["marts", "marts/sales", "raw"]
-
-    assert [table.name for table in tables[""]] == ["loose"]
-    assert [table.name for table in tables["raw"]] == ["orders"]
-    assert [table.name for table in tables["marts/sales"]] == ["daily"]
-
-    # A file at the root has no folder, so its address is two slots.
-    assert tables[""][0].fqn == "lakehouse.loose"
-
-    # A flat folder is the schema …
-    assert tables["raw"][0].fqn == "lakehouse.raw.orders"
-    assert tables["raw"][0].sql_name == "lakehouse.raw.orders"
-
-    # … and a nested one carries its whole path, quoted, because SQL has three slots.
-    assert tables["marts/sales"][0].fqn == "lakehouse.marts.sales.daily"
-    assert tables["marts/sales"][0].sql_name == 'lakehouse."marts.sales".daily'
-
-    # Hidden folders are not part of the tree.
-    assert all(".hidden" not in key for key in tables)
+@pytest.fixture
+def prefix():
+    """A unique folder namespace, removed afterwards."""
+    name = f"zzbatch{uuid.uuid4().hex[:6]}"
+    yield name
+    drop_schema(name)
 
 
-def test_rows_and_sizes_come_from_the_footer(tmp_path: Path) -> None:
-    root = tmp_path / "lakehouse"
-    _write(root / "raw" / "orders.parquet", rows=7)
+def test_the_catalog_groups_tables_by_folder(prefix) -> None:
+    # Unique schemas on purpose: the session lakehouse is shared, and a table called
+    # `raw.orders` here would be read by the shipped dbt models in another test.
+    write_table(f"{prefix}_raw/orders.parquet", pa.table({"id": [1, 2, 3]}))
+    write_table(f"{prefix}_marts/sales/daily.parquet", pa.table({"id": [1, 2, 3, 4]}))
+    write_table(f"{prefix}/loose.parquet", pa.table({"id": [1, 2]}))
+    write_table(f"root_{prefix}.parquet", pa.table({"id": [1]}))
 
-    _, tables = _by_folder(root)
-    table = tables["raw"][0]
+    grouped = _by_folder()
+
+    assert [table.name for table in grouped[f"{prefix}_raw"]] == ["orders"]
+    # A folder is a schema, so a nested path arrives with dots, not slashes.
+    assert [table.name for table in grouped[f"{prefix}_marts.sales"]] == ["daily"]
+
+    loose = grouped[prefix][0]
+    assert loose.fqn == f"lakehouse.{prefix}.loose"
+
+    orders = grouped[f"{prefix}_raw"][0]
+    assert orders.fqn == f"lakehouse.{prefix}_raw.orders"
+    assert orders.sql_name == f"lakehouse.{prefix}_raw.orders"
+
+    # A nested folder is one quoted schema, because SQL has three slots.
+    daily = grouped[f"{prefix}_marts.sales"][0]
+    assert daily.fqn == f"lakehouse.{prefix}_marts.sales.daily"
+    assert daily.sql_name == f'lakehouse."{prefix}_marts.sales".daily'
+
+    # A table in the catalog's default schema is a two-slot address.
+    assert grouped[""][0].fqn == f"lakehouse.root_{prefix}"
+
+
+def test_rows_and_columns_come_from_the_catalog(prefix) -> None:
+    write_table(f"{prefix}/orders.parquet", pa.table({"id": list(range(7)), "name": ["a"] * 7}))
+
+    table = _by_folder()[prefix][0]
 
     assert table.num_rows == 7
-    assert table.size_bytes > 0
-    assert table.columns[0]["name"] == "id"
+    assert [column["name"] for column in table.columns] == ["id", "name"]
+    # Size is whatever the catalog recorded for the table's files; a small table may be
+    # inlined in the catalog itself, so only the lower bound is meaningful.
+    assert table.size_bytes >= 0
 
 
 def test_empty_directories_still_appear(tmp_path: Path) -> None:
-    root = tmp_path / "lakehouse"
-    (root / "raw").mkdir(parents=True)
-    (root / "marts").mkdir()
+    """A folder is where tables go; the storage layer still reports empty ones."""
+    (tmp_path / "raw").mkdir(parents=True)
+    (tmp_path / "marts").mkdir()
 
-    directories, tables = _by_folder(root)
-
-    assert directories == ["marts", "raw"]
-    assert tables == {}
+    assert LocalWarehouse(tmp_path).list_directories() == ["marts", "raw"]
 
 
 def test_missing_root_is_not_an_error(tmp_path: Path) -> None:
-    directories, tables = _by_folder(tmp_path / "does-not-exist")
-    assert directories == [] and tables == {}
+    assert LocalWarehouse(tmp_path / "does-not-exist").list_directories() == []

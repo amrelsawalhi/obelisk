@@ -46,12 +46,11 @@ def staging_folder() -> str:
 
 
 def folder_tables(folder: str) -> set[str]:
-    store = warehouse_storage()
-    return {
-        info.path.rsplit("/", 1)[-1][: -len(".parquet")]
-        for info in store.list_parquet()
-        if (info.path.rsplit("/", 1)[0] if "/" in info.path else "") == folder
-    }
+    """The tables one warehouse schema holds — asked of the catalog, not the disk."""
+    from app.core.catalog import scan
+
+    schema = folder.strip("/").replace("/", ".")
+    return {table.name for table in scan().tables if (table.folder or "") == schema}
 
 
 def _client() -> AsyncClient:
@@ -129,7 +128,8 @@ async def test_sample_data_can_target_a_named_folder_and_rejects_an_illegal_one(
         created = await client.post("/api/dbt/sample-data", json={"folder": folder})
         assert created.status_code == 200, created.text
         assert created.json()["folder"] == folder
-        assert (empty_warehouse / folder / "orders.parquet").is_file()
+        # The sample table exists in the lakehouse — asked of the catalog, not the disk.
+        assert f"orders" in folder_tables(folder)
 
         rejected = await client.post("/api/dbt/sample-data", json={"folder": "../escape"})
         assert rejected.status_code == 400
@@ -155,5 +155,7 @@ def test_sample_tables_land_where_the_catalog_says_they_do(empty_warehouse):
     result = scan(warehouse_storage())
     assert {table.name for table in result.tables} == SAMPLE_TABLES
     for table in result.tables:
-        assert table.path == path_for(staging_folder(), table.name)
+        # A table's address is its folder and name; the bytes live in whatever files the
+        # catalog says belong to it.
+        assert table.path == f"{staging_folder()}/{table.name}"
 

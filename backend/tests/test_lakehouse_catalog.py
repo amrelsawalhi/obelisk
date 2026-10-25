@@ -23,20 +23,20 @@ async def test_lakehouse_catalog_tree_and_preview():
     lakehouse_root = settings.lakehouse_root_path
     lakehouse_root.mkdir(parents=True, exist_ok=True)
 
-    # 1. Create a custom test directory and sample parquet file
+    # 1. Create a custom test folder and a sample table in the catalog
     custom_tier = f"test_tier_{uuid.uuid4().hex[:6]}"
     tier_dir = lakehouse_root / custom_tier
     tier_dir.mkdir(parents=True, exist_ok=True)
 
     sample_table = f"events_{uuid.uuid4().hex[:4]}"
-    parquet_path = tier_dir / f"{sample_table}.parquet"
+    from lakehouse_helpers import write_table as create_table
 
     table_data = pa.Table.from_pydict({
         "event_id": [101, 102, 103],
         "event_type": ["click", "view", "purchase"],
         "revenue": [0.0, 0.0, 149.99],
     })
-    pq.write_table(table_data, str(parquet_path), compression="SNAPPY")
+    create_table(f"{custom_tier}/{sample_table}.parquet", table_data)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -91,13 +91,14 @@ async def test_lakehouse_catalog_tree_and_preview():
         assert query_res["row_count"] == 1
         assert query_res["rows"][0]["revenue"] == 149.99
 
-    # Cleanup test files
-    if parquet_path.exists():
-        parquet_path.unlink()
-    if tier_dir.exists():
-        for p in tier_dir.iterdir():
-            p.unlink()
-        tier_dir.rmdir()
+    # Cleanup: drop the table, then the folder the test created (DuckLake leaves its
+    # data directory inside it, so remove the tree rather than its entries).
+    import shutil
+
+    from lakehouse_helpers import drop_schema
+
+    drop_schema(custom_tier)
+    shutil.rmtree(tier_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio
@@ -131,11 +132,11 @@ async def test_lakehouse_management_crud_and_metadata():
 
         # 2. Plant a sample table in parent_tier
         table_name = f"tab_{uuid.uuid4().hex[:4]}"
-        file_path = lakehouse_root / parent_tier / f"{table_name}.parquet"
-        pq.write_table(
+        from lakehouse_helpers import write_table as create_table
+
+        create_table(
+            f"{parent_tier}/{table_name}.parquet",
             pa.Table.from_pydict({"id": [1, 2], "val": ["A", "B"]}),
-            str(file_path),
-            compression="SNAPPY",
         )
 
         # Verify tree hierarchy contains parent (depth 0) and child (depth 1)
@@ -158,8 +159,14 @@ async def test_lakehouse_management_crud_and_metadata():
             "table_name": table_name,
         })
         assert move_res.status_code == 200
-        assert not (lakehouse_root / parent_tier / f"{table_name}.parquet").exists()
-        assert (lakehouse_root / child_tier / f"{table_name}.parquet").exists()
+        # The table lives in the child schema now — asked of the catalog, not the disk.
+        from app.core.catalog import scan as scan_lakehouse
+
+        after_move = {(t.fqn, t.folder) for t in scan_lakehouse().tables}
+        child_schema = child_tier.replace("/", ".")
+        parent_schema = parent_tier.replace("/", ".")
+        assert (f"lakehouse.{child_schema}.{table_name}", child_schema) in after_move
+        assert not any(t.fqn.endswith(f".{table_name}") and t.folder == parent_schema for t in scan_lakehouse().tables)
 
         # 4. Rename table in child_tier
         renamed_table = f"{table_name}_v2"
@@ -169,8 +176,9 @@ async def test_lakehouse_management_crud_and_metadata():
             "new_name": renamed_table,
         })
         assert rename_res.status_code == 200
-        assert not (lakehouse_root / child_tier / f"{table_name}.parquet").exists()
-        assert (lakehouse_root / child_tier / f"{renamed_table}.parquet").exists()
+        names = {(t.name, t.folder) for t in scan_lakehouse().tables}
+        assert (renamed_table, child_schema) in names
+        assert (table_name, child_schema) not in names
 
         # Preview renamed table
         prev = await client.get(f"/api/catalog/preview/lakehouse:{child_tier}/{renamed_table}")
@@ -183,7 +191,7 @@ async def test_lakehouse_management_crud_and_metadata():
             "name": renamed_table,
         })
         assert del_tbl.status_code == 200
-        assert not (lakehouse_root / child_tier / f"{renamed_table}.parquet").exists()
+        assert (renamed_table, child_schema) not in {(t.name, t.folder) for t in scan_lakehouse().tables}
 
         # 6. Delete directory
         del_child = await client.delete("/api/catalog/lakehouse/directories", params={

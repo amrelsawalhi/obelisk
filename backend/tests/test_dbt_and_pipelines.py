@@ -68,9 +68,8 @@ def test_dbt_pipeline_end_to_end(source_postgres_params):
     staging_dir = settings.lakehouse_root_path / staging_schema
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Create real Parquet files
-    orders_path = staging_dir / "orders.parquet"
-    customers_path = staging_dir / "customers.parquet"
+    # 1. Create the source tables through the catalog (a file on disk is not a table).
+    from lakehouse_helpers import write_table as create_table
 
     orders_table = pa.Table.from_pydict({
         "order_id": [1, 2, 3, 4],
@@ -79,7 +78,7 @@ def test_dbt_pipeline_end_to_end(source_postgres_params):
         "status": ["completed", "completed", "completed", "pending"],
         "created_at": ["2026-01-10 10:00:00", "2026-01-11 11:30:00", "2026-01-12 14:15:00", "2026-01-13 09:00:00"],
     })
-    pq.write_table(orders_table, str(orders_path), compression="SNAPPY")
+    create_table(f"{staging_schema}/orders.parquet", orders_table)
 
     customers_table = pa.Table.from_pydict({
         "customer_id": [10, 20, 30],
@@ -87,13 +86,12 @@ def test_dbt_pipeline_end_to_end(source_postgres_params):
         "tier": ["Enterprise", "MidMarket", "Enterprise"],
         "country": ["US", "DE", "FR"],
     })
-    pq.write_table(customers_table, str(customers_path), compression="SNAPPY")
+    create_table(f"{staging_schema}/customers.parquet", customers_table)
 
     # The project also declares two enterprise sources. Give them one row each so
     # `dbt run` can build every model in the project, not just the ones asserted on.
-    ecommerce_orders_path = staging_dir / "ecommerce_orders.parquet"
-    ecommerce_customers_path = staging_dir / "ecommerce_customers.parquet"
-    pq.write_table(
+    create_table(
+        f"{staging_schema}/ecommerce_orders.parquet",
         pa.Table.from_pydict({
             "order_id": [9001],
             "order_uuid": ["11111111-1111-1111-1111-111111111111"],
@@ -107,10 +105,9 @@ def test_dbt_pipeline_end_to_end(source_postgres_params):
             "order_placed_at": ["2026-01-15 10:00:00+00"],
             "shipping_address": ['{"city": "Berlin", "street": "Main 1", "is_commercial": false}'],
         }),
-        str(ecommerce_orders_path),
-        compression="SNAPPY",
     )
-    pq.write_table(
+    create_table(
+        f"{staging_schema}/ecommerce_customers.parquet",
         pa.Table.from_pydict({
             "customer_id": ["33333333-3333-3333-3333-333333333333"],
             "first_name": ["Ada"],
@@ -121,8 +118,6 @@ def test_dbt_pipeline_end_to_end(source_postgres_params):
             "signup_timestamp": ["2026-01-01 09:00:00+00"],
             "metadata_json": ['{"referral_source": "search", "preferred_channel": "email", "vip_flag": true}'],
         }),
-        str(ecommerce_customers_path),
-        compression="SNAPPY",
     )
 
     pg_params = {
@@ -199,15 +194,17 @@ def test_dbt_pipeline_end_to_end(source_postgres_params):
             conn.close()
 
     finally:
-        # Cleanup Parquet files
-        for leftover in (
-            orders_path,
-            customers_path,
-            ecommerce_orders_path,
-            ecommerce_customers_path,
-        ):
-            if leftover.exists():
-                leftover.unlink(missing_ok=True)
+        # Drop the source tables the run read, so the shared lakehouse stays clean.
+        from app.engines.duckdb_engine import duckdb_engine
+
+        conn = duckdb_engine.get_connection()
+        try:
+            for name in ("orders", "customers", "ecommerce_orders", "ecommerce_customers"):
+                conn.execute(
+                    f'DROP TABLE IF EXISTS lakehouse."{staging_schema}"."{name}"'
+                )
+        finally:
+            conn.close()
 
 
 @pytest.mark.asyncio

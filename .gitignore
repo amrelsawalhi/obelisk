@@ -41,6 +41,20 @@ data/dagster_home/
 data/run/
 data/logs/
 
+# DuckLake spike workspace (throwaway; created by backend/scripts/spike_ducklake.py)
+data/spike_ducklake/
+
+# Single-instance guard: the claim file and the holder note are runtime state
+**/obelisk.instance.lock
+**/obelisk.instance.json
+
+# DuckLake metadata catalog and DuckDB spill scratch (runtime state, per install)
+data/lakehouse_catalog.sqlite*
+data/duckdb_tmp/
+
+# Backups written by backend/scripts/lakehouse_maintenance.py
+backups/
+
 # Lakehouse Parquet Data & DuckDB files (User/Ingested Lakehouse Data)
 **/lakehouse/**
 !**/lakehouse/.gitkeep

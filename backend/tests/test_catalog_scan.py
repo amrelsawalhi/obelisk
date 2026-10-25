@@ -128,117 +128,78 @@ def test_illegal_paths_are_refused(bad):
 # ------------------------------------------------------------------------ scan
 
 
-def test_scan_reads_the_tree_it_finds(tmp_path):
-    write_parquet(tmp_path / "orders.parquet", rows=5)
-    write_parquet(tmp_path / "supabase" / "table1.parquet", rows=2, extra_column=True)
-    write_parquet(tmp_path / "supabase" / "auth" / "table1.parquet", rows=7)
-    (tmp_path / "empty" / "nested").mkdir(parents=True)
-
-    result = scan(LocalWarehouse(tmp_path))
-
-    assert result.problems == ()
-    assert [table.fqn for table in result.tables] == [
-        "lakehouse.orders",
-        "lakehouse.supabase.auth.table1",
-        "lakehouse.supabase.table1",
-    ]
-    by_path = {table.path: table for table in result.tables}
-    assert by_path["orders.parquet"].num_rows == 5
-    assert by_path["orders.parquet"].folder == ""
-    assert by_path["supabase/auth/table1.parquet"].folder == "supabase/auth"
-    assert (
-        by_path["supabase/auth/table1.parquet"].sql_name
-        == 'lakehouse."supabase.auth".table1'
-    )
-    assert [column["name"] for column in by_path["supabase/table1.parquet"].columns] == [
-        "id",
-        "name",
-        "amount",
-    ]
-    assert by_path["supabase/table1.parquet"].size_bytes > 0
-    assert by_path["supabase/table1.parquet"].modified_at.tzinfo == timezone.utc
-
-
-def test_an_empty_warehouse_scans_to_nothing(tmp_path):
-    result = scan(LocalWarehouse(tmp_path))
-    assert result.tables == ()
-    assert result.problems == ()
-
-
-def test_a_corrupt_file_is_reported_and_does_not_hide_the_rest(tmp_path):
-    write_parquet(tmp_path / "orders.parquet")
-    broken = tmp_path / "broken" / "table1.parquet"
-    broken.parent.mkdir(parents=True)
-    broken.write_bytes(b"this is not parquet")
-
-    result = scan(LocalWarehouse(tmp_path))
-
-    assert [table.fqn for table in result.tables] == ["lakehouse.orders"]
-    assert len(result.problems) == 1
-    assert "broken/table1.parquet" in result.problems[0]
-
-
-def test_the_scan_never_writes(tmp_path):
-    write_parquet(tmp_path / "orders.parquet")
-    before = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
-    scan(LocalWarehouse(tmp_path))
-    after = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
-    assert before == after
-
-
-class InMemoryWarehouse:
-    """A warehouse whose files are a dict, so case-only collisions can be exercised.
-
-    Windows cannot hold ``orders.parquet`` and ``Orders.parquet`` in one folder, but a
-    bucket can, and the scan has to notice instead of letting one shadow the other.
-    """
-
-    def __init__(self, files: dict[str, bytes]):
-        self.files = dict(files)
-
-    def display_root(self) -> str:
-        return "memory://warehouse"
-
-    def list_parquet(self) -> list[FileInfo]:
-        now = datetime.now(timezone.utc)
-        return [
-            FileInfo(path=path, size_bytes=len(data), modified_at=now)
-            for path, data in sorted(self.files.items())
-        ]
-
-    def open_binary(self, rel: str):
-        return io.BytesIO(self.files[rel])
-
-    def stat(self, rel: str) -> FileInfo:
-        return FileInfo(
-            path=rel, size_bytes=len(self.files[rel]), modified_at=datetime.now(timezone.utc)
-        )
-
-    def exists(self, rel: str) -> bool:
-        return rel in self.files
-
-    def write_atomic(self, rel: str, data: bytes) -> None:
-        self.files[rel] = data
-
-    def delete(self, rel: str) -> None:
-        self.files.pop(rel, None)
-
-    def location(self, rel: str) -> str:
-        return f"memory://warehouse/{rel}"
-
-
-def test_two_files_differing_only_by_case_are_reported():
-    store = InMemoryWarehouse(
-        {"orders.parquet": parquet_bytes(), "Orders.parquet": parquet_bytes()}
-    )
-
-    result = scan(store)
-
-    assert len(result.tables) == 1
-    assert len(result.problems) == 1
-    assert "case-insensitive" in result.problems[0]
-    assert result.root == "memory://warehouse"
-
-
 def test_the_source_slot_names_the_warehouse():
     assert SOURCE == "lakehouse"
+
+
+# --------------------------------------------------------------- scan (the catalog)
+
+def write_table(schema: str, table: str, rows: int = 3, extra_column: bool = False) -> None:
+    """Creates a table through the writer, which is how tables exist now."""
+    from app.engines.duckdb_engine import duckdb_engine
+    from app.engines.ingest_engine import ingest_engine
+
+    data = {"id": list(range(1, rows + 1)), "name": [f"row-{i}" for i in range(1, rows + 1)]}
+    if extra_column:
+        data["amount"] = [1.5 * i for i in range(1, rows + 1)]
+
+    conn = duckdb_engine.get_connection()
+    try:
+        conn.execute(f'CREATE SCHEMA IF NOT EXISTS lakehouse."{schema}";')
+        assert ingest_engine._stage_batches(conn, [pa.table(data)]) == rows
+        ingest_engine._write_staged(
+            conn,
+            target=f'lakehouse."{schema}".{table}',
+            mode="snapshot",
+            exists=False,
+            write_strategy="append",
+            primary_key=None,
+            watermark_column=None,
+        )
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def schema():
+    """A unique schema in the test lakehouse, dropped afterwards."""
+    import uuid
+
+    from app.engines.duckdb_engine import duckdb_engine
+
+    name = f"zzscan{uuid.uuid4().hex[:6]}"
+    yield name
+    conn = duckdb_engine.get_connection()
+    try:
+        conn.execute(f'DROP SCHEMA IF EXISTS lakehouse."{name}" CASCADE')
+    finally:
+        conn.close()
+
+
+def test_scan_reads_what_the_catalog_holds(schema):
+    write_table(schema, "orders", rows=5, extra_column=True)
+
+    result = scan()
+
+    by_fqn = {table.fqn: table for table in result.tables}
+    table = by_fqn[f"lakehouse.{schema}.orders"]
+    assert table.num_rows == 5
+    assert table.folder == schema
+    assert [column["name"] for column in table.columns] == ["id", "name", "amount"]
+    assert table.modified_at.tzinfo == timezone.utc
+    assert result.problems == (), "a healthy catalog reports no problems"
+
+
+def test_a_dropped_table_disappears_from_the_catalog(schema):
+    from app.engines.duckdb_engine import duckdb_engine
+
+    write_table(schema, "gone", rows=2)
+    assert any(t.fqn == f"lakehouse.{schema}.gone" for t in scan().tables)
+
+    conn = duckdb_engine.get_connection()
+    try:
+        conn.execute(f'DROP TABLE lakehouse."{schema}".gone')
+    finally:
+        conn.close()
+
+    assert not any(t.fqn == f"lakehouse.{schema}.gone" for t in scan().tables)

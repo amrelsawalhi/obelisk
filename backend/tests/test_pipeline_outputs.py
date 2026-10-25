@@ -218,7 +218,14 @@ async def test_materialize_writes_a_dataset_and_publishes_its_name():
         # Row count is published without being declared.
         assert outputs["rows"]["value"] == 2
         assert "Materialized 2 row(s)" in (step_run.logs or "")
-        assert (settings.lakehouse_root_path / folder / "numbers.parquet").is_file()
+        # The dataset is durable in the lakehouse, and the catalog is what says so.
+        from app.core.catalog import scan
+
+        written = next(
+            (t for t in scan().tables if t.fqn == f"lakehouse.{folder}.numbers"), None
+        )
+        assert written is not None, "the materialised table must appear in the catalog"
+        assert written.num_rows == 2
     finally:
         await pipeline_engine.stop()
         # Removing the files is enough: the projection prunes the catalog row itself.

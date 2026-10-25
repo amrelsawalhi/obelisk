@@ -18,7 +18,7 @@ alembic>=1.13.0
 greenlet>=3.0.3
 
 # In-Process OLAP & Zero-Copy Arrow / Polars
-duckdb>=0.10.0
+duckdb>=2.0.0
 polars>=0.20.15
 pyarrow>=15.0.0
 fsspec>=2024.2.0

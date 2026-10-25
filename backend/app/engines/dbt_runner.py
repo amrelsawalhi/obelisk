@@ -151,33 +151,50 @@ class DbtRunner:
         look at, and gets back exactly which tables that created. Idempotent — files
         that already exist are left untouched.
         """
+        from app.core.catalog import scan as scan_lakehouse
+
         target = (folder or self._dbt_folders()["staging"]).strip().strip("/")
         store = warehouse_storage()
-        before = {info.path for info in store.list_parquet()}
+        schema = target.replace("/", ".")
+        before = {table.name for table in scan_lakehouse().tables if table.folder == schema}
         self._write_sample_tables(target)
-        after = [info.path for info in store.list_parquet() if info.path.startswith(f"{target}/")]
+        after = {table.name for table in scan_lakehouse().tables if table.folder == schema}
         return {
             "status": "success",
             "folder": target,
             "directory": store.display_root(),
-            "tables": sorted(path.rsplit("/", 1)[-1][: -len(".parquet")] for path in after),
-            "created": sorted(
-                path.rsplit("/", 1)[-1][: -len(".parquet")]
-                for path in after
-                if path not in before
-            ),
+            "tables": sorted(after),
+            "created": sorted(after - before),
         }
 
     @staticmethod
-    def _write_parquet(store: Any, rel_path: str, table: Any) -> None:
-        """One atomic write through the storage seam, so a bucket changes nothing here."""
-        import io
+    def _write_table(rel_path: str, table: Any) -> None:
+        """Creates one sample table in the lakehouse, if it is not there already.
 
-        import pyarrow.parquet as pq
+        ``IF NOT EXISTS`` keeps the seeding idempotent: a workspace that already has the
+        sample set is left exactly as it is, which is what the caller promised.
+        """
+        from app.core.catalog import SOURCE, quote_ident
+        from app.engines.duckdb_engine import duckdb_engine
 
-        buffer = io.BytesIO()
-        pq.write_table(table, buffer, compression="SNAPPY")
-        store.write_atomic(rel_path, buffer.getvalue())
+        folder, name = rel_path.rsplit("/", 1) if "/" in rel_path else ("", rel_path)
+        if name.endswith(".parquet"):
+            name = name[: -len(".parquet")]
+        schema = folder.replace("/", ".") if folder else "main"
+
+        conn = duckdb_engine.get_connection()
+        try:
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema)};")
+            conn.register("_obelisk_sample", table)
+            try:
+                conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {SOURCE}.{quote_ident(schema)}."
+                    f"{quote_ident(name)} AS SELECT * FROM _obelisk_sample"
+                )
+            finally:
+                conn.unregister("_obelisk_sample")
+        finally:
+            conn.close()
 
     def _write_sample_tables(self, folder: str) -> None:
         """Writes the demo tables the shipped models read.
@@ -206,7 +223,7 @@ class DbtRunner:
                     datetime(2026, 1, 19, 16, 20, 0, tzinfo=timezone.utc),
                 ]),
             }
-            self._write_parquet(store, orders_file, pa.Table.from_pydict(orders_data))
+            self._write_table(orders_file, pa.Table.from_pydict(orders_data))
 
         customers_file = path_for(folder, "customers")
         if not store.exists(customers_file):
@@ -216,7 +233,7 @@ class DbtRunner:
                 "tier": pa.array(["Enterprise", "Pro", "Standard"], type=pa.string()),
                 "country": pa.array(["USA", "UK", "Germany"], type=pa.string()),
             }
-            self._write_parquet(store, customers_file, pa.Table.from_pydict(customers_data))
+            self._write_table(customers_file, pa.Table.from_pydict(customers_data))
 
         # The project's two "enterprise" models read these, so the sample set covers
         # both model families — a run on sample data exercises every shipped model.
@@ -255,8 +272,7 @@ class DbtRunner:
                     type=pa.string(),
                 ),
             }
-            self._write_parquet(
-                store, ecommerce_orders_file, pa.Table.from_pydict(orders_data)
+            self._write_table(ecommerce_orders_file, pa.Table.from_pydict(orders_data)
             )
 
         ecommerce_customers_file = path_for(folder, "ecommerce_customers")
@@ -285,8 +301,7 @@ class DbtRunner:
                     type=pa.string(),
                 ),
             }
-            self._write_parquet(
-                store, ecommerce_customers_file, pa.Table.from_pydict(ecommerce_customers_data)
+            self._write_table(ecommerce_customers_file, pa.Table.from_pydict(ecommerce_customers_data)
             )
 
     def sync_folder_to_postgres(
@@ -311,24 +326,26 @@ class DbtRunner:
         password = postgres_params["password"]
         sslmode = postgres_params.get("sslmode", "disable")
 
-        all_parquet = [
-            info for info in store.list_parquet()
-            if (info.path.rsplit("/", 1)[0] if "/" in info.path else "") == target_folder
+        # The source is the lakehouse catalog, not the folder: a table is a catalog entry
+        # now, and its files are whatever the catalog says belong to it.
+        from app.core.catalog import scan as scan_lakehouse
+
+        schema_key = target_folder.replace("/", ".")
+        source_tables = [
+            table for table in scan_lakehouse().tables if (table.folder or "") == schema_key
         ]
-        if not all_parquet:
+        if not source_tables:
             # Nothing to copy: the project has no source tables to read. Say that
             # plainly instead of writing sample tables the operator never asked for.
             raise NoSourceData(
                 self._empty_folder_message(target_folder or "/", store.location(target_folder or ""))
             )
         if table_names:
-            target_files = [
-                info for info in all_parquet if info.path.rsplit("/", 1)[-1][: -len(".parquet")] in table_names
-            ]
+            target_tables = [table for table in source_tables if table.name in table_names]
         else:
-            target_files = all_parquet
+            target_tables = source_tables
 
-        if not target_files:
+        if not target_tables:
             return {
                 "status": "success",
                 "folder": target_folder,
@@ -343,6 +360,9 @@ class DbtRunner:
         synced_info = []
 
         try:
+            from app.core.catalog import attach_lakehouse
+
+            attach_lakehouse(conn)
             conn.execute("LOAD postgres;")
             conn_str = build_pg_dsn(
                 dbname=database,
@@ -359,12 +379,11 @@ class DbtRunner:
             # The folder's own schema, created on first use.
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{schema};")
 
-            for pf in target_files:
-                table_name = pf.path.rsplit("/", 1)[-1][: -len(".parquet")]
-                posix_src = store.location(pf.path)
+            for table in target_tables:
+                table_name = table.name
                 query = f"""
                     CREATE OR REPLACE TABLE {alias}.{schema}."{table_name}" AS
-                    SELECT * FROM read_parquet('{posix_src}');
+                    SELECT * FROM {table.sql_name};
                 """
                 conn.execute(query)
 
@@ -598,14 +617,17 @@ class DbtRunner:
         return run_data
 
     def folder_tables(self, folder: str) -> List[str]:
-        """The table names this warehouse folder holds, from the scan."""
-        target = (folder or "").strip().strip("/")
-        names = []
-        for info in warehouse_storage().list_parquet():
-            parent = info.path.rsplit("/", 1)[0] if "/" in info.path else ""
-            if parent == target:
-                names.append(info.path.rsplit("/", 1)[-1][: -len(".parquet")])
-        return names
+        """The table names this warehouse folder holds, from the catalog."""
+        from app.core.catalog import scan as scan_lakehouse
+
+        target = (folder or "").strip().strip("/").replace("/", ".")
+        if target in ("", "main"):
+            target = ""
+        return [
+            table.name
+            for table in scan_lakehouse().tables
+            if (table.folder or "") == target
+        ]
 
     def get_model_code(self, folder: str, name: str) -> Optional[str]:
         """Reads SQL source code of a dbt model from git_repo/dbt_project/models/."""
@@ -937,6 +959,9 @@ class DbtRunner:
             env["DBT_DUCKDB_PATH"] = (
                 settings.lakehouse_root_path / "lakehouse.duckdb"
             ).resolve().as_posix()
+            # The lakehouse output attaches the DuckLake catalog; give dbt its path so
+            # `dbt run` writes tables into the lake instead of a file.
+            env["DBT_LAKEHOUSE_CATALOG"] = settings.lakehouse_catalog_path.as_posix()
 
         return env
 

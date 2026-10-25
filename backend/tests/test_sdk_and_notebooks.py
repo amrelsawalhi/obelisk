@@ -18,36 +18,32 @@ import obelisk
 
 @pytest.fixture(scope="module")
 def sample_bronze_dataset():
-    """Provisions a real Snappy Parquet table in Bronze storage for SDK verification."""
-    # Both readers ask for "bronze.<table>", so the file belongs in the bronze folder.
-    # At the lakehouse root it was also in the path of the autouse cleanup, which
-    # deletes sdk_orders_* files after every test -- invisible while the Spark test was
-    # skipped for want of a JDK, and a FileNotFoundError as soon as one was installed.
-    storage_dir = Path(settings.duckdb_storage_path) / "bronze"
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    table_name = f"sdk_orders_{uuid.uuid4().hex[:6]}"
-    target_path = storage_dir / f"{table_name}.parquet"
+    """Provisions a real table in the bronze schema for SDK verification."""
+    from app.engines.duckdb_engine import duckdb_engine
 
+    table_name = f"sdk_orders_{uuid.uuid4().hex[:6]}"
     table_data = pa.Table.from_pydict({
         "order_id": [101, 102, 103],
         "customer": ["Alice", "Bob", "Charlie"],
         "amount": [150.50, 89.20, 240.00],
     })
-    pq.write_table(table_data, str(target_path), compression="SNAPPY")
+    obelisk.save(table_data, f"bronze.{table_name}", sync_postgres=False)
 
-    yield table_name, target_path
+    yield table_name, None
 
-    if target_path.exists():
-        target_path.unlink(missing_ok=True)
+    conn = duckdb_engine.get_connection()
+    try:
+        conn.execute(f'DROP TABLE IF EXISTS lakehouse."bronze".{table_name}')
+    finally:
+        conn.close()
 
 
 def test_obelisk_table_and_formats(sample_bronze_dataset):
     """Verifies that obelisk.table() resolves datasets and converts seamlessly across engines."""
-    table_name, target_path = sample_bronze_dataset
+    table_name, _target_path = sample_bronze_dataset
     tbl = obelisk.table(f"bronze.{table_name}")
 
     assert tbl.exists() is True
-    assert tbl.file_path == target_path
 
     # 1. PyArrow conversion
     arrow_tbl = tbl.to_arrow()
@@ -96,21 +92,22 @@ async def test_obelisk_save_writes_a_file_the_catalog_can_see():
     assert res["sql_name"] == f"lakehouse.gold.{gold_stem}"
     assert res["num_rows"] == 4
 
-    target_file = Path(res["file_path"])
-    assert target_file.exists()
-    assert pq.read_metadata(str(target_file)).num_rows == 4
-
-    # The catalog read is the projection: no one registered this table.
+    # The save landed in the catalog, and nothing was registered by hand.
     transport = ASGITransport(app=app)
     try:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             objects = (await client.get("/api/catalog/objects")).json()
         row = next(obj for obj in objects if obj["fqn"] == res["fqn"])
         assert row["row_count"] == 4
-        assert row["path"] == f"gold/{gold_stem}.parquet"
         assert row["folder"] == "gold"
     finally:
-        target_file.unlink(missing_ok=True)
+        from app.engines.duckdb_engine import duckdb_engine
+
+        conn = duckdb_engine.get_connection()
+        try:
+            conn.execute(f'DROP TABLE IF EXISTS lakehouse."gold".{gold_stem}')
+        finally:
+            conn.close()
         import sqlite3
 
         with sqlite3.connect(settings.sqlite_db_path) as conn:

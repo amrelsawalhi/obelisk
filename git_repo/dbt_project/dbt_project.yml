@@ -19,6 +19,10 @@ clean-targets:
 # Obelisk reads the same names to know which warehouse folder to stage from and into.
 models:
   obelisk_dbt:
+    # On the lakehouse target, models write into the attached DuckLake catalog, so the
+    # results are visible to the catalog tree and Query Studio with no import step. On
+    # any other adapter the database is whatever that adapter says it is.
+    +database: "{{ 'lakehouse' if target.type == 'duckdb' else target.database }}"
     staging:
       +schema: raw
       +materialized: table

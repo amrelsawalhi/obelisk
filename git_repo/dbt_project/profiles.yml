@@ -1,6 +1,21 @@
 obelisk:
   target: "{{ env_var('DBT_TARGET', 'dev') }}"
   outputs:
+    # Marts live in the lakehouse itself: this target attaches the DuckLake catalog, so
+    # `dbt run` writes tables the catalog tree, the SDK and Query Studio can see without
+    # any import step. It is opt-in (DBT_TARGET=lakehouse) because switching the default
+    # would move every existing model's output to a different place.
+    lakehouse:
+      type: duckdb
+      path: "{{ env_var('DBT_DUCKDB_PATH', 'dbt.duckdb') }}"
+      schema: main
+      threads: 2
+      extensions:
+        - ducklake
+      attach:
+        - path: "ducklake:sqlite:{{ env_var('DBT_LAKEHOUSE_CATALOG') }}"
+          alias: lakehouse
+          is_ducklake: true
     dev:
       type: postgres
       host: "{{ env_var('DBT_PG_HOST', 'localhost') }}"

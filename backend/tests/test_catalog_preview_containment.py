@@ -66,10 +66,10 @@ async def test_preview_still_serves_a_real_table() -> None:
 @pytest.mark.asyncio
 async def test_preview_serves_a_nested_folder() -> None:
     """A nested folder is addressed by its path, exactly like the tree shows it."""
+    from lakehouse_helpers import drop_schema, write_table
+
     layer = f"zz{uuid.uuid4().hex[:6]}/sales"
-    directory = settings.lakehouse_root_path / layer
-    directory.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table({"id": [1, 2]}), directory / "probe.parquet")
+    write_table(f"{layer}/probe.parquet", pa.table({"id": [1, 2]}))
 
     try:
         transport = ASGITransport(app=app)
@@ -79,9 +79,4 @@ async def test_preview_serves_a_nested_folder() -> None:
         assert response.status_code == 200, response.text
         assert len(response.json()["columns"]) == 1
     finally:
-        shutil.rmtree(directory, ignore_errors=True)
-        import sqlite3
-
-        with sqlite3.connect(settings.sqlite_db_path) as con:
-            con.execute("DELETE FROM catalog_objects WHERE location LIKE ?", (f"{layer}/%",))
-            con.commit()
+        drop_schema(layer.split("/")[0])

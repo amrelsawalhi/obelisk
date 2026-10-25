@@ -8,7 +8,13 @@ from typing import Dict, Any, List, Tuple, Optional
 import duckdb
 import polars as pl
 from app.config import settings
-from app.core.catalog import SOURCE, WarehouseScan, quote_ident, scan
+from app.core.catalog import (
+    RESERVED,
+    SOURCE,
+    attach_lakehouse,
+    lakehouse_tables,
+    quote_ident,
+)
 from app.core.resource_advisor import advisor
 from app.core.storage import warehouse_storage
 
@@ -35,38 +41,51 @@ class DuckDBEngine:
         """
         return settings.duckdb_storage_path
 
-    def get_connection(self) -> duckdb.DuckDBPyConnection:
-        """
-        Creates an in-memory DuckDB connection, sets memory limit from ResourceAdvisor,
-        and registers the storage_uri setting.
+    def get_connection(self, *, with_lakehouse: bool = True) -> duckdb.DuckDBPyConnection:
+        """An in-memory DuckDB connection with this process's budget applied.
+
+        Every connection in the application comes from here (Rule 5): the memory limit
+        from ``ResourceAdvisor``, a local temp directory so a large query spills instead
+        of dying, a cap on that spill, and a thread ceiling so concurrent queries do not
+        each claim every core.
+
+        The lakehouse catalog is attached by default, because a connection without it can
+        neither read nor write a table.
         """
         conn = duckdb.connect(":memory:")
-        mem_limit = advisor.get_duckdb_memory_limit()
-        try:
-            conn.execute(f"SET memory_limit = '{mem_limit}';")
-        except Exception as e:
-            logger.debug("DuckDB memory_limit setting failed: %s", e)
-
-        # Set duckdb storage directory setting for convenience
-        storage_path = self._ensure_storage()
-        try:
-            conn.execute(f"SET storage_directory = '{storage_path}';")
-        except Exception as e:
-            logger.debug("DuckDB storage_directory setting failed: %s", e)
-
-        # Enforce secure HTTPS for DuckDB extension downloads (prevents ISP HTTP 307 interception)
-        try:
-            conn.execute("SET custom_extension_repository = 'https://extensions.duckdb.org';")
-        except Exception as e:
-            logger.debug("DuckDB custom_extension_repository setting failed: %s", e)
-
-        # Load httpfs extension for remote HTTPS and S3 queries
+        self._apply_session_budget(conn)
         try:
             conn.execute("LOAD httpfs;")
         except Exception as e:
             logger.debug("DuckDB httpfs extension load failed: %s", e)
-
+        if with_lakehouse:
+            self.attach_lakehouse(conn)
         return conn
+
+    def _apply_session_budget(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """One place that decides how much of the machine a connection may use."""
+        statements = [
+            f"SET memory_limit = '{advisor.get_duckdb_memory_limit()}';",
+            f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
+            f"SET max_temp_directory_size = '{settings.DUCKDB_TEMP_SIZE_LIMIT}';",
+            "SET preserve_insertion_order = false;",
+            f"SET storage_directory = '{self._ensure_storage()}';",
+        ]
+        if settings.DUCKDB_THREADS:
+            statements.append(f"SET threads = {int(settings.DUCKDB_THREADS)};")
+        for statement in statements:
+            try:
+                conn.execute(statement)
+            except Exception as exc:
+                logger.debug("DuckDB setting failed (%s): %s", statement, exc)
+
+    def attach_lakehouse(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Attaches the DuckLake catalog under the name ``lakehouse``.
+
+        The address people already type — ``lakehouse.raw.orders`` — is unchanged; only
+        who owns the metadata is. See :func:`app.core.catalog.attach_lakehouse`.
+        """
+        attach_lakehouse(conn)
 
     def attach_postgres(
         self,
@@ -112,47 +131,14 @@ class DuckDBEngine:
         else:
             conn.execute(f"ATTACH {sql_string(dsn)} AS {safe_alias} (TYPE POSTGRES);")
 
-    def _warehouse_scan(self) -> WarehouseScan:
-        """The tables that exist, read from the warehouse itself.
-
-        No cache here: the walk is a directory listing, and the expensive part — reading
-        each footer — is cached in :func:`app.core.catalog.read_footer` against the
-        file's size and timestamp. A table written a moment ago is therefore visible to
-        the very next query, which a time-based cache could not promise.
-        """
-        return scan(warehouse_storage())
-
-    @staticmethod
-    def _schema_for(folder: str) -> str:
-        """The DuckDB schema a folder maps to, quoted only where it must be.
-
-        SQL identifiers carry three parts, so a nested path becomes one schema whose
-        name contains dots — `supabase/auth` -> `"supabase.auth"`. Root-level files
-        live in the attached catalog's default schema.
-        """
-        if not folder:
-            return "main"
-        return quote_ident(folder.replace("/", "."))
-
-    def _register_view(self, conn: duckdb.DuckDBPyConnection, table, location: str) -> None:
-        """Creates the canonical view for one table, plus a bare alias when unambiguous.
-
-        The canonical name is the three-slot address — `lakehouse.supabase.table1`, or
-        `lakehouse."supabase.auth".table1` when the folder path is deeper than one
-        level. The bare alias exists because `SELECT * FROM orders` is what people
-        type; it is only registered while that name is unique in the warehouse.
-        """
-        schema = self._schema_for(table.folder)
-        table_name = quote_ident(table.name)
-        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{schema};")
-        conn.execute(
-            f"CREATE OR REPLACE VIEW {SOURCE}.{schema}.{table_name} AS "
-            f"SELECT * FROM read_parquet('{location}');"
-        )
-        if table.bare_alias:
-            conn.execute(
-                f"CREATE OR REPLACE VIEW {table_name} AS SELECT * FROM read_parquet('{location}');"
-            )
+    def _lakehouse_tables(self, conn: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
+        """``(schema, table)`` pairs the catalog knows about."""
+        try:
+            rows = lakehouse_tables(conn)
+        except Exception as exc:
+            logger.debug("Could not read DuckLake metadata: %s", exc)
+            return []
+        return [(row["schema"], row["table"]) for row in rows]
 
     @staticmethod
     def _rewrite_names(sql: str, mapping: Dict[str, str]) -> str:
@@ -210,44 +196,50 @@ class DuckDBEngine:
                 index = end
         return "".join(out)
 
-    def _prepare_sql_and_views(self, conn: duckdb.DuckDBPyConnection, sql: str, storage_path: str) -> str:
-        """Makes the warehouse queryable: views from the scan, then name resolution.
+    def _prepare_sql_and_views(
+        self, conn: duckdb.DuckDBPyConnection, sql: str, storage_path: str
+    ) -> str:
+        """Makes warehouse names resolvable, without walking the filesystem.
 
-        This engine keeps no catalog of its own. It asks :func:`app.core.catalog.scan`
-        what exists and creates a view per file, so a table is queryable exactly when
-        its Parquet file is there — the same answer the catalog tree shows.
+        The tables already exist — the catalog is attached — so the per-query scan and
+        the ``CREATE VIEW`` per file are gone. Two conveniences remain:
+
+        * the folder shorthand (``raw.orders``) is rewritten to the address DuckDB
+          parses, because that is what SQL steps and the docs use;
+        * a bare name (``orders``) becomes a temporary view while it is unique in the
+          warehouse, so ``SELECT * FROM orders`` keeps working and an ambiguous name
+          still fails loudly instead of picking a schema.
         """
-        store = warehouse_storage()
-        result = self._warehouse_scan()
+        tables = self._lakehouse_tables(conn)
         tokens = set(re.findall(r"[a-zA-Z0-9_]+", sql.lower()))
+        counts: Dict[str, int] = {}
+        for _, table in tables:
+            counts[table.lower()] = counts.get(table.lower(), 0) + 1
 
-        try:
-            conn.execute(f"ATTACH ':memory:' AS {SOURCE};")
-        except Exception as exc:
-            logger.debug("Failed to attach in-memory %s catalog: %s", SOURCE, exc)
-
-        # Rewriting is independent of what this query mentions: the map is the
-        # warehouse's own address list, so it costs one dictionary pass.
         names: Dict[str, str] = {}
-        for table in result.tables:
-            if table.fqn.lower() != table.sql_name.lower():
-                names[table.fqn.lower()] = table.sql_name
-            # The layer shorthand -- ``bronze.orders`` -- is what SQL steps and the docs
-            # use, while ``sql_name`` is the canonical address DuckDB parses. Mapping it
-            # here is what makes the shorthand resolve instead of depending on a bare
-            # alias that only exists when the file name happens to be unique.
-            shorthand = f"{table.folder.strip('/').replace('/', '.')}.{table.name}".lower()
-            if table.folder.strip("/"):
-                names.setdefault(shorthand, table.sql_name)
+        for schema, table in tables:
+            target = f"{SOURCE}.{quote_ident(schema)}.{quote_ident(table)}"
+            fqn = f"{SOURCE}.{schema}.{table}"
+            if fqn.lower() != target.lower():
+                names[fqn.lower()] = target
+            if schema.strip() and schema.lower() != "main":
+                names.setdefault(f"{schema}.{table}".lower(), target)
+            else:
+                # A table in the catalog's default schema keeps its documented two-slot
+                # address: `lakehouse.orders`, not `lakehouse.main.orders`.
+                names.setdefault(f"{SOURCE}.{table}".lower(), target)
 
-        for table in result.tables:
-            segments = [segment.lower() for segment in table.folder.split("/") if segment]
-            if not (table.name.lower() in tokens or any(part in tokens for part in segments)):
-                continue
-            try:
-                self._register_view(conn, table, store.location(table.path))
-            except Exception as exc:
-                logger.debug("Could not register a view for %s: %s", table.path, exc)
+            # A bare alias is a convenience, not an address: only when exactly one table
+            # answers to that name, and never for a word SQL already uses.
+            bare = table.lower()
+            if counts[bare] == 1 and bare in tokens and bare not in RESERVED:
+                try:
+                    conn.execute(
+                        f"CREATE OR REPLACE TEMP VIEW {quote_ident(table)} AS "
+                        f"SELECT * FROM {target};"
+                    )
+                except Exception as exc:
+                    logger.debug("Could not alias %s: %s", table, exc)
 
         return self._normalize_parquet_paths(self._rewrite_names(sql, names))
 

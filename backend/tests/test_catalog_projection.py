@@ -26,8 +26,15 @@ from app.services.catalog import catalog_service
 
 
 def write_table(path: Path, rows: int = 3) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.table({"id": list(range(rows))}), str(path))
+    """Creates the table that ``path`` used to represent, through the catalog.
+
+    The helper keeps its signature so the tests below still read as "a table appears at
+    this address"; only the mechanism changed.
+    """
+    from lakehouse_helpers import write_table as create_table
+
+    rel = path.relative_to(settings.lakehouse_root_path).as_posix()
+    create_table(rel, pa.table({"id": list(range(rows))}))
 
 
 def warehouse_rows() -> list[tuple]:
@@ -68,13 +75,20 @@ async def test_a_file_appears_without_any_registration(empty_lakehouse):
 
 
 @pytest.mark.asyncio
-async def test_deleting_the_file_deletes_the_row(empty_lakehouse):
+async def test_dropping_the_table_deletes_the_row(empty_lakehouse):
     target = empty_lakehouse / "raw" / "orders.parquet"
     write_table(target, rows=2)
     await refresh()
     assert [row[0] for row in warehouse_rows()] == ["lakehouse.raw.orders"]
 
-    target.unlink()
+    from app.engines.duckdb_engine import duckdb_engine
+
+    conn = duckdb_engine.get_connection()
+    try:
+        conn.execute('DROP TABLE lakehouse."raw".orders')
+    finally:
+        conn.close()
+
     await refresh()
 
     assert warehouse_rows() == []

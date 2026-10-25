@@ -1,29 +1,24 @@
-"""The catalog is a projection of the warehouse directory.
+"""The catalog is a projection of the lakehouse's own metadata.
 
-Nothing registers a table. :func:`scan` walks the files, reads each Parquet footer and
-returns what exists; ``catalog_objects`` is refreshed from that answer, so a row can
-never outlive its file or describe data nobody wrote. That single rule is what makes a
-directory of files a warehouse: the files are the truth, and the catalog, the editor's
-views and the UI tree are all derived from them.
+Nothing registers a table. :func:`scan` asks DuckLake which tables exist — schema, row
+count and byte size come from its metadata tables — and ``catalog_objects`` is refreshed
+from that answer, so a row can never outlive its table or describe data nobody wrote.
 
-A table's address is its path, in three slots::
+A table's address is still three slots, and a folder is still a schema::
 
-    orders.parquet                    -> lakehouse.orders
-    supabase/table1.parquet           -> lakehouse.supabase.table1
-    supabase/auth/table1.parquet      -> lakehouse.supabase.auth.table1
+    raw/orders            -> lakehouse.raw.orders
+    supabase/auth/table1  -> lakehouse."supabase.auth".table1
 
 ``source`` is the warehouse itself (``lakehouse``) or an attached database's alias, the
-folder path is the middle slot, and the file name is the table. SQL identifiers only
-carry three parts, so a path deeper than one folder is held in a single quoted schema
-name — ``lakehouse."supabase.auth".table1`` — which DuckDB accepts verbatim and which
-:func:`sql_name_for` emits. On disk the tree stays exactly as the operator made it;
-the joining exists only in the name the engine registers, never in the files.
+folder path is the middle slot, and the table name is the last. What changed is only who
+owns the truth: the Parquet files hold the data, the catalog holds which files belong to
+which table at which version.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable, Optional, Sequence
 
 from app.core.storage import FileInfo, WarehouseStorage, normalize_rel, warehouse_storage
@@ -53,6 +48,148 @@ RESERVED = frozenset(
 
 class InvalidTablePath(ValueError):
     """Raised when a table path cannot be represented as a three-slot address."""
+
+
+class LakehouseUnavailable(RuntimeError):
+    """The lakehouse catalog cannot be reached, so no table can be read or written."""
+
+
+def attach_lakehouse(conn) -> None:
+    """Attaches the DuckLake catalog under the name ``lakehouse``.
+
+    The address people already type — ``lakehouse.raw.orders`` — does not change; only
+    who owns the metadata does. The catalog is created on first attach, which is what
+    makes a fresh install work without a migration step.
+
+    Loading is tried before installing: DuckDB 2.0 refuses an ``INSTALL`` whose recorded
+    origin differs from the one it would download from, and an extension is often already
+    present (shipped in an air-gapped bundle, or installed by an earlier version). A
+    ``FORCE INSTALL`` is the last resort and the only step that requires a network.
+    """
+    from app.config import settings
+
+    try:
+        conn.execute("LOAD ducklake;")
+    except Exception:
+        try:
+            conn.execute("INSTALL ducklake;")
+        except Exception:
+            try:
+                conn.execute("FORCE INSTALL ducklake;")
+            except Exception as exc:
+                raise LakehouseUnavailable(
+                    "The ducklake extension is not available and could not be downloaded. "
+                    "Air-gapped installs must ship it: run `INSTALL ducklake` once on a "
+                    "connected machine and copy the extension directory across."
+                ) from exc
+        try:
+            conn.execute("LOAD ducklake;")
+        except Exception as exc:
+            raise LakehouseUnavailable(
+                f"The ducklake extension is installed but cannot be loaded: {exc}"
+            ) from exc
+
+    catalog = settings.lakehouse_catalog_path
+    catalog.parent.mkdir(parents=True, exist_ok=True)
+    conn.execute(
+        f"ATTACH 'ducklake:sqlite:{catalog.as_posix()}' AS {SOURCE} "
+        f"(DATA_PATH '{settings.duckdb_storage_path}');"
+    )
+
+
+def lakehouse_connection():
+    """A throwaway connection with the catalog attached.
+
+    Callers that already own a connection should use :func:`attach_lakehouse` instead;
+    this exists for the few places (a scan, a preview) that only need one answer.
+    """
+    import duckdb
+
+    conn = duckdb.connect(":memory:")
+    try:
+        attach_lakehouse(conn)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def lakehouse_tables(conn) -> list[dict]:
+    """Every live table, as the catalog describes it.
+
+    One query replaces a directory walk plus a footer read per file: the schema and
+    table come from ``ducklake_schema`` / ``ducklake_table``, and the physical facts from
+    ``ducklake_table_stats``. ``modified_at`` is the catalog's newest snapshot — a
+    coarser answer than a file timestamp, and the honest one here, because a table is
+    now many files and only the catalog knows when any of them last changed.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT s.schema_name,
+               t.table_name,
+               coalesce(st.record_count, 0)      AS num_rows,
+               coalesce(st.file_size_bytes, 0)   AS size_bytes,
+               t.begin_snapshot,
+               t.table_id
+        FROM __ducklake_metadata_{SOURCE}.ducklake_table AS t
+        JOIN __ducklake_metadata_{SOURCE}.ducklake_schema AS s
+          ON s.schema_id = t.schema_id
+        LEFT JOIN __ducklake_metadata_{SOURCE}.ducklake_table_stats AS st
+          ON st.table_id = t.table_id
+        WHERE t.end_snapshot IS NULL
+        ORDER BY 1, 2
+        """
+    ).fetchall()
+    return [
+        {
+            "schema": str(schema),
+            "table": str(table),
+            "num_rows": int(num_rows or 0),
+            "size_bytes": int(size_bytes or 0),
+            "table_id": int(table_id),
+        }
+        for schema, table, num_rows, size_bytes, _begin, table_id in rows
+    ]
+
+
+def lakehouse_columns(conn, schema: str, table: str) -> tuple[dict, ...]:
+    """The columns of one table, as DuckDB reports them."""
+    try:
+        described = conn.execute(
+            f'DESCRIBE {SOURCE}.{quote_ident(schema)}.{quote_ident(table)}'
+        ).fetchall()
+    except Exception:
+        return ()
+    return tuple(
+        {
+            "name": row[0],
+            "data_type": row[1],
+            "is_nullable": str(row[2]).upper() != "NO",
+            "is_primary_key": False,
+        }
+        for row in described
+    )
+
+
+def last_snapshot_time(conn) -> datetime:
+    """When the catalog last changed, always in UTC.
+
+    DuckDB returns ``TIMESTAMPTZ`` converted into the session's timezone, so the value is
+    normalised here: every timestamp the platform shows is UTC, and a tree that mixed
+    zones would be subtly wrong everywhere it was compared.
+    """
+    try:
+        row = conn.execute(
+            f"SELECT max(snapshot_time) FROM ducklake_snapshots('{SOURCE}')"
+        ).fetchone()
+    except Exception:
+        return datetime.now(timezone.utc)
+    if not row or row[0] is None:
+        return datetime.now(timezone.utc)
+    value = row[0]
+    if not isinstance(value, datetime):
+        return datetime.now(timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def quote_ident(value: str) -> str:
@@ -228,51 +365,52 @@ def table_from_file(storage: WarehouseStorage, info: FileInfo) -> TableFile:
 
 
 def scan(storage: Optional[WarehouseStorage] = None) -> WarehouseScan:
-    """Walks the warehouse and returns the tables that actually exist.
+    """Everything the lakehouse holds, read from its catalog.
 
-    This is the only function that decides what a table is: a visible ``*.parquet``
-    file whose path is a legal address. Folders need no record to exist, and nothing
-    is created here — a scan never writes, so calling it is always safe.
+    One query replaces a directory walk plus a footer read per file: DuckLake records
+    which tables exist, how many rows they hold and how many bytes they occupy. Folders
+    are schemas, so the address is still ``lakehouse.<schema>.<table>`` and a table's
+    path stays ``schema/table``.
     """
     store = storage or warehouse_storage()
     tables: list[TableFile] = []
     problems: list[str] = []
-    claimed: dict[tuple[str, str], str] = {}
 
-    for info in store.list_parquet():
-        try:
-            folder, name = split_table_path(info.path)
-        except InvalidTablePath as exc:
-            problems.append(f"{info.path}: {exc}")
-            continue
-
-        # SQL identifiers are case-insensitive, so two files that differ only by case
-        # would fight over one name. Windows cannot even hold both, but a bucket can.
-        key = (folder.lower(), name.lower())
-        if key in claimed:
-            problems.append(
-                f"{info.path}: same table name as {claimed[key]} (names are case-insensitive)"
+    conn = lakehouse_connection()
+    try:
+        rows = lakehouse_tables(conn)
+        stamp = last_snapshot_time(conn)
+        counts: dict[str, int] = {}
+        for row in rows:
+            schema, name = row["schema"], row["table"]
+            folder = "" if schema == "main" else schema
+            rel = f"{folder}/{name}" if folder else name
+            columns = lakehouse_columns(conn, schema, name)
+            if not columns:
+                problems.append(f"{rel}: the catalog lists it but DuckDB cannot describe it")
+            counts[name.lower()] = counts.get(name.lower(), 0) + 1
+            tables.append(
+                TableFile(
+                    path=rel,
+                    name=name,
+                    folder=folder,
+                    fqn=fqn_for(f"{rel}{PARQUET_SUFFIX}"),
+                    sql_name=sql_name_for(f"{rel}{PARQUET_SUFFIX}"),
+                    num_rows=row["num_rows"],
+                    size_bytes=row["size_bytes"],
+                    modified_at=stamp,
+                    columns=columns,
+                )
             )
-            continue
-
-        try:
-            table = table_from_file(store, info)
-        except Exception as exc:  # a corrupt file must not hide the others
-            problems.append(f"{info.path}: unreadable Parquet footer ({exc})")
-            continue
-
-        claimed[key] = info.path
-        tables.append(table)
+    finally:
+        conn.close()
 
     tables.sort(key=lambda table: table.path)
 
     # A bare name is a convenience, not an address: register it only when exactly one
-    # table answers to it, so `SELECT * FROM orders` never silently picks a folder.
-    names: dict[str, int] = {}
-    for table in tables:
-        names[table.name.lower()] = names.get(table.name.lower(), 0) + 1
+    # table answers to it, so `SELECT * FROM orders` never silently picks a schema.
     tables = [
-        replace(table, bare_alias=names[table.name.lower()] == 1) for table in tables
+        replace(table, bare_alias=counts[table.name.lower()] == 1) for table in tables
     ]
 
     root = store.display_root() if hasattr(store, "display_root") else ""

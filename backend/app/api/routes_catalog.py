@@ -25,6 +25,84 @@ from app.core.sources import (
     resolve_source,
 )
 from app.services.catalog import catalog_service
+
+
+# -- lakehouse identity -------------------------------------------------------
+#
+# A folder is a schema and a table is a table, so these two helpers are the only place
+# that decides what "folder + name" means in SQL. The warehouse root is the catalog's
+# default schema, which is why "root" and "main" are the same thing here.
+
+def _lakehouse_schema(folder: str) -> str:
+    clean = (folder or "").strip().strip("/")
+    if clean in ("", "root", "main"):
+        return "main"
+    return clean.replace("/", ".")
+
+
+def _lakehouse_table_exists(conn, schema: str, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM __ducklake_metadata_lakehouse.ducklake_table AS t "
+        "JOIN __ducklake_metadata_lakehouse.ducklake_schema AS s "
+        "  ON s.schema_id = t.schema_id "
+        "WHERE t.end_snapshot IS NULL AND s.schema_name = ? AND t.table_name = ? LIMIT 1",
+        [schema, name],
+    ).fetchone()
+    return row is not None
+
+
+# The three operations below are synchronous on purpose: the routes hand them to
+# ``asyncio.to_thread`` so a DuckDB call never blocks the event loop (audit: async
+# routes must not block). Each returns a word the route turns into a response.
+
+def _rename_table_sync(schema: str, old_name: str, new_name: str) -> str:
+    conn = duckdb_engine.get_connection()
+    try:
+        if not _lakehouse_table_exists(conn, schema, old_name):
+            return "missing"
+        if _lakehouse_table_exists(conn, schema, new_name):
+            return "exists"
+        conn.execute(f'ALTER TABLE lakehouse."{schema}"."{old_name}" RENAME TO "{new_name}"')
+        return "ok"
+    finally:
+        conn.close()
+
+
+def _delete_table_sync(schema: str, name: str) -> str:
+    conn = duckdb_engine.get_connection()
+    try:
+        if not _lakehouse_table_exists(conn, schema, name):
+            return "missing"
+        conn.execute(f'DROP TABLE lakehouse."{schema}"."{name}"')
+        return "ok"
+    finally:
+        conn.close()
+
+
+def _move_table_sync(src_schema: str, dst_schema: str, name: str) -> str:
+    conn = duckdb_engine.get_connection()
+    try:
+        if not _lakehouse_table_exists(conn, src_schema, name):
+            return "missing"
+        conn.execute(f'CREATE SCHEMA IF NOT EXISTS lakehouse."{dst_schema}"')
+        if _lakehouse_table_exists(conn, dst_schema, name):
+            return "exists"
+        try:
+            conn.execute(
+                f'ALTER TABLE lakehouse."{src_schema}"."{name}" '
+                f'SET SCHEMA lakehouse."{dst_schema}"'
+            )
+        except Exception:
+            # DuckLake may not support SET SCHEMA yet; a copy-then-drop is the honest
+            # fallback and still ends with the data in exactly one place.
+            conn.execute(
+                f'CREATE TABLE lakehouse."{dst_schema}"."{name}" AS '
+                f'SELECT * FROM lakehouse."{src_schema}"."{name}"'
+            )
+            conn.execute(f'DROP TABLE lakehouse."{src_schema}"."{name}"')
+        return "ok"
+    finally:
+        conn.close()
 from app.core.catalog import scan
 from app.core.storage import warehouse_storage
 
@@ -621,7 +699,7 @@ async def rename_lakehouse_table(
     req: RenameLakehouseTableRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """Renames a Parquet table file and synchronizes the metadata asset in SQLite."""
+    """Renames a lakehouse table and refreshes the catalog."""
     clean_folder = _clean_lakehouse_path(req.folder)
     old_name = req.old_name.strip()
     new_name = req.new_name.strip()
@@ -631,27 +709,19 @@ async def rename_lakehouse_table(
             detail="New table name must be alphanumeric and may only contain dashes or underscores."
         )
 
-    table_dir = settings.lakehouse_root_path / clean_folder
-    old_file = table_dir / f"{old_name}.parquet"
-    if not old_file.exists() and clean_folder in ("root", "main"):
-        old_file = settings.lakehouse_root_path / f"{old_name}.parquet"
-        table_dir = settings.lakehouse_root_path
-    new_file = table_dir / f"{new_name}.parquet"
-
-    if not old_file.exists():
+    schema = _lakehouse_schema(clean_folder)
+    outcome = await asyncio.to_thread(_rename_table_sync, schema, old_name, new_name)
+    if outcome == "missing":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Table '{old_name}' not found in folder '{clean_folder}'."
+            detail=f"Table '{old_name}' not found in folder '{clean_folder}'.",
         )
-    if new_file.exists():
+    if outcome == "exists":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Table '{new_name}' already exists in folder '{clean_folder}'."
+            detail=f"Table '{new_name}' already exists in folder '{clean_folder}'.",
         )
 
-    await asyncio.to_thread(old_file.rename, new_file)
-
-    # The file carries the name, so the row follows from the next scan.
     await catalog_service.refresh(db)
 
     invalidate_catalog_cache()
@@ -663,17 +733,14 @@ async def delete_lakehouse_table(
     name: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Deletes a Parquet table file and cleans up its asset record from the metadata brain."""
+    """Drops a lakehouse table and refreshes the catalog."""
     clean_folder = _clean_lakehouse_path(folder)
     clean_name = name.strip()
-    table_file = settings.lakehouse_root_path / clean_folder / f"{clean_name}.parquet"
-    if not table_file.exists() and clean_folder in ("root", "main"):
-        table_file = settings.lakehouse_root_path / f"{clean_name}.parquet"
+    schema = _lakehouse_schema(clean_folder)
 
-    if table_file.exists():
-        await asyncio.to_thread(table_file.unlink)
+    await asyncio.to_thread(_delete_table_sync, schema, clean_name)
 
-    # Deleting the file is the whole operation: the row has nothing left to describe.
+    # Dropping the table is the whole operation: the row has nothing left to describe.
     await catalog_service.refresh(db)
 
     invalidate_catalog_cache()
@@ -684,32 +751,26 @@ async def move_lakehouse_table(
     req: MoveLakehouseTableRequest,
     db: AsyncSession = Depends(get_db)
 ):
-    """Moves a Parquet table between Lakehouse folders and updates its asset metadata."""
+    """Moves a lakehouse table between folders and refreshes the catalog."""
     src_folder = _clean_lakehouse_path(req.source_folder)
     dst_folder = _clean_lakehouse_path(req.target_folder)
     table_name = req.table_name.strip()
+    src_schema = _lakehouse_schema(src_folder)
+    dst_schema = _lakehouse_schema(dst_folder)
 
-    src_file = settings.lakehouse_root_path / src_folder / f"{table_name}.parquet"
-    dst_dir = settings.lakehouse_root_path / dst_folder
-    dst_file = dst_dir / f"{table_name}.parquet"
-
-    if not src_file.exists():
+    outcome = await asyncio.to_thread(_move_table_sync, src_schema, dst_schema, table_name)
+    if outcome == "missing":
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Table '{table_name}' does not exist in folder '{src_folder}'."
+            detail=f"Table '{table_name}' does not exist in folder '{src_folder}'.",
         )
-
-    await asyncio.to_thread(dst_dir.mkdir, parents=True, exist_ok=True)
-    if dst_file.exists():
+    if outcome == "exists":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Table '{table_name}' already exists in folder '{dst_folder}'."
+            detail=f"Table '{table_name}' already exists in folder '{dst_folder}'.",
         )
 
-    await asyncio.to_thread(shutil.move, src_file, dst_file)
-
-    # The row's identity is the path, so the move is already complete: the scan will
-    # drop the old address and create the new one.
+    # The table keeps its name and schema, so the catalog refresh is all that is left.
     await catalog_service.refresh(db)
 
     invalidate_catalog_cache()
@@ -998,19 +1059,21 @@ async def get_table_preview(
                     _first_parquet_named, lakehouse_root, table_name
                 )
 
-        if not parquet_file or not parquet_file.exists():
+        # The table's address comes from the catalog, not from a file: DuckLake decides
+        # which files belong to it. Nothing is resolved from the filesystem here, so
+        # there is no path to escape and no "another folder's file with the same name"
+        # fallback - an absent table is a 404.
+        from app.core.catalog import scan as scan_lakehouse
+
+        catalogue = await asyncio.to_thread(scan_lakehouse)
+        match = next((t for t in catalogue.tables if t.name == table_name), None)
+        if match is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Parquet table '{table_name}' does not exist in Lakehouse."
+                detail=f"Table '{table_name}' does not exist in the lakehouse.",
             )
 
-        resolved = parquet_file.resolve()
-        if not resolved.is_relative_to(lakehouse_root.resolve()):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Resolved table path escapes the lakehouse root.",
-            )
-        query = f"SELECT * FROM read_parquet({sql_string(resolved.as_posix())}) LIMIT 50;"
+        query = f"SELECT * FROM {match.sql_name} LIMIT 50;"
         res = await asyncio.to_thread(duckdb_engine.execute_query, query)
         return res
 

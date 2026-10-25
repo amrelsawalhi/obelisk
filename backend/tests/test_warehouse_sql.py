@@ -1,29 +1,68 @@
 """The editor queries the warehouse by address, however deeply it is nested.
 
-A table's SQL name is its path in three slots — `lakehouse.folder.table`, with a nested
-folder path carried as one quoted schema. DuckDB's parser stops at three parts, so the
-engine rewrites the address a person types into the form it parses; these tests pin both
-spellings, the bare-name convenience, and the fact that neither can be fooled by a
-string literal or a name that is not a table.
+A table's SQL name is still three slots — ``lakehouse.folder.table``, with a nested folder
+path carried as one quoted schema. DuckDB's parser stops at three parts, so the engine
+rewrites the address a person types into the form it parses; these tests pin both
+spellings, the bare-name convenience, and the fact that neither can be fooled by a string
+literal or a name that is not a table.
+
+What changed: the table is created through the ingest writer, because a Parquet file lying
+on disk is no longer a table — the catalog is.
 """
 from __future__ import annotations
 
-import io
-import shutil
 import uuid
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
-from app.core.storage import warehouse_storage
 from app.engines.duckdb_engine import duckdb_engine
+from app.engines.ingest_engine import ingest_engine
 
 
 def write_table(rel_path: str, rows: int = 2) -> None:
-    buffer = io.BytesIO()
-    pq.write_table(pa.table({"id": list(range(1, rows + 1))}), buffer)
-    warehouse_storage().write_atomic(rel_path, buffer.getvalue())
+    """Creates (or replaces) the table through the writer, as ingestion would."""
+    folder, name = rel_path.rsplit("/", 1) if "/" in rel_path else ("", rel_path)
+    name = name[: -len(".parquet")] if name.endswith(".parquet") else name
+    schema, table = ingest_engine._address(folder, name, None)
+
+    conn = duckdb_engine.get_connection()
+    try:
+        conn.execute(f'CREATE SCHEMA IF NOT EXISTS lakehouse."{schema}";')
+        batch = pa.table({"id": list(range(1, rows + 1))})
+        assert ingest_engine._stage_batches(conn, [batch]) == rows
+        ingest_engine._write_staged(
+            conn,
+            target=f'lakehouse."{schema}".{table}',
+            mode="snapshot",
+            exists=False,
+            write_strategy="append",
+            primary_key=None,
+            watermark_column=None,
+        )
+    finally:
+        conn.close()
+
+
+def drop_schemas(prefix: str) -> None:
+    """Removes every schema this test created, including nested ones."""
+    conn = duckdb_engine.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT schema_name FROM __ducklake_metadata_lakehouse.ducklake_schema "
+            "WHERE schema_name LIKE ?",
+            [f"{prefix}%"],
+        ).fetchall()
+        for (schema,) in rows:
+            conn.execute(f'DROP SCHEMA lakehouse."{schema}" CASCADE')
+        for (table,) in conn.execute(
+            "SELECT table_name FROM __ducklake_metadata_lakehouse.ducklake_table "
+            "WHERE table_name LIKE ?",
+            [f"{prefix}%"],
+        ).fetchall():
+            conn.execute(f'DROP TABLE IF EXISTS lakehouse."main".{table}')
+    finally:
+        conn.close()
 
 
 def count(sql: str) -> int:
@@ -32,30 +71,23 @@ def count(sql: str) -> int:
 
 @pytest.fixture
 def prefix():
-    """A unique folder namespace, removed (files and folders) afterwards."""
+    """A unique folder namespace, removed (schema and tables) afterwards."""
     name = f"zzsql{uuid.uuid4().hex[:6]}"
     yield name
-    store = warehouse_storage()
-    for info in list(store.list_parquet()):
-        if info.path.startswith(name):
-            store.delete(info.path)
-    shutil.rmtree(store.root / name, ignore_errors=True)
+    drop_schemas(name)
 
 
-def test_a_file_in_a_folder_is_three_slots(prefix):
+def test_a_table_in_a_folder_is_three_slots(prefix):
     write_table(f"{prefix}/orders.parquet", rows=3)
 
     assert count(f"select count(*) as n from lakehouse.{prefix}.orders") == 3
 
 
-def test_a_file_at_the_root_is_two_slots(prefix):
+def test_a_table_at_the_root_is_two_slots(prefix):
     name = f"{prefix}_loose"
     write_table(f"{name}.parquet", rows=4)
 
-    try:
-        assert count(f"select count(*) as n from lakehouse.{name}") == 4
-    finally:
-        warehouse_storage().delete(f"{name}.parquet")
+    assert count(f"select count(*) as n from lakehouse.{name}") == 4
 
 
 def test_a_nested_path_answers_to_both_spellings(prefix):
@@ -111,8 +143,8 @@ def test_a_table_written_a_moment_ago_is_queryable_at_once(prefix):
     write_table(f"{prefix}/fresh.parquet", rows=1)
     assert count(f"select count(*) as n from lakehouse.{prefix}.fresh") == 1
 
-    # Replacing the file must be visible immediately too — the footer cache is keyed
-    # on size and timestamp, so it cannot serve the previous version.
+    # Replacing the table must be visible immediately too: the catalog is the truth now,
+    # so there is no file timestamp to go stale behind.
     write_table(f"{prefix}/fresh.parquet", rows=6)
     assert count(f"select count(*) as n from lakehouse.{prefix}.fresh") == 6
 
@@ -147,3 +179,4 @@ def test_rewriting_leaves_names_the_warehouse_does_not_have(prefix):
         f"select * from xlakehouse.{prefix}.a.b.table1", mapping
     )
     assert longer == f"select * from xlakehouse.{prefix}.a.b.table1"
+

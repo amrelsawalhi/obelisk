@@ -72,22 +72,42 @@ if not _app_logger.handlers:
 async def lifespan(app: FastAPI):
     # Refuse to start in the one configuration that only looks secure.
     assert_credentials_are_not_shipped_defaults()
-    # Initialize SQLite database and enforce WAL mode
-    await init_db()
-    # Close out runs killed by the previous shutdown and reload recent history, so a
-    # restart no longer erases every job and dbt run (audit M3/H10).
-    from app.services.state import restore_task_history
-    await asyncio.to_thread(restore_task_history)
-    # The catalog needs no repair on boot: it is a projection, rebuilt from the files
-    # the first time anyone reads it.
-    # The orchestrator heals interrupted rows itself on its first tick.
-    from app.engines.pipeline_engine import pipeline_engine
-    pipeline_engine.start()
-    yield
-    await pipeline_engine.stop()
-    # Terminate the headless Marimo subprocess so no orphan holds port 2718.
-    from app.engines.marimo_service import marimo_service
-    marimo_service.stop()
+    # One process owns this data directory. Nothing below enforces it: SQLite tolerates
+    # another writer, DuckDB opens the same Parquet files, and DuckLake accepts a second
+    # connection against the same catalog (proven in the format spike). Two backends on
+    # one lakehouse corrupt it quietly, so the claim is taken before anything is read or
+    # migrated, and released only when this process is done.
+    from app.core.instance_lock import acquire_instance_lock
+
+    instance_lock = acquire_instance_lock(
+        Path(settings.sqlite_db_path).parent,
+        database=settings.sqlite_db_path,
+        lakehouse=settings.duckdb_storage_path,
+    )
+    try:
+        # Attach the lakehouse catalog before anything can ask for a table. On a fresh
+        # install this creates it; on a broken one it fails here, naming the missing
+        # ducklake extension, rather than at somebody's first query.
+        from app.engines.duckdb_engine import duckdb_engine
+        await asyncio.to_thread(lambda: duckdb_engine.get_connection().close())
+        # Initialize SQLite database and enforce WAL mode
+        await init_db()
+        # Close out runs killed by the previous shutdown and reload recent history, so a
+        # restart no longer erases every job and dbt run (audit M3/H10).
+        from app.services.state import restore_task_history
+        await asyncio.to_thread(restore_task_history)
+        # The catalog needs no repair on boot: it is a projection, rebuilt from the files
+        # the first time anyone reads it.
+        # The orchestrator heals interrupted rows itself on its first tick.
+        from app.engines.pipeline_engine import pipeline_engine
+        pipeline_engine.start()
+        yield
+        await pipeline_engine.stop()
+        # Terminate the headless Marimo subprocess so no orphan holds port 2718.
+        from app.engines.marimo_service import marimo_service
+        marimo_service.stop()
+    finally:
+        instance_lock.release()
 
 def _cors_origins() -> list[str]:
     """Origins allowed to make credentialed requests once auth is enforced."""

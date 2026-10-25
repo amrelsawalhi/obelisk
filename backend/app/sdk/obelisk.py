@@ -28,7 +28,7 @@ import pyarrow.parquet as pq
 import polars as pl
 
 from app.config import settings
-from app.core.catalog import fqn_for, path_for, split_table_path, sql_name_for
+from app.core.catalog import SOURCE, fqn_for, path_for, split_table_path, sql_name_for
 from app.core.resource_advisor import advisor
 from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 from app.core.storage import warehouse_storage
@@ -60,8 +60,22 @@ class TableWrapper:
         self.file_path = file_path
         self.full_identifier = full_identifier or (f"{folder}.{name}" if folder else name)
 
+    @property
+    def _readable_file(self) -> Optional[Path]:
+        """The single Parquet file behind this table, when there is one.
+
+        With the catalog in charge, a table lives in a *directory* named after it, so a
+        path that exists is not necessarily a table — reading it as one returned an empty
+        dataset instead of an error. Only a real ``.parquet`` file is read directly;
+        everything else goes through SQL.
+        """
+        path = self.file_path
+        if path is None:
+            return None
+        return path if path.is_file() and path.suffix.lower() == ".parquet" else None
+
     def exists(self) -> bool:
-        if self.file_path and self.file_path.exists():
+        if self._readable_file:
             return True
         try:
             res = query(f"SELECT 1 FROM {self.full_identifier} LIMIT 1")
@@ -70,9 +84,9 @@ class TableWrapper:
             return False
 
     def to_arrow(self) -> pa.Table:
-        """Reads Parquet dataset into a PyArrow Table, or queries external database table."""
-        if self.file_path and self.file_path.exists():
-            return pq.read_table(str(self.file_path))
+        """Reads the table into a PyArrow Table, or queries an external database table."""
+        if self._readable_file:
+            return pq.read_table(str(self._readable_file))
         try:
             res = query_arrow(f"SELECT * FROM {self.full_identifier}")
             if hasattr(res, "read_all"):
@@ -80,18 +94,20 @@ class TableWrapper:
             return res
         except Exception as e:
             raise FileNotFoundError(
-                f"Dataset '{self.full_identifier}' not found at {self.file_path} or attached external sources: {e}"
+                f"Dataset '{self.full_identifier}' not found in the lakehouse or "
+                f"attached external sources: {e}"
             ) from e
 
     def to_polars(self) -> pl.DataFrame:
-        """Reads Parquet dataset into a Polars DataFrame, or queries external database table."""
-        if self.file_path and self.file_path.exists():
-            return pl.read_parquet(str(self.file_path))
+        """Reads the table into a Polars DataFrame, or queries an external database table."""
+        if self._readable_file:
+            return pl.read_parquet(str(self._readable_file))
         try:
             return query(f"SELECT * FROM {self.full_identifier}")
         except Exception as e:
             raise FileNotFoundError(
-                f"Dataset '{self.full_identifier}' not found at {self.file_path} or attached external sources: {e}"
+                f"Dataset '{self.full_identifier}' not found in the lakehouse or "
+                f"attached external sources: {e}"
             ) from e
 
     def to_df(self) -> Any:
@@ -109,8 +125,8 @@ class TableWrapper:
         (audit M4).
         """
         c = conn or _implicit_connection()
-        if self.file_path and self.file_path.exists():
-            return c.from_parquet(self.file_path.resolve().as_posix())
+        if self._readable_file:
+            return c.from_parquet(self._readable_file.resolve().as_posix())
         for att in _get_sdk_pg_attachments(self.full_identifier):
             duckdb_engine.attach_postgres(c, **att)
         return c.query(f"SELECT * FROM {self.full_identifier}")
@@ -127,7 +143,7 @@ class TableWrapper:
 
     def __repr__(self) -> str:
         status = "exists" if self.exists() else "not_found"
-        return f"<ObeliskTable: {self.full_identifier} [{status}] -> {self.file_path}>"
+        return f"<ObeliskTable: {self.full_identifier} [{status}] -> {self.full_identifier}>"
 
 
 def _resolve_external_identifier(identifier: str) -> str:
@@ -324,21 +340,19 @@ def query_arrow(sql: str) -> pa.Table:
 
 
 def save(df: Any, target: str, sync_postgres: Optional[bool] = None) -> Dict[str, Any]:
-    """Persists a DataFrame as one Parquet file in the warehouse.
+    """Persists a DataFrame as a table in the lakehouse.
 
     ``target`` is a warehouse path — ``"supabase/auth/table1"``, the fully qualified
     ``"lakehouse.supabase.auth.table1"``, or a bare ``"orders"`` for the root. Dots and
     slashes are both separators, so a layer-style ``"marts.sales.orders"`` still works
-    and lands in ``marts/sales/orders.parquet``.
+    and lands in schema ``marts.sales``.
 
-    The file is the table: this writes it through the storage seam (one atomic file)
-    and stops. Nothing is registered, because there is nothing to register — the
-    catalog reads the files when someone asks what exists, so a table can never be
-    listed without a file behind it.
+    The catalog is the table: one statement replaces it, and the row count, schema and
+    size follow from the catalog without anything being registered by hand.
     """
     folder, stem = split_table_path(target)
-    rel_path = path_for(folder, stem)
-    schema_name = folder.replace("/", "__") if folder else "main"
+    schema_name = folder.replace("/", ".") if folder else "main"
+    rel_path = f"{folder}/{stem}" if folder else stem
 
     # 1. Normalize input to PyArrow Table
     if isinstance(df, pl.DataFrame):
@@ -356,23 +370,32 @@ def save(df: Any, target: str, sync_postgres: Optional[bool] = None) -> Dict[str
     else:
         raise TypeError(f"Unsupported DataFrame type '{type(df)}' for obelisk.save().")
 
-    # 2. One file, written atomically through the storage seam. A bucket backend
-    # replaces the same call with a single-object PUT; nothing above notices.
-    buffer = io.BytesIO()
-    pq.write_table(arrow_table, buffer, compression="SNAPPY")
-    store = warehouse_storage()
-    store.write_atomic(rel_path, buffer.getvalue())
+    # 2. One statement, through the same connection factory as everything else.
+    from app.core.catalog import quote_ident
+    from app.engines.duckdb_engine import duckdb_engine
 
-    file_path = store.location(rel_path)
+    address = f'{SOURCE}.{quote_ident(schema_name)}.{quote_ident(stem)}'
+    conn = duckdb_engine.get_connection()
+    try:
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema_name)};")
+        conn.register("_obelisk_save", arrow_table)
+        try:
+            conn.execute(
+                f"CREATE OR REPLACE TABLE {address} AS SELECT * FROM _obelisk_save"
+            )
+        finally:
+            conn.unregister("_obelisk_save")
+    finally:
+        conn.close()
+
     num_rows = arrow_table.num_rows
 
-    # 3. Mirror into PostgreSQL when the caller wants it. The folder path is the
-    # schema, flattened because schemas cannot nest, and a failure is reported rather
-    # than swallowed: the Parquet file is already written, so the save itself succeeded.
+    # 3. Mirror into PostgreSQL when the caller wants it. Read from the lake, not from a
+    # file, and report a failure rather than swallow it: the save itself already landed.
     warehouse_sync: Optional[Dict[str, Any]] = None
     if sync_postgres is not False:
         try:
-            _sync_table_to_postgres(Path(file_path), schema=schema_name, table_name=stem)
+            _sync_table_to_postgres(schema=schema_name, table_name=stem)
             warehouse_sync = {"status": "success", "schema": schema_name}
         except Exception as exc:
             warehouse_sync = {
@@ -385,49 +408,51 @@ def save(df: Any, target: str, sync_postgres: Optional[bool] = None) -> Dict[str
         "status": "success",
         "target": target,
         "path": rel_path,
-        "fqn": fqn_for(rel_path),
-        "sql_name": sql_name_for(rel_path),
+        "fqn": fqn_for(f"{rel_path}.parquet"),
+        "sql_name": sql_name_for(f"{rel_path}.parquet"),
         "folder": folder,
         "warehouse_schema": schema_name,
         "warehouse_sync": warehouse_sync,
         "name": stem,
         "num_rows": num_rows,
-        "file_path": file_path,
+        "file_path": address,
     }
 
 
-def _sync_table_to_postgres(parquet_file: Path, schema: str, table_name: str) -> None:
-    """Syncs Parquet file into PostgreSQL warehouse using DuckDB native COPY."""
-    # Resolve the warehouse the same way Query Studio, dbt and pipelines do.
+def _sync_table_to_postgres(schema: str, table_name: str) -> None:
+    """Publishes one lakehouse table into PostgreSQL through DuckDB.
+
+    The source is the lakehouse table, so this needs no Parquet path and no copy of the
+    data in Python: DuckDB reads from the catalog and writes to the attached database in
+    one statement.
+    """
+    from app.core.catalog import SOURCE as _SOURCE
+    from app.core.catalog import attach_lakehouse, quote_ident
     from app.core.warehouse_resolver import resolve_warehouse_postgres_params
+
     pg = resolve_warehouse_postgres_params()
-    pg_host = pg["host"]
-    pg_port = pg["port"]
-    pg_user = pg["username"]
-    pg_pass = pg["password"]
-    pg_db = pg["database"]
-    pg_sslmode = pg.get("sslmode") or "disable"
+    conn_str = build_pg_dsn(
+        dbname=pg["database"],
+        host=pg["host"],
+        port=pg["port"],
+        user=pg["username"],
+        password=pg["password"],
+        sslmode=pg.get("sslmode") or "disable",
+    )
 
     import duckdb
     conn = duckdb.connect(":memory:")
     try:
+        attach_lakehouse(conn)
         conn.execute("LOAD postgres;")
-        conn_str = build_pg_dsn(
-            dbname=pg_db,
-            host=pg_host,
-            port=pg_port,
-            user=pg_user,
-            password=pg_pass,
-            sslmode=pg_sslmode,
-        )
-        alias = "pg_sync_wh"
-        conn.execute(f"ATTACH {sql_string(conn_str)} AS {validate_alias(alias)} (TYPE POSTGRES);")
+        alias = validate_alias("pg_sync_wh")
+        conn.execute(f"ATTACH {sql_string(conn_str)} AS {alias} (TYPE POSTGRES);")
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{schema};")
-        posix_src = parquet_file.resolve().as_posix()
-        conn.execute(f"CREATE OR REPLACE TABLE {alias}.{schema}.\"{table_name}\" AS SELECT * FROM read_parquet('{posix_src}');")
+        conn.execute(
+            f'CREATE OR REPLACE TABLE {alias}.{schema}."{table_name}" AS '
+            f"SELECT * FROM {_SOURCE}.{quote_ident(schema)}.{quote_ident(table_name)};"
+        )
         conn.execute(f"DETACH {alias};")
-    except Exception:
-        pass
     finally:
         conn.close()
 
