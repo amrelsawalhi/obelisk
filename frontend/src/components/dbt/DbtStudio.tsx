@@ -60,7 +60,7 @@ export const DbtStudio: React.FC = () => {
 
   // Modals
   const [isNewModelOpen, setIsNewModelOpen] = useState(false);
-  const [newModelLayer, setNewModelLayer] = useState<'staging' | 'marts' | undefined>();
+  const [newModelFolder, setNewModelFolder] = useState<'staging' | 'marts' | undefined>();
   const [isNewYamlOpen, setIsNewYamlOpen] = useState(false);
 
   // Bottom Dock State
@@ -475,8 +475,8 @@ export const DbtStudio: React.FC = () => {
         selectedPath={activeTabPath}
         onSelectFile={(node) => handleOpenFile(node.path, node.name)}
         onRefresh={fetchTree}
-        onOpenNewModel={(layer) => {
-          setNewModelLayer(layer);
+        onOpenNewModel={(folder) => {
+          setNewModelFolder(folder);
           setIsNewModelOpen(true);
         }}
         onOpenNewYaml={() => setIsNewYamlOpen(true)}
@@ -948,7 +948,7 @@ export const DbtStudio: React.FC = () => {
       {/* New Model Modal */}
       <NewModelModal
         isOpen={isNewModelOpen}
-        initialLayer={newModelLayer}
+        initialFolder={newModelFolder}
         onClose={() => setIsNewModelOpen(false)}
         onSuccess={(filePath) => {
           fetchTree();

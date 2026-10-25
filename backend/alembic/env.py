@@ -16,7 +16,11 @@ import app.models  # noqa: F401  — registers every model on Base.metadata
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False is not a detail: migrations run *inside* the app at
+    # startup, and the default (True) disables every logger that already exists -- the
+    # app's own and uvicorn's included -- so access logs and audit trails went silent
+    # the moment the first request was served.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

@@ -723,49 +723,5 @@ class Introspector:
                 tables.append(entry)
         return tables
 
-    @staticmethod
-    def introspect_lakehouse(root: Path) -> tuple[List[str], Dict[str, List[Dict[str, Any]]]]:
-        """Walks a lakehouse root once and reads every Parquet footer in that pass.
-
-        Returns ``(directories, tables_by_directory)``: directories are relative POSIX
-        paths with hidden folders skipped, and the table map is keyed the same way,
-        with ``""`` holding the files that sit directly in the root.
-
-        The catalog tree used to call :meth:`introspect_parquet` once per directory, so
-        every directory re-walked the tree and paid its own thread hop. This is one
-        walk, one footer read per file, and one hop for the whole tree.
-        """
-        root = Path(root)
-        directories: List[str] = []
-        tables: Dict[str, List[Dict[str, Any]]] = {}
-
-        if not root.is_dir():
-            return directories, tables
-
-        for current, subdirs, filenames in os.walk(root):
-            subdirs[:] = sorted(name for name in subdirs if not name.startswith("."))
-            current_path = Path(current)
-            rel = current_path.relative_to(root).as_posix()
-            rel = "" if rel == "." else rel
-            if rel:
-                directories.append(rel)
-
-            schema_name = "main" if not rel else rel.replace("/", ".")
-            entries = []
-            for filename in sorted(filenames):
-                if not filename.endswith(".parquet"):
-                    continue
-                entry = Introspector._table_from_file(
-                    current_path / filename,
-                    schema_name,
-                    f"lakehouse.{schema_name}.{filename[: -len('.parquet')]}",
-                )
-                if entry:
-                    entries.append(entry)
-            if entries:
-                tables[rel] = entries
-
-        directories.sort(key=str.lower)
-        return directories, tables
 
 introspector = Introspector()

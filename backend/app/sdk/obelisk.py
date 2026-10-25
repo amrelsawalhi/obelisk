@@ -4,12 +4,14 @@ Usage:
     import obelisk
     df = obelisk.table("raw.orders").to_polars()
     res = obelisk.query("SELECT * FROM read_parquet(...)")
-    obelisk.save(df, "marts.monthly_revenue")
+    obelisk.save(df, "marts/monthly_revenue")
     spark = obelisk.spark()
 
-Layer names are whatever the workspace uses; there is nothing reserved.
+A table is a Parquet file at a path. There are no layers to create: the folder you
+name is the schema, and the file you write is the table.
 """
 
+import io
 import logging
 import os
 import sys
@@ -26,11 +28,11 @@ import pyarrow.parquet as pq
 import polars as pl
 
 from app.config import settings
+from app.core.catalog import fqn_for, path_for, split_table_path, sql_name_for
 from app.core.resource_advisor import advisor
 from app.core.dsn import build_pg_dsn, sql_string, validate_alias
-from app.core.layers import resolve_layer, safe_layer_path
+from app.core.storage import warehouse_storage
 from app.engines.duckdb_engine import DuckDBEngine
-from app.services.layers import default_layer_path, ensure_layer
 
 duckdb_engine = DuckDBEngine()
 logger = logging.getLogger(__name__)
@@ -52,11 +54,11 @@ def _implicit_connection():
 class TableWrapper:
     """Wrapper around lakehouse datasets and external tables supporting zero-copy format conversions."""
 
-    def __init__(self, name: str, layer: str, file_path: Path, full_identifier: Optional[str] = None):
+    def __init__(self, name: str, folder: str, file_path: Path, full_identifier: Optional[str] = None):
         self.name = name
-        self.layer = layer
+        self.folder = folder
         self.file_path = file_path
-        self.full_identifier = full_identifier or f"{layer}.{name}"
+        self.full_identifier = full_identifier or (f"{folder}.{name}" if folder else name)
 
     def exists(self) -> bool:
         if self.file_path and self.file_path.exists():
@@ -176,76 +178,58 @@ def _resolve_external_identifier(identifier: str) -> str:
 
 
 def table(identifier: str) -> TableWrapper:
+    """Resolves a warehouse table by its address, or an external table by its FQN.
+
+    Accepts the canonical address (``lakehouse.marts.sales.orders``), a path
+    (``marts/sales/orders``), a folder plus name (``marts.orders``), or a bare name
+    when exactly one table answers to it. Resolution reads the warehouse — the same
+    scan the editor and the catalog use — so there is no second registry to disagree
+    with.
     """
-    Resolves a lakehouse dataset or external registered table by canonical FQN or identifier.
-    Supports:
-        3-tier Lakehouse: 'lakehouse.bronze.venues' -> reads Parquet from Zero-Cost STORAGE_URI
-        3-tier External:  'supabase.public.venues_old' -> queries attached external database
-        2-tier Lakehouse: 'bronze.venues' -> backwards-compatible Parquet resolution
-    """
+    from app.core.catalog import scan
+    from app.core.storage import warehouse_storage
+
     clean_id = identifier.strip().replace("`", "").replace('"', "")
+    store = warehouse_storage()
+    stripped = (
+        clean_id[len("lakehouse."):] if clean_id.lower().startswith("lakehouse.") else clean_id
+    )
+    wanted = stripped.replace(".", "/").lower()
+
+    result = scan(store)
+
+    # 1. An exact address: folder path plus table name.
+    for entry in result.tables:
+        if entry.path[: -len(".parquet")].lower() == wanted:
+            return TableWrapper(
+                name=entry.name,
+                folder=entry.folder,
+                file_path=store.root / entry.path,
+                full_identifier=entry.fqn,
+            )
+
+    # 2. A bare name, or a folder/name whose folder was spelled with dots, is still
+    # unambiguous while only one table carries that name.
+    leaf = wanted.rsplit("/", 1)[-1]
+    matches = [entry for entry in result.tables if entry.name.lower() == leaf]
+    if len(matches) == 1:
+        entry = matches[0]
+        return TableWrapper(
+            name=entry.name,
+            folder=entry.folder,
+            file_path=store.root / entry.path,
+            full_identifier=entry.fqn,
+        )
+
+    # 3. Not a warehouse table: it may be an attached database's.
     parts = clean_id.split(".")
-    lakehouse_root = settings.lakehouse_root_path
-
-    # 1. Canonical 3-tier Lakehouse FQN: lakehouse.<folder>.<stem>
-    if len(parts) >= 3 and parts[0].lower() == "lakehouse":
-        folder = parts[1]
-        stem = parts[2]
-        full_id = f"lakehouse.{folder}.{stem}"
-        file_path = lakehouse_root / folder / f"{stem}.parquet"
-        return TableWrapper(name=stem, layer=folder, file_path=file_path, full_identifier=full_id)
-
-    # 2. Canonical 3-tier External Source FQN: <catalog>.<schema>.<stem>
-    if len(parts) >= 3:
-        catalog, schema, stem = parts[0].lower(), parts[1], parts[2]
-        full_id = f"{catalog}.{schema}.{stem}"
-        return TableWrapper(name=stem, layer=schema, file_path=None, full_identifier=full_id)
-
-    # 3. 2-tier Lakehouse or External fallback:
-    if len(parts) == 2:
-        prefix, stem = parts[0].lower(), parts[1]
-        # Case A: lakehouse.<stem> (flat table directly in lakehouse root or in any subfolder)
-        if prefix == "lakehouse":
-            flat_candidate = lakehouse_root / f"{stem}.parquet"
-            if flat_candidate.exists():
-                return TableWrapper(name=stem, layer="main", file_path=flat_candidate, full_identifier=f"lakehouse.{stem}")
-            if lakehouse_root.exists() and lakehouse_root.is_dir():
-                for sub in lakehouse_root.iterdir():
-                    if sub.is_dir() and (sub / f"{stem}.parquet").exists():
-                        return TableWrapper(name=stem, layer=sub.name, file_path=sub / f"{stem}.parquet", full_identifier=f"lakehouse.{sub.name}.{stem}")
-
-        # Case B: <folder>.<stem> in lakehouse
-        candidate = lakehouse_root / prefix / f"{stem}.parquet"
-        if candidate.exists():
-            return TableWrapper(name=stem, layer=prefix, file_path=candidate, full_identifier=f"lakehouse.{prefix}.{stem}")
-
-        # Case C: Check flat directly in lakehouse root
-        flat_candidate = lakehouse_root / f"{stem}.parquet"
-        if flat_candidate.exists():
-            return TableWrapper(name=stem, layer="main", file_path=flat_candidate, full_identifier=f"lakehouse.{stem}")
-
-        # If not found on disk, resolve external identifier
-        resolved = _resolve_external_identifier(clean_id)
-        return TableWrapper(name=stem, layer=prefix, file_path=None, full_identifier=resolved)
-
-    # 4. 1-tier bare table name (e.g. 'orders', 'venues'):
-    stem = clean_id
-    # A. Check flat directly in lakehouse root:
-    flat_candidate = lakehouse_root / f"{stem}.parquet"
-    if flat_candidate.exists():
-        return TableWrapper(name=stem, layer="main", file_path=flat_candidate, full_identifier=f"lakehouse.{stem}")
-
-    # B. Dynamically search any subfolder in lakehouse_root:
-    if lakehouse_root.exists() and lakehouse_root.is_dir():
-        for sub in lakehouse_root.iterdir():
-            if sub.is_dir():
-                sub_candidate = sub / f"{stem}.parquet"
-                if sub_candidate.exists():
-                    return TableWrapper(name=stem, layer=sub.name, file_path=sub_candidate, full_identifier=f"lakehouse.{sub.name}.{stem}")
-
-    # C. External database fallback
     resolved = _resolve_external_identifier(clean_id)
-    return TableWrapper(name=stem, layer="main", file_path=None, full_identifier=resolved)
+    return TableWrapper(
+        name=parts[-1],
+        folder=".".join(parts[:-2]) if len(parts) >= 3 else "main",
+        file_path=None,
+        full_identifier=resolved,
+    )
 
 
 def _get_sdk_pg_attachments(sql: str) -> list:
@@ -340,19 +324,21 @@ def query_arrow(sql: str) -> pa.Table:
 
 
 def save(df: Any, target: str, sync_postgres: Optional[bool] = None) -> Dict[str, Any]:
-    """
-    Persists a Polars, Pandas, Arrow, or Spark DataFrame to the Lakehouse.
+    """Persists a DataFrame as one Parquet file in the warehouse.
 
-    ``target`` is ``<layer path>.<name>`` - ``"raw.orders"`` or
-    ``"marts.sales.orders"``. Without a layer prefix the default layer is used. The
-    layer is added to the tree if it is new, and the table is mirrored into the
-    warehouse under that layer's schema unless ``sync_postgres`` is False.
+    ``target`` is a warehouse path — ``"supabase/auth/table1"``, the fully qualified
+    ``"lakehouse.supabase.auth.table1"``, or a bare ``"orders"`` for the root. Dots and
+    slashes are both separators, so a layer-style ``"marts.sales.orders"`` still works
+    and lands in ``marts/sales/orders.parquet``.
+
+    The file is the table: this writes it through the storage seam (one atomic file)
+    and stops. Nothing is registered, because there is nothing to register — the
+    catalog reads the files when someone asks what exists, so a table can never be
+    listed without a file behind it.
     """
-    if "." in target:
-        layer, stem = target.rsplit(".", 1)
-        layer = safe_layer_path(layer)
-    else:
-        layer, stem = default_layer_path(), target
+    folder, stem = split_table_path(target)
+    rel_path = path_for(folder, stem)
+    schema_name = folder.replace("/", "__") if folder else "main"
 
     # 1. Normalize input to PyArrow Table
     if isinstance(df, pl.DataFrame):
@@ -370,93 +356,43 @@ def save(df: Any, target: str, sync_postgres: Optional[bool] = None) -> Dict[str
     else:
         raise TypeError(f"Unsupported DataFrame type '{type(df)}' for obelisk.save().")
 
-    # 2. Write to Parquet atomically inside the layer's directory
-    storage_uri_clean = settings.STORAGE_URI.rstrip("/")
-    location = resolve_layer(layer)
-    storage_dir = location.filesystem_dir
-    asset_storage_uri = f"{storage_uri_clean}/{layer}/{stem}.parquet"
+    # 2. One file, written atomically through the storage seam. A bucket backend
+    # replaces the same call with a single-object PUT; nothing above notices.
+    buffer = io.BytesIO()
+    pq.write_table(arrow_table, buffer, compression="SNAPPY")
+    store = warehouse_storage()
+    store.write_atomic(rel_path, buffer.getvalue())
 
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    target_file = storage_dir / f"{stem}.parquet"
-    temp_file = target_file.with_name(f"{target_file.stem}_{uuid.uuid4().hex[:8]}.tmp.parquet")
-
-    pq.write_table(arrow_table, str(temp_file), compression="SNAPPY")
-    os.replace(temp_file, target_file)
-
+    file_path = store.location(rel_path)
     num_rows = arrow_table.num_rows
-    columns = [
-        {"name": col_name, "type": str(arrow_table.schema.field(col_name).type)}
-        for col_name in arrow_table.column_names
-    ]
-    schema_meta = {"num_rows": num_rows, "columns": columns}
 
-    # 3. Register in the SQLite catalog. The layer comes first so the tree always
-    # covers what is on disk, then the asset row and its registry mirror.
-    ensure_layer(layer)
-    db_path = settings.sqlite_db_path
-    now_iso = datetime.now(timezone.utc).isoformat()
-    asset_id = str(uuid.uuid4())
-
-    try:
-        with sqlite3.connect(db_path, timeout=10.0) as conn:
-            cur = conn.cursor()
-            cur.execute("PRAGMA journal_mode=WAL;")
-            cur.execute(
-                """
-                INSERT INTO catalog_objects (
-                    id, fqn, name, layer_path, kind, backend, location,
-                    schema_json, row_count, version, created_at, last_materialized_at
-                )
-                VALUES (?, ?, ?, ?, 'parquet', 'local', ?, ?, ?, 1, ?, ?)
-                ON CONFLICT(fqn) DO UPDATE SET
-                    location=excluded.location,
-                    schema_json=excluded.schema_json,
-                    row_count=excluded.row_count,
-                    last_materialized_at=excluded.last_materialized_at,
-                    version=catalog_objects.version + 1;
-                """,
-                (
-                    str(uuid.uuid4()),
-                    f"lakehouse.{layer}.{stem}",
-                    stem,
-                    layer,
-                    asset_storage_uri,
-                    json.dumps(schema_meta),
-                    num_rows,
-                    now_iso,
-                    now_iso,
-                ),
-            )
-            conn.commit()
-    except sqlite3.Error as exc:
-        logger.warning("obelisk.save: could not record %s.%s in the catalog: %s", layer, stem, exc)
-
-    # 4. Mirror into the warehouse unless the caller opts out. The layer's schema is
-    # the target, and a failure is reported rather than swallowed: the Parquet file is
-    # already written, so the save itself did succeed.
+    # 3. Mirror into PostgreSQL when the caller wants it. The folder path is the
+    # schema, flattened because schemas cannot nest, and a failure is reported rather
+    # than swallowed: the Parquet file is already written, so the save itself succeeded.
     warehouse_sync: Optional[Dict[str, Any]] = None
     if sync_postgres is not False:
         try:
-            _sync_table_to_postgres(
-                target_file, schema=location.warehouse_schema, table_name=stem
-            )
-            warehouse_sync = {"status": "success", "schema": location.warehouse_schema}
+            _sync_table_to_postgres(Path(file_path), schema=schema_name, table_name=stem)
+            warehouse_sync = {"status": "success", "schema": schema_name}
         except Exception as exc:
             warehouse_sync = {
                 "status": "error",
-                "schema": location.warehouse_schema,
+                "schema": schema_name,
                 "error": str(exc),
             }
 
     return {
         "status": "success",
         "target": target,
-        "layer": layer,
-        "warehouse_schema": location.warehouse_schema,
+        "path": rel_path,
+        "fqn": fqn_for(rel_path),
+        "sql_name": sql_name_for(rel_path),
+        "folder": folder,
+        "warehouse_schema": schema_name,
         "warehouse_sync": warehouse_sync,
         "name": stem,
         "num_rows": num_rows,
-        "file_path": target_file.as_posix(),
+        "file_path": file_path,
     }
 
 

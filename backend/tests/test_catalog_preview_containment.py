@@ -15,7 +15,6 @@ from httpx import ASGITransport, AsyncClient
 
 from app.config import settings
 from app.main import app
-from app.services.layers import ensure_layer
 
 
 @pytest.mark.asyncio
@@ -47,8 +46,7 @@ async def test_preview_still_serves_a_real_table() -> None:
         tree = (await client.get("/api/catalog/tree?refresh=true")).json()
 
     lakehouse = next(node for node in tree if node.get("id") == "lakehouse")
-    # A directory's own path is the identifier the preview expects: layer paths keep
-    # their dots, plain folders are slash-separated.
+    # A directory's own path is the identifier the preview expects.
     node = next((d for d in lakehouse.get("directories", []) if d.get("tables")), None)
     if node is None:
         pytest.skip("no lakehouse table available to preview")
@@ -66,16 +64,14 @@ async def test_preview_still_serves_a_real_table() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preview_serves_a_nested_layer() -> None:
-    """A layer path contains dots, which a plain folder name never could."""
-    layer = f"zz{uuid.uuid4().hex[:6]}.sales"
+async def test_preview_serves_a_nested_folder() -> None:
+    """A nested folder is addressed by its path, exactly like the tree shows it."""
+    layer = f"zz{uuid.uuid4().hex[:6]}/sales"
     directory = settings.lakehouse_root_path / layer
     directory.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({"id": [1, 2]}), directory / "probe.parquet")
 
     try:
-        ensure_layer(layer)
-
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(f"/api/catalog/preview/lakehouse:{layer}/probe")
@@ -87,5 +83,5 @@ async def test_preview_serves_a_nested_layer() -> None:
         import sqlite3
 
         with sqlite3.connect(settings.sqlite_db_path) as con:
-            con.execute("DELETE FROM layers WHERE path = ?", (layer,))
+            con.execute("DELETE FROM catalog_objects WHERE location LIKE ?", (f"{layer}/%",))
             con.commit()

@@ -22,7 +22,8 @@ for _p in (
 
 from contextlib import asynccontextmanager
 import asyncio
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+import logging
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,22 +43,43 @@ from app.api.routes_variables import router as variables_router
 from app.api.routes_files import router as files_router
 from app.api.routes_terminal import router as terminal_router
 from app.api.routes_dbt import router as dbt_router
-from app.api.routes_layers import router as layers_router
 from app.core.resource_advisor import advisor
 from app.core.docker_manager import docker_mgr
+from app.core.security import (
+    assert_credentials_are_not_shipped_defaults,
+    authorize_websocket,
+    require_principal,
+)
+
+# uvicorn configures its own loggers and leaves this application's without a
+# handler, so a refused socket or an opened shell was being written to a logger that
+# went nowhere. Attach one to the 'app' namespace only: uvicorn's access and error
+# logs keep their own formatting, and records are still free to propagate.
+_app_logger = logging.getLogger("app")
+if not _app_logger.handlers:
+    _app_handler = logging.StreamHandler()
+    _app_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    _app_logger.addHandler(_app_handler)
+    _app_logger.setLevel(logging.INFO)
+    # Alembic's fileConfig also configures the root logger (from alembic.ini). Keeping
+    # app records out of that path means one line per event and no dependence on the
+    # migration config's level, which is WARN.
+    _app_logger.propagate = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Refuse to start in the one configuration that only looks secure.
+    assert_credentials_are_not_shipped_defaults()
     # Initialize SQLite database and enforce WAL mode
     await init_db()
     # Close out runs killed by the previous shutdown and reload recent history, so a
     # restart no longer erases every job and dbt run (audit M3/H10).
     from app.services.state import restore_task_history
     await asyncio.to_thread(restore_task_history)
-    # A layer can be deleted while the catalog still points at it; restore the rows so
-    # the tree always describes what exists.
-    from app.services.layers import reconcile_layers_from_assets
-    await asyncio.to_thread(reconcile_layers_from_assets)
+    # The catalog needs no repair on boot: it is a projection, rebuilt from the files
+    # the first time anyone reads it.
     # The orchestrator heals interrupted rows itself on its first tick.
     from app.engines.pipeline_engine import pipeline_engine
     pipeline_engine.start()
@@ -67,17 +89,31 @@ async def lifespan(app: FastAPI):
     from app.engines.marimo_service import marimo_service
     marimo_service.stop()
 
+def _cors_origins() -> list[str]:
+    """Origins allowed to make credentialed requests once auth is enforced."""
+    configured = [
+        item.strip().rstrip("/") for item in settings.ALLOWED_ORIGINS.split(",") if item.strip()
+    ]
+    return sorted({*configured, "http://localhost:5173", "http://127.0.0.1:5173"})
+
+
 app = FastAPI(
     title=settings.APP_NAME,
     version="0.1.0",
     description="Obelisk: Pluggable On-Premise Data Platform & Control Plane",
     lifespan=lifespan,
+    # One declaration instead of ten. `require_principal` is inert while auth is off
+    # (see app/core/security.py) and answers 401 for /api/* the moment it is on, so no
+    # route has to be revisited when the auth layer lands.
+    dependencies=[Depends(require_principal)],
 )
 
-# CORS middleware for LAN clients and Vite frontend
+# CORS. While auth is off, the wildcard is what LAN clients and the Vite dev server
+# rely on. A wildcard cannot carry credentials, so the moment auth is enforced the set
+# has to be explicit -- otherwise the session cookie would silently never be sent.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins() if settings.AUTH_ENABLED else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -96,7 +132,6 @@ app.include_router(variables_router)
 app.include_router(files_router)
 app.include_router(terminal_router)
 app.include_router(dbt_router)
-app.include_router(layers_router)
 
 
 @app.get("/health")
@@ -110,6 +145,8 @@ async def health_check():
 
 @app.websocket("/ws/telemetry")
 async def websocket_telemetry(websocket: WebSocket):
+    if await authorize_websocket(websocket, "telemetry") is None:
+        return
     """Streams live ResourceAdvisor RAM, CPU, and active container statuses every 2 seconds automatically."""
     await websocket.accept()
     try:
@@ -160,6 +197,8 @@ async def get_telemetry():
 @app.websocket("/ws/events")
 async def websocket_events(websocket: WebSocket):
     """Compatibility websocket endpoint for event streaming."""
+    if await authorize_websocket(websocket, "events") is None:
+        return
     await websocket.accept()
     try:
         while True:

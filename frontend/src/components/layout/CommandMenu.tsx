@@ -151,7 +151,7 @@ function buildItems(data: PaletteData | null, navigate: NavigateFunction): Comma
       kind: 'model',
       label: file.name.replace(/\.sql$/, ''),
       subtitle: `dbt model • ${file.path}`,
-      keywords: `dbt model ${file.path} ${file.layer || ''}`,
+      keywords: `dbt model ${file.path} ${file.folder || ''}`,
       icon: Boxes,
       run: () => navigate('/dbt'),
     });

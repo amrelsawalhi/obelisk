@@ -216,7 +216,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
   };
 
   const declared = (args.outputs as Record<string, { type?: string; sensitive?: boolean }>) ?? {};
-  const materialize = args.materialize as { layer?: string; name?: string } | undefined;
+  const materialize = args.materialize as { folder?: string; name?: string } | undefined;
   const isRawSql = step.step_type === "raw_sql";
   const isDbt = step.step_type === "dbt_run" || step.step_type === "dbt_test";
   const isProcess = step.step_type === "script" || step.step_type === "notebook";
@@ -492,7 +492,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                         checked={Boolean(materialize)}
                         onChange={(event) =>
                           event.target.checked
-                            ? setArgs({ materialize: { layer: "bronze", name: "" } })
+                            ? setArgs({ materialize: { folder: "", name: "" } })
                             : dropArg("materialize")
                         }
                       />
@@ -502,12 +502,12 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                       <div className="grid grid-cols-[1fr_1.4fr] gap-1.5">
                         <input
                           className={inputClass}
-                          value={materialize.layer ?? "bronze"}
-                          aria-label="Layer"
-                          placeholder="layer"
+                          value={materialize.folder ?? ""}
+                          aria-label="Folder"
+                          placeholder="folder (blank = root)"
                           onChange={(event) =>
                             setArgs({
-                              materialize: { ...materialize, layer: event.target.value },
+                              materialize: { ...materialize, folder: event.target.value },
                             })
                           }
                         />
@@ -526,7 +526,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                     )}
                     {materialize?.name && (
                       <p className="rounded bg-slate-50 px-1.5 py-1 font-mono text-[10px] text-slate-600">
-                        {`${materialize.layer || "bronze"}.${materialize.name}`}
+                        {`${materialize.folder ? materialize.folder + "/" : ""}${materialize.name}`}
                       </p>
                     )}
                   </div>

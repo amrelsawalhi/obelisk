@@ -38,6 +38,7 @@ from croniter import croniter
 from sqlalchemy import delete, func, select, update
 
 from app.config import settings
+from app.core.catalog import InvalidTablePath, path_for, split_table_path
 from app.database import AsyncSessionLocal
 from app.models.pipeline import (
     Pipeline,
@@ -1200,7 +1201,7 @@ class PipelineEngine:
     ) -> Dict[str, Dict[str, Any]]:
         """Runs the step and returns the outputs the engine derived itself."""
         if step.step_type in ("dbt_run", "dbt_test"):
-            return await self._run_dbt(step, args, params, log, timeout)
+            return await self._run_dbt(step, args, params, log, timeout, step_run_id)
         if step.step_type == "script":
             await self._run_python_file(
                 self.scripts_dir, step.target, args, params, step_run_id, run_id,
@@ -1228,6 +1229,7 @@ class PipelineEngine:
         params: Dict[str, Any],
         log: List[str],
         timeout: int,
+        step_run_id: Optional[str] = None,
     ) -> Dict[str, Dict[str, Any]]:
         from app.engines.dbt_runner import dbt_runner
 
@@ -1247,6 +1249,41 @@ class PipelineEngine:
         target = str(args.get("target") or "").strip() or None
         env_vars = await asyncio.to_thread(dbt_runner._get_target_env, target or "")
         log.append(f"dbt target: {env_vars.get('DBT_TARGET', '?')}")
+
+        # A model reads a schema, not a folder, so a step that consumes what an earlier
+        # step just wrote has to stage that folder into the warehouse first. The Studio's
+        # run does this implicitly; a pipeline step asks for it explicitly, because
+        # copying a folder into Postgres is a side effect the operator should declare.
+        stage = args.get("stage")
+        if stage:
+            stage_args = stage if isinstance(stage, dict) else {}
+            folder = str(stage_args.get("folder") or "").strip() or None
+            tables = stage_args.get("tables")
+            postgres_params = {
+                "host": env_vars.get("DBT_PG_HOST"),
+                "port": int(env_vars.get("DBT_PG_PORT") or 5432),
+                "database": env_vars.get("DBT_PG_DBNAME"),
+                "username": env_vars.get("DBT_PG_USER"),
+                "password": env_vars.get("DBT_PG_PASSWORD"),
+                "sslmode": env_vars.get("DBT_PG_SSLMODE", "disable"),
+            }
+            sync = await asyncio.to_thread(
+                dbt_runner.sync_folder_to_postgres,
+                postgres_params=postgres_params,
+                table_names=tables,
+                folder=folder,
+            )
+            log.append(
+                f"staged {sync.get('synced_tables', 0)} table(s) from "
+                f"'{sync.get('folder')}' into warehouse schema '{sync.get('schema')}'"
+            )
+        # dbt used to write its output to the step row only when the CLI exited, which
+        # made the longest step in a pipeline the one you could not watch. Stream the
+        # lines and flush them on the same one-second cadence a child process uses.
+        streamed = step_run_id is not None
+        flusher: Optional[asyncio.Task] = None
+        if streamed:
+            flusher = asyncio.create_task(self._flush_log_loop(step_run_id, log))
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -1255,6 +1292,7 @@ class PipelineEngine:
                     select=selector,
                     dbt_vars=dbt_vars,
                     env_vars=env_vars,
+                    on_line=log.append if streamed else None,
                 ),
                 timeout=timeout,
             )
@@ -1263,8 +1301,11 @@ class PipelineEngine:
             # The step is still terminal and honest about the timeout.
             log.append(f"dbt exceeded {timeout}s; abandoning the wait.")
             raise
+        finally:
+            if flusher is not None:
+                flusher.cancel()
         output = (result or {}).get("output", "")
-        if output:
+        if output and not streamed:
             log.append(output)
         if not (result or {}).get("success"):
             raise RuntimeError(
@@ -1399,8 +1440,10 @@ class PipelineEngine:
         if isinstance(materialize, dict) and materialize.get("name"):
             return await self._materialize_sql(sql, materialize, log, timeout)
 
+        attachments = await self._postgres_attachments(sql)
         result = await asyncio.wait_for(
-            asyncio.to_thread(duckdb_engine.execute_query, sql), timeout=timeout
+            asyncio.to_thread(duckdb_engine.execute_query, sql, attachments),
+            timeout=timeout,
         )
         rows = (result or {}).get("row_count", 0)
         columns = (result or {}).get("columns", [])
@@ -1408,6 +1451,23 @@ class PipelineEngine:
         for row in (result or {}).get("rows", [])[:25]:
             log.append(str(row))
         return {"rows": {"type": "scalar", "value": rows}}
+
+    async def _postgres_attachments(self, sql: str) -> List[Dict[str, Any]]:
+        """The live sources this SQL references, so a raw_sql step can federate.
+
+        The editor and the notebook SDK already resolve this; the orchestrator is the
+        third caller of one implementation (``app.services.connections``), not a third
+        copy of it. A metadata read that fails yields no attachments rather than failing
+        the step: the SQL then fails loudly on its own if it truly needed the source.
+        """
+        from app.services.connections import attachable_postgres_attachments
+
+        try:
+            async with AsyncSessionLocal() as session:
+                return await attachable_postgres_attachments(session, sql=sql)
+        except Exception as exc:
+            logger.warning("Could not resolve live sources for raw SQL: %s", exc)
+            return []
 
     async def _materialize_sql(
         self, sql: str, materialize: Dict[str, Any], log: List[str], timeout: int
@@ -1422,26 +1482,29 @@ class PipelineEngine:
         """
         from app.sdk import obelisk as sdk
 
-        layer = str(materialize.get("layer") or "bronze").strip().strip("/")
+        folder = str(materialize.get("folder") or materialize.get("layer") or "").strip().strip("/")
         name = str(materialize.get("name") or "").strip()
-        table = f"{layer}.{name}"
-        if not re.fullmatch(r"[A-Za-z0-9_]+", name) or not re.fullmatch(
-            r"[A-Za-z0-9_./]+", layer
-        ):
-            raise ValueError(f"Invalid materialize target '{table}'.")
+        try:
+            folder, name = split_table_path(f"{folder}/{name}" if folder else name)
+        except InvalidTablePath as exc:
+            raise ValueError(f"Invalid materialize target: {exc}") from exc
+        rel_path = path_for(folder, name)
 
         def _write() -> Dict[str, Any]:
             arrow = sdk.query_arrow(sql)
-            saved = sdk.save(arrow, table, sync_postgres=False)
+            saved = sdk.save(arrow, rel_path, sync_postgres=False)
             return {"rows": int(arrow.num_rows), "saved": saved}
 
         outcome = await asyncio.wait_for(asyncio.to_thread(_write), timeout=timeout)
+        # The published value is the name a later step can query, so binding a table
+        # needs no knowledge of how the materialiser spelled it.
+        table_name = outcome["saved"]["sql_name"]
         log.append(
-            f"Materialized {outcome['rows']} row(s) -> {table} "
+            f"Materialized {outcome['rows']} row(s) -> {table_name} "
             f"({outcome['saved'].get('file_path', '?')})"
         )
         return {
-            "table": {"type": "table", "value": table},
+            "table": {"type": "table", "value": table_name},
             "rows": {"type": "scalar", "value": outcome["rows"]},
         }
 
@@ -1541,6 +1604,21 @@ class PipelineEngine:
         finally:
             self._procs.pop(step_run_id, None)
             await self._flush_logs(step_run_id, log)
+
+    async def _flush_log_loop(self, step_run_id: str, log: List[str]) -> None:
+        """Persists in-process step output while it streams.
+
+        A child process gets this from ``_run_child``; dbt runs in a thread here, so
+        without it the row would only ever hold the final text.
+        """
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                await self._flush_logs(step_run_id, log)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Live dbt log flush failed", exc_info=True)
 
     async def _flush_logs(self, step_run_id: str, log: List[str]) -> None:
         """Writes the accumulated log to the step row (tail-capped) mid-run.

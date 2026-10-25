@@ -47,7 +47,7 @@ export const DbtLineageGraph = React.memo(function DbtLineageGraph({
     id: `model.${lineage.model_name}`,
     name: lineage.model_name,
     type: 'model' as const,
-    layer: 'silver',
+    schema: 'raw',
     is_current: true,
   };
 
@@ -147,7 +147,7 @@ export const DbtLineageGraph = React.memo(function DbtLineageGraph({
                     <span className="font-mono text-xs font-medium truncate">{node.name}</span>
                   </div>
                   <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded bg-white/80 border border-slate-200 text-slate-500 shrink-0">
-                    {node.type === 'source' ? 'source' : node.layer}
+                    {node.type === 'source' ? 'source' : node.schema}
                   </span>
                 </div>
               ))
@@ -173,7 +173,7 @@ export const DbtLineageGraph = React.memo(function DbtLineageGraph({
                   </span>
                 </div>
                 <span className="text-[10px] font-mono font-semibold uppercase px-2 py-0.5 rounded bg-sky-100 text-sky-800 border border-sky-300">
-                  {currentNode.layer || 'model'}
+                  {currentNode.schema || 'model'}
                 </span>
               </div>
               <div className="text-[11px] text-slate-500 font-mono flex items-center gap-2">
@@ -208,7 +208,7 @@ export const DbtLineageGraph = React.memo(function DbtLineageGraph({
                     <span className="font-mono text-xs font-medium truncate">{node.name}</span>
                   </div>
                   <span className="text-[9px] font-mono uppercase px-1.5 py-0.5 rounded bg-white/80 border border-slate-200 text-slate-500 shrink-0">
-                    {node.type === 'test' ? 'test' : node.layer}
+                    {node.type === 'test' ? 'test' : node.schema}
                   </span>
                 </div>
               ))

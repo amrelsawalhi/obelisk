@@ -365,33 +365,11 @@ export interface NotebookServerStatus {
   notebooks_dir: string;
 }
 
-export interface ResolvedLayer {
-  path: string;
-  depth: number;
-  filesystem_dir: string;
-  warehouse_schema: string;
-  dbt_folder: string;
-}
-
-export interface Layer {
-  /** Dot-separated path, e.g. "raw" or "marts.sales". */
-  path: string;
-  name: string;
-  parent_path: string | null;
-  depth: number;
-  position: number;
-  description?: string | null;
-  color?: string | null;
-  icon?: string | null;
-  is_default: boolean;
-  object_count: number;
-}
-
 export interface AssetGraphNode {
   id: string;
   name: string;
-  /** Layer path the node belongs to, e.g. "raw" or "marts.sales". */
-  layer: string;
+  /** Schema the node's output lands in, e.g. "raw" or "marts". */
+  schema: string;
   /** Project folder it came from: landing, staging or marts. */
   folder?: string;
   type: string;
@@ -405,7 +383,7 @@ export interface AssetGraphNode {
 }
 
 export interface SaveModelRequest {
-  layer: string;
+  folder: string;
   name: string;
   sql: string;
 }
@@ -418,7 +396,7 @@ export interface AssetGraphEdge {
 export interface AssetGraphResponse {
   nodes: AssetGraphNode[];
   edges: AssetGraphEdge[];
-  layers: string[];
+  schemas: string[];
   active_pipeline_selector?: string;
   active_node_count?: number;
 }
@@ -508,7 +486,7 @@ export interface DbtTreeNode {
   path: string;
   type: 'file' | 'directory';
   extension?: string;
-  layer?: 'staging' | 'marts' | null;
+  folder?: 'staging' | 'marts' | null;
   size_bytes?: number;
   modified_at?: string;
   children?: DbtTreeNode[];
@@ -560,8 +538,8 @@ export interface DbtLineageNode {
   id: string;
   name: string;
   type: 'model' | 'source' | 'test';
-  /** Layer path, or "test" for a dbt test node. */
-  layer: string;
+  /** Schema the model lands in, or "test" for a dbt test node. */
+  schema: string;
   folder?: string;
   is_current?: boolean;
   materialized?: string;

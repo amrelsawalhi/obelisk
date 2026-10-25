@@ -14,8 +14,7 @@ from app.core.vault import decrypt
 from app.engines.duckdb_engine import duckdb_engine
 from app.engines.native_query_engine import native_query_engine
 from app.core.docker_manager import docker_mgr
-from app.core.host_resolver import resolve_connection_host
-from app.core.sources import UnsupportedSource, resolve_source
+from app.services.connections import attachable_postgres_attachments
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 
 router = APIRouter(prefix="/api/query", tags=["query"])
@@ -60,58 +59,6 @@ class QueryExportRequest(BaseModel):
     postgres_attachments: Optional[List[Dict[str, Any]]] = Field(
         None, description="Optional Postgres sources to attach dynamically"
     )
-
-def _is_connection_referenced(sql: str, alias: str, db_name: Optional[str] = None) -> bool:
-    """Checks whether an external database alias or name is referenced in the SQL statement."""
-    clean_sql = re.sub(r"--[^\n]*", "", sql)
-    clean_sql = re.sub(r"/\*.*?\*/", "", clean_sql, flags=re.DOTALL)
-    tokens = set(re.findall(r"[a-zA-Z0-9_]+", clean_sql.lower()))
-    if alias.lower() in tokens:
-        return True
-    if db_name and db_name.lower() in tokens:
-        return True
-    return False
-
-async def _get_default_pg_attachments(db: AsyncSession, sql: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Fetches every source Obelisk can attach live in DuckDB.
-    If sql is provided, only attaches sources that are actually referenced in the query.
-
-    Attachability is a property of the connection's recipe (app.core.sources), not a
-    hardcoded source type, so a new attachable driver works here without an edit.
-    """
-    attachments = []
-    try:
-        stmt = select(Connection)
-        conns = (await db.execute(stmt)).scalars().all()
-        for c in conns:
-            try:
-                recipe = resolve_source(c)
-            except UnsupportedSource:
-                continue
-            if not recipe.is_attachable:
-                continue
-
-            alias = recipe.alias
-            if sql is not None and not _is_connection_referenced(sql, alias, c.database):
-                continue
-            pw = decrypt(c.encrypted_credentials)
-            sslmode = (c.options or {}).get("sslmode", "disable")
-            connect_timeout = int((c.options or {}).get("connect_timeout", 8))
-            resolved_h = resolve_connection_host(c.host, c.port)
-            attachments.append({
-                "alias": alias,
-                "host": resolved_h,
-                "port": c.port,
-                "database": c.database,
-                "username": c.username,
-                "password": pw,
-                "sslmode": sslmode,
-                "connect_timeout": connect_timeout,
-            })
-    except Exception:
-        pass
-    return attachments
 
 @router.get("/targets", response_model=List[QueryTarget])
 async def list_query_targets(db: AsyncSession = Depends(get_db)):
@@ -380,7 +327,7 @@ async def execute_sql(
     # Route 2: DuckDB In-Process Engine (Default)
     pg_attachments = req.postgres_attachments
     if pg_attachments is None:
-        pg_attachments = await _get_default_pg_attachments(db, sql=req.sql)
+        pg_attachments = await attachable_postgres_attachments(db, sql=req.sql)
 
     try:
         res = await asyncio.wait_for(
@@ -441,7 +388,7 @@ async def export_sql_results(
 
     pg_attachments = req.postgres_attachments
     if pg_attachments is None:
-        pg_attachments = await _get_default_pg_attachments(db, sql=req.sql)
+        pg_attachments = await attachable_postgres_attachments(db, sql=req.sql)
 
     try:
         data_bytes = await asyncio.to_thread(

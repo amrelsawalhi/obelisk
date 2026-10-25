@@ -21,7 +21,7 @@ interface DbtProjectTreeProps {
   selectedPath: string | null;
   onSelectFile: (node: DbtTreeNode) => void;
   onRefresh: () => void;
-  onOpenNewModel: (defaultLayer?: 'staging' | 'marts') => void;
+  onOpenNewModel: (defaultFolder?: 'staging' | 'marts') => void;
   onOpenNewYaml: () => void;
   onDeleteFile: (path: string) => void;
 }
@@ -45,10 +45,10 @@ export const DbtProjectTree: React.FC<DbtProjectTreeProps> = ({
 
   const getFileIcon = (node: DbtTreeNode) => {
     if (node.extension === '.sql') {
-      if (node.layer === 'staging') {
+      if (node.folder === 'staging') {
         return <FileCode className="w-3.5 h-3.5 text-sky-600 shrink-0" />;
       }
-      if (node.layer === 'marts') {
+      if (node.folder === 'marts') {
         return <FileCode className="w-3.5 h-3.5 text-amber-600 shrink-0" />;
       }
       return <FileCode className="w-3.5 h-3.5 text-slate-500 shrink-0" />;

@@ -30,7 +30,7 @@ class TriggerPipelineRequest(BaseModel):
     )
     table_names: Optional[List[str]] = Field(
         default=None,
-        description="Optional list of table stems to copy from the landing layer and transform.",
+        description="Optional list of table stems to copy from the staging folder and transform.",
     )
     selector: Optional[str] = Field(
         default=None,
@@ -42,7 +42,7 @@ class TriggerPipelineRequest(BaseModel):
 
 
 class SaveModelRequest(BaseModel):
-    layer: str = Field(..., description="Target layer path, e.g. 'raw' or 'marts.sales'")
+    folder: str = Field(..., description="Project folder, e.g. 'staging' or 'marts'")
     name: str = Field(..., description="Model name (e.g. stg_orders or fct_revenue)")
     sql: str = Field(..., description="SQL Jinja model code")
 
@@ -87,16 +87,16 @@ async def get_pipeline_runs():
     return {"runs": runs, "total": len(runs)}
 
 
-@router.get("/model/{layer}/{model_name}")
-async def get_pipeline_model_code(layer: str, model_name: str):
+@router.get("/model/{folder}/{model_name}")
+async def get_pipeline_model_code(folder: str, model_name: str):
     """Returns the raw SQL/Jinja source code of a dbt model."""
-    code = await asyncio.to_thread(dbt_runner.get_model_code, layer=layer, name=model_name)
+    code = await asyncio.to_thread(dbt_runner.get_model_code, folder=folder, name=model_name)
     if code is None:
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{model_name}' not found in layer '{layer}'.",
+            detail=f"Model '{model_name}' not found in folder '{folder}'.",
         )
-    return {"name": model_name, "layer": layer, "sql": code}
+    return {"name": model_name, "folder": folder, "sql": code}
 
 
 @router.post("/model")
@@ -104,7 +104,7 @@ async def save_or_create_pipeline_model(req: SaveModelRequest):
     """Saves or creates a dbt model in git_repo/dbt_project/models/."""
     try:
         return await asyncio.to_thread(
-            dbt_runner.save_model_code, layer=req.layer, name=req.name, sql=req.sql
+            dbt_runner.save_model_code, folder=req.folder, name=req.name, sql=req.sql
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save model: {str(e)}")

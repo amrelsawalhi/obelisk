@@ -149,41 +149,6 @@ export const api = {
     const res = await apiClient.get<Connection[]>('/catalog/connections');
     return res.data;
   },
-  listLayers: async (): Promise<import('./types').Layer[]> => {
-    const res = await apiClient.get<import('./types').Layer[]>('/layers');
-    return res.data;
-  },
-  createLayer: async (req: {
-    path: string;
-    description?: string;
-  }): Promise<import('./types').Layer> => {
-    const res = await apiClient.post<import('./types').Layer>('/layers', req);
-    return res.data;
-  },
-  updateLayer: async (
-    path: string,
-    req: { name?: string; description?: string; position?: number; is_default?: boolean },
-  ): Promise<import('./types').Layer> => {
-    const res = await apiClient.patch<import('./types').Layer>(
-      `/layers/${encodeURIComponent(path)}`,
-      req,
-    );
-    return res.data;
-  },
-  deleteLayer: async (
-    path: string,
-  ): Promise<{ deleted: string; default_layer: string | null }> => {
-    const res = await apiClient.delete<{ deleted: string; default_layer: string | null }>(
-      `/layers/${encodeURIComponent(path)}`,
-    );
-    return res.data;
-  },
-  resolveLayer: async (path: string): Promise<import('./types').ResolvedLayer> => {
-    const res = await apiClient.get<import('./types').ResolvedLayer>('/layers/resolve', {
-      params: { path },
-    });
-    return res.data;
-  },
   createConnection: async (req: CreateConnectionRequest): Promise<Connection> => {
     const res = await apiClient.post<Connection>('/catalog/connections', req);
     return res.data;
@@ -428,11 +393,11 @@ export const api = {
     const res = await apiClient.get<{ runs: PipelineRun[]; total: number }>('/pipelines/runs');
     return res.data;
   },
-  getModelCode: async (layer: string, modelName: string): Promise<{ name: string; layer: string; sql: string }> => {
-    const res = await apiClient.get<{ name: string; layer: string; sql: string }>(`/pipelines/model/${layer}/${modelName}`);
+  getModelCode: async (folder: string, modelName: string): Promise<{ name: string; folder: string; sql: string }> => {
+    const res = await apiClient.get<{ name: string; folder: string; sql: string }>(`/pipelines/model/${folder}/${modelName}`);
     return res.data;
   },
-  saveModelCode: async (payload: { layer: string; name: string; sql: string }): Promise<Record<string, unknown>> => {
+  saveModelCode: async (payload: { folder: string; name: string; sql: string }): Promise<Record<string, unknown>> => {
     const res = await apiClient.post<Record<string, unknown>>('/pipelines/model', payload);
     return res.data;
   },

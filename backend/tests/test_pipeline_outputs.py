@@ -42,7 +42,7 @@ def test_declared_outputs_includes_derived_ones():
     assert declared_outputs("dbt_run", {}) == {"dbt_summary": "scalar"}
     # raw SQL always knows its row count; materialising adds the table name.
     assert declared_outputs(
-        "raw_sql", {"materialize": {"layer": "bronze", "name": "orders"}}
+        "raw_sql", {"materialize": {"folder": "bronze", "name": "orders"}}
     ) == {"rows": "scalar", "table": "table"}
     assert declared_outputs(
         "script", {"outputs": {"rows": {"type": "scalar"}, "sneaky": "table"}}
@@ -132,7 +132,7 @@ async def test_undeclared_or_non_parent_output_references_are_rejected():
                             step_type="raw_sql",
                             target="select 1 as n",
                             args={
-                                "materialize": {"layer": "bronze", "name": "orders_delta"},
+                                "materialize": {"folder": "bronze", "name": "orders_delta"},
                                 "outputs": {"n": {"type": "scalar"}},
                             },
                         ),
@@ -166,10 +166,9 @@ async def test_materialize_writes_a_dataset_and_publishes_its_name():
     from app.config import settings
     from app.database import AsyncSessionLocal
     from app.engines.pipeline_engine import pipeline_engine
-    from app.models.catalog_object import CatalogObject
     from app.models.pipeline import PipelineRun, StepRun
 
-    layer = f"zzpipe_{uuid.uuid4().hex[:6]}"
+    folder = f"zzpipe_{uuid.uuid4().hex[:6]}"
     pipeline_id = None
     pipeline_engine.start()
     try:
@@ -186,7 +185,7 @@ async def test_materialize_writes_a_dataset_and_publishes_its_name():
                                 "load",
                                 step_type="raw_sql",
                                 target="select 1 as n union all select 2 as n",
-                                args={"materialize": {"layer": layer, "name": "numbers"}},
+                                args={"materialize": {"folder": folder, "name": "numbers"}},
                             )
                         ]
                     ),
@@ -213,19 +212,17 @@ async def test_materialize_writes_a_dataset_and_publishes_its_name():
                 await session.execute(select(StepRun).where(StepRun.run_id == run_id))
             ).scalars().one()
         outputs = json.loads(step_run.output_json or "{}")
-        assert outputs["table"]["value"] == f"{layer}.numbers"
+        # The published value is the address a later step can query, whichever way the
+        # materialiser spelled the target.
+        assert outputs["table"]["value"] == f"lakehouse.{folder}.numbers"
         # Row count is published without being declared.
         assert outputs["rows"]["value"] == 2
         assert "Materialized 2 row(s)" in (step_run.logs or "")
-        assert (settings.lakehouse_root_path / layer).exists()
+        assert (settings.lakehouse_root_path / folder / "numbers.parquet").is_file()
     finally:
         await pipeline_engine.stop()
-        async with AsyncSessionLocal() as session:
-            await session.execute(
-                delete(CatalogObject).where(CatalogObject.layer_path == layer)
-            )
-            await session.commit()
-        shutil.rmtree(settings.lakehouse_root_path / layer, ignore_errors=True)
+        # Removing the files is enough: the projection prunes the catalog row itself.
+        shutil.rmtree(settings.lakehouse_root_path / folder, ignore_errors=True)
         if pipeline_id:
             async with _client() as client:
                 await client.delete(f"/api/pipelines/{pipeline_id}")

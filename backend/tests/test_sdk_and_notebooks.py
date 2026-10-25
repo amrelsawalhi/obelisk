@@ -76,8 +76,9 @@ def test_obelisk_query():
     assert df["engine"][0] == "obelisk_engine"
 
 
-def test_obelisk_save_and_catalog():
-    """Verifies obelisk.save() persists DataFrames to Gold and updates the SQLite assets table."""
+@pytest.mark.asyncio
+async def test_obelisk_save_writes_a_file_the_catalog_can_see():
+    """``save`` writes the table; the catalog finds it because the file exists."""
     gold_stem = f"gold_revenue_{uuid.uuid4().hex[:6]}"
     df = pl.DataFrame({
         "region": ["North", "South", "East", "West"],
@@ -86,32 +87,31 @@ def test_obelisk_save_and_catalog():
 
     res = obelisk.save(df, f"gold.{gold_stem}", sync_postgres=False)
     assert res["status"] == "success"
-    assert res["layer"] == "gold"
+    assert res["folder"] == "gold"
+    assert res["fqn"] == f"lakehouse.gold.{gold_stem}"
+    assert res["sql_name"] == f"lakehouse.gold.{gold_stem}"
     assert res["num_rows"] == 4
 
     target_file = Path(res["file_path"])
     assert target_file.exists()
-    saved_meta = pq.read_metadata(str(target_file))
-    assert saved_meta.num_rows == 4
+    assert pq.read_metadata(str(target_file)).num_rows == 4
 
-    # Verify registration in SQLite assets catalog
-    import sqlite3
-    db_path = settings.sqlite_db_path
-    with sqlite3.connect(db_path) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT name, layer, record_count FROM assets WHERE name = ?;", (gold_stem,))
-        row = cur.fetchone()
-        assert row is not None
-        assert row[0] == gold_stem
-        assert row[1] == "gold"
-        assert row[2] == 4
-
-    # Cleanup
-    if target_file.exists():
+    # The catalog read is the projection: no one registered this table.
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            objects = (await client.get("/api/catalog/objects")).json()
+        row = next(obj for obj in objects if obj["fqn"] == res["fqn"])
+        assert row["row_count"] == 4
+        assert row["path"] == f"gold/{gold_stem}.parquet"
+        assert row["folder"] == "gold"
+    finally:
         target_file.unlink(missing_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("DELETE FROM catalog_objects WHERE name = ?;", (gold_stem,))
-        conn.commit()
+        import sqlite3
+
+        with sqlite3.connect(settings.sqlite_db_path) as conn:
+            conn.execute("DELETE FROM catalog_objects WHERE fqn = ?;", (res["fqn"],))
+            conn.commit()
 
 
 def test_obelisk_spark_builder_configuration():

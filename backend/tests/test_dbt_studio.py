@@ -6,6 +6,17 @@ from app.main import app
 from app.engines.dbt_runner import dbt_runner
 
 
+async def _seed_sample_data(client: AsyncClient) -> dict:
+    """Creates the shipped sample tables on purpose.
+
+    A build no longer fills an empty layer behind the operator's back, so the tests
+    that read ``orders`` have to ask for it the same way an operator would.
+    """
+    response = await client.post("/api/dbt/sample-data", json={})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 @pytest.mark.asyncio
 async def test_dbt_studio_project_tree():
     """Tests GET /api/dbt/tree against real git_repo/dbt_project/."""
@@ -31,7 +42,7 @@ async def test_dbt_studio_file_lifecycle_and_compile():
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         rel_path = "models/staging/stg_test_unit.sql"
         content = (
-            "{{ config(materialized='view', schema=var('layer_staging')) }}\n\n"
+            "{{ config(materialized='view') }}\n\n"
             "select\n"
             "    order_id,\n"
             "    customer_id,\n"
@@ -80,6 +91,16 @@ async def test_dbt_studio_preview_data(source_postgres_params):
     """
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Preview reads the warehouse, which a build fills from the staging layer:
+        # the sample tables have to exist, and only this call creates them.
+        seeded = await _seed_sample_data(client)
+        assert "orders" in seeded["tables"]
+        run_res = await client.post(
+            "/api/dbt/run", json={"selector": "stg_orders", "target": "postgres"}
+        )
+        assert run_res.status_code == 200
+        assert run_res.json()["success"] is True, run_res.json().get("output", "")
+
         # stg_orders is an existing model
         preview_res = await client.post(
             "/api/dbt/preview",
@@ -101,6 +122,8 @@ async def test_dbt_studio_run_and_test(source_postgres_params):
     """
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Without data a build reports that plainly; with it, dbt runs for real.
+        await _seed_sample_data(client)
         # Run scoped to stg_orders
         run_res = await client.post(
             "/api/dbt/run",

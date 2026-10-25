@@ -41,6 +41,32 @@ class Settings(BaseSettings):
         )
     )
 
+    # ---------------------------------------------------------------- auth
+    # Enforcement is off until a real user store exists. The plumbing already asks
+    # "who is calling" (app/core/security.py), so turning this on gates every /api
+    # route and every socket without editing a single handler.
+    AUTH_ENABLED: bool = Field(
+        default_factory=lambda: os.getenv("OBELISK_AUTH_ENABLED", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    # Extra browser origins allowed to open sockets, comma separated. Same-host,
+    # loopback and Vite's dev server are always allowed; this is for a reverse proxy
+    # that rewrites the Host header to something else.
+    ALLOWED_ORIGINS: str = Field(
+        default_factory=lambda: os.getenv("OBELISK_ALLOWED_ORIGINS", "")
+    )
+
+    # ------------------------------------------------------------ terminal
+    # The in-app terminal spawns a real shell as this process's user. It stays on for
+    # local use; a deployment that would rather not hand that out turns it off with
+    # OBELISK_TERMINAL=0 instead of editing code.
+    TERMINAL_ENABLED: bool = Field(
+        default_factory=lambda: os.getenv("OBELISK_TERMINAL", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    TERMINAL_MAX_SESSIONS: int = 4
+    TERMINAL_IDLE_TIMEOUT_SECONDS: int = 900
+
     @staticmethod
     def _default_database_url() -> str:
         env_url = os.getenv("DATABASE_URL")

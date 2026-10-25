@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.core.catalog import InvalidTablePath
 from app.engines.dbt_runner import dbt_runner
 
 router = APIRouter(prefix="/api/dbt", tags=["dbt Studio"])
@@ -55,6 +56,33 @@ class TestDbtRequest(BaseModel):
         default=None,
         description="A target name from profiles.yml; defaults to the profile's own default",
     )
+
+
+class SampleDataRequest(BaseModel):
+    folder: Optional[str] = Field(
+        default=None,
+        description="Warehouse folder to write the sample tables into; defaults to the project's staging schema",
+    )
+
+
+@router.post("/sample-data")
+async def create_sample_data(req: Optional[SampleDataRequest] = None):
+    """Writes the shipped sample tables into a folder, because someone asked.
+
+    The explicit way to fill an empty warehouse. A build never calls it: a run with
+    no data reports that plainly instead of inventing tables, so what the catalog
+    shows is always what the operator put there.
+    """
+    try:
+        return await asyncio.to_thread(
+            dbt_runner.seed_sample_data, req.folder if req else None
+        )
+    except InvalidTablePath as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Could not write the sample tables: {exc}"
+        ) from exc
 
 
 @router.get("/targets")

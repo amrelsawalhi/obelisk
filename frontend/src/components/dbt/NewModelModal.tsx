@@ -4,19 +4,19 @@ import { api } from '../../lib/api';
 
 interface NewModelModalProps {
   isOpen: boolean;
-  initialLayer?: 'staging' | 'marts';
+  initialFolder?: 'staging' | 'marts';
   onClose: () => void;
   onSuccess: (relPath: string) => void;
 }
 
 export const NewModelModal: React.FC<NewModelModalProps> = ({
   isOpen,
-  initialLayer = 'staging',
+  initialFolder = 'staging',
   onClose,
   onSuccess,
 }) => {
   const [modelName, setModelName] = useState('');
-  const [layer, setLayer] = useState<'staging' | 'marts'>(initialLayer);
+  const [folder, setFolder] = useState<'staging' | 'marts'>(initialFolder);
   const [materialization, setMaterialization] = useState<'table' | 'view'>('table');
   const [sourceTable, setSourceTable] = useState('orders');
   const [loading, setLoading] = useState(false);
@@ -32,12 +32,12 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
     }
 
     const cleanName = modelName.trim().toLowerCase().replace(/\s+/g, '_').replace(/\.sql$/, '');
-    const folder = layer === 'staging' ? 'models/staging' : 'models/marts';
-    const filePath = `${folder}/${cleanName}.sql`;
+    const projectFolder = folder === 'staging' ? 'models/staging' : 'models/marts';
+    const filePath = `${projectFolder}/${cleanName}.sql`;
 
     let template = '';
-    if (layer === 'staging') {
-      template = `{{ config(materialized='${materialization}', schema=var('layer_staging')) }}\n\n` +
+    if (folder === 'staging') {
+      template = `{{ config(materialized='${materialization}') }}\n\n` +
         `with source as (\n` +
         `    select * from {{ source('landing', '${sourceTable || 'orders'}') }}\n` +
         `),\n\n` +
@@ -52,7 +52,7 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
         `)\n\n` +
         `select * from cleaned\n`;
     } else {
-      template = `{{ config(materialized='${materialization}', schema=var('layer_marts')) }}\n\n` +
+      template = `{{ config(materialized='${materialization}') }}\n\n` +
         `with staging as (\n` +
         `    select * from {{ ref('stg_orders') }}\n` +
         `)\n\n` +
@@ -116,7 +116,7 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
                 type="text"
                 autoFocus
                 required
-                placeholder={layer === 'staging' ? 'stg_payments' : 'fct_monthly_sales'}
+                placeholder={folder === 'staging' ? 'stg_payments' : 'fct_monthly_sales'}
                 value={modelName}
                 onChange={(e) => setModelName(e.target.value)}
                 className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs font-mono text-slate-900 placeholder-slate-400 focus:outline-sky-500 shadow-2xs"
@@ -125,38 +125,38 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
             </div>
           </div>
 
-          {/* Target Layer Selector */}
+          {/* Target folder */}
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-slate-700">Model Folder</label>
             <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"
-                onClick={() => setLayer('staging')}
+                onClick={() => setFolder('staging')}
                 className={`p-3 rounded-lg border text-left transition-all ${
-                  layer === 'staging'
+                  folder === 'staging'
                     ? 'border-sky-500 bg-sky-50/60 ring-2 ring-sky-500/20'
                     : 'border-slate-200 hover:border-slate-300 bg-white'
                 }`}
               >
                 <div className="font-semibold text-xs text-slate-900 flex items-center justify-between">
                   <span>Staging</span>
-                  {layer === 'staging' && <Check className="w-3.5 h-3.5 text-sky-600" />}
+                  {folder === 'staging' && <Check className="w-3.5 h-3.5 text-sky-600" />}
                 </div>
                 <div className="text-[10px] text-slate-500 mt-1">models/staging/</div>
               </button>
 
               <button
                 type="button"
-                onClick={() => setLayer('marts')}
+                onClick={() => setFolder('marts')}
                 className={`p-3 rounded-lg border text-left transition-all ${
-                  layer === 'marts'
+                  folder === 'marts'
                     ? 'border-indigo-500 bg-indigo-50/60 ring-2 ring-indigo-500/20'
                     : 'border-slate-200 hover:border-slate-300 bg-white'
                 }`}
               >
                 <div className="font-semibold text-xs text-slate-900 flex items-center justify-between">
                   <span>Marts</span>
-                  {layer === 'marts' && <Check className="w-3.5 h-3.5 text-indigo-600" />}
+                  {folder === 'marts' && <Check className="w-3.5 h-3.5 text-indigo-600" />}
                 </div>
                 <div className="text-[10px] text-slate-500 mt-1">models/marts/</div>
               </button>
@@ -164,7 +164,7 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
           </div>
 
           {/* Staging source table option */}
-          {layer === 'staging' && (
+          {folder === 'staging' && (
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-700">Landing Table</label>
               <input

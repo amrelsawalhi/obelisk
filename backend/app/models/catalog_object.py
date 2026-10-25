@@ -16,9 +16,13 @@ class CatalogObject(Base):
     """One addressable data object, keyed by its fully-qualified name.
 
     This is the authoritative registry the architecture calls the Catalog seam.
-    ``fqn`` is the identity — ``lakehouse.<layer>.<name>`` for objects Obelisk
-    materialises, ``<connection>.<schema>.<name>`` for attached externals — and
-    every other column is metadata about *where* and *how* it exists.
+    ``fqn`` is the identity — ``lakehouse.<folder>.<name>`` for objects that live in
+    the warehouse, ``<connection>.<schema>.<name>`` for attached externals — and every
+    other column is metadata about *where* and *how* it exists.
+
+    Lakehouse rows are a projection: they are rewritten from a scan of the files and
+    never describe a table that is not on disk. There is no layer, no folder registry
+    and no parent pointer — a folder exists because it holds a file.
 
     Physical facts (``backend``, ``location``, ``capabilities_json``) are recorded,
     never inferred: a table that lives in Postgres and a Parquet file that lives on
@@ -37,7 +41,6 @@ class CatalogObject(Base):
     )
     fqn: Mapped[str] = mapped_column(String(512), nullable=False, unique=True, index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    layer_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
 
     # table | view | model | parquet | shortcut | mirror
     kind: Mapped[str] = mapped_column(

@@ -128,19 +128,24 @@ def test_sqlite_wal_proof():
     finally:
         raw_conn.close()
 
-def test_storage_uri_normalization():
+def test_storage_uri_normalization(tmp_path):
     """Verifies STORAGE_URI resolution: local paths resolve, remote schemes fail.
 
     Remote schemes used to be returned verbatim from duckdb_storage_path while
     every writer silently wrote to local disk (audit B1). They are now rejected
     at resolution time instead of being passed through to Path()/os.replace().
+
+    The probe directory is a temporary one: ``file:///data/lakehouse/bronze`` is not
+    an absolute path on Windows, so resolving it creates a directory inside the
+    checkout — which is exactly how empty folders kept appearing in the developer's
+    lakehouse after a test run.
     """
     original = settings.STORAGE_URI
     try:
         # Local file:// scheme resolution with forward slashes
-        settings.STORAGE_URI = "file:///data/lakehouse/bronze"
+        settings.STORAGE_URI = (tmp_path / "lakehouse" / "bronze").as_uri()
         storage_path = settings.duckdb_storage_path
-        assert storage_path.endswith("data/lakehouse/bronze")
+        assert storage_path.endswith("lakehouse/bronze")
         assert "\\" not in storage_path
         assert os.path.exists(storage_path)
 

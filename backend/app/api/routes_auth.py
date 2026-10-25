@@ -1,8 +1,3 @@
-import hmac
-import hashlib
-import json
-import base64
-import time
 import os
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
@@ -10,81 +5,20 @@ from fastapi import APIRouter, HTTPException, Depends, Request, Response, status
 from pydantic import BaseModel, Field
 
 from app.config import settings
+# The token primitive and cookie name live in core/security.py so the websocket
+# and dependency layers can use them without importing this router. Re-exported
+# here because callers (and tests) have always imported them from this module.
+from app.core.security import (  # noqa: F401
+    COOKIE_NAME,
+    DEFAULT_EXPIRATION_SECONDS,
+    create_token,
+    verify_token,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
-# Session Configuration
-COOKIE_NAME = "obelisk_session"
-DEFAULT_EXPIRATION_SECONDS = 86400 * 7 # 7 days
 ADMIN_USERNAME = os.environ.get("OBELISK_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("OBELISK_ADMIN_PASSWORD", "obelisk2026")
-
-
-def _b64_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
-
-def _b64_decode(data_str: str) -> bytes:
-    padding = "=" * (4 - (len(data_str) % 4)) if len(data_str) % 4 != 0 else ""
-    return base64.urlsafe_b64decode(data_str + padding)
-
-
-def create_token(payload: Dict[str, Any], expires_seconds: int = DEFAULT_EXPIRATION_SECONDS) -> str:
-    """Signs a standard HS256 JWT using settings.OBELISK_MASTER_KEY."""
-    header = {"alg": "HS256", "typ": "JWT"}
-    payload_copy = payload.copy()
-    now = int(time.time())
-    payload_copy["iat"] = now
-    payload_copy["exp"] = now + expires_seconds
-
-    header_b64 = _b64_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
-    payload_b64 = _b64_encode(json.dumps(payload_copy, separators=(",", ":")).encode("utf-8"))
-
-    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
-    secret_bytes = settings.OBELISK_MASTER_KEY.encode("utf-8")
-    signature = hmac.new(secret_bytes, signing_input, hashlib.sha256).digest()
-    sig_b64 = _b64_encode(signature)
-
-    return f"{header_b64}.{payload_b64}.{sig_b64}"
-
-
-def verify_token(token: str) -> Dict[str, Any]:
-    """Validates signature and expiration of an HS256 JWT."""
-    parts = token.strip().split(".")
-    if len(parts) != 3:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Malformed session token."
-        )
-
-    header_b64, payload_b64, sig_b64 = parts
-    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
-    secret_bytes = settings.OBELISK_MASTER_KEY.encode("utf-8")
-    expected_sig = hmac.new(secret_bytes, signing_input, hashlib.sha256).digest()
-    actual_sig = _b64_decode(sig_b64)
-
-    if not hmac.compare_digest(expected_sig, actual_sig):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid session token signature."
-        )
-
-    try:
-        payload = json.loads(_b64_decode(payload_b64).decode("utf-8"))
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid session payload."
-        )
-
-    now = int(time.time())
-    if payload.get("exp", 0) < now:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session has expired."
-        )
-
-    return payload
 
 
 # Request / Response Schemas

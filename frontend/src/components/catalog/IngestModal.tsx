@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   X,
   ArrowDownToLine,
@@ -39,28 +39,9 @@ export const IngestModal: React.FC<IngestModalProps> = ({
   const defaultTargetName = table.name.includes('.') ? table.name.split('.').pop()! : table.name;
   const [targetName, setTargetName] = useState(defaultTargetName);
 
-  // Folder selection. Empty means "the workspace's default layer"; the real layer
-  // paths are offered as chips once they load.
+  // The folder is typed, not chosen: it is a directory in the warehouse, created on
+  // write. Empty means the warehouse root.
   const [targetFolder, setTargetFolder] = useState<string>('');
-  const [layerPaths, setLayerPaths] = useState<string[]>([]);
-
-  useEffect(() => {
-    let active = true;
-    api
-      .listLayers()
-      .then((layers) => {
-        if (!active) return;
-        setLayerPaths(layers.map((layer) => layer.path));
-        const fallback = layers.find((layer) => layer.is_default)?.path ?? layers[0]?.path;
-        if (fallback) setTargetFolder((current) => current || fallback);
-      })
-      .catch(() => {
-        if (active) setLayerPaths([]);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
 
   // Sample ingestion option
   const [isSample, setIsSample] = useState(false);
@@ -260,27 +241,11 @@ export const IngestModal: React.FC<IngestModalProps> = ({
                 <span>Target Lakehouse Folder</span>
               </span>
             </label>
-            <div className="flex items-center gap-2 mb-1.5">
-              {layerPaths.map((folder) => (
-                <button
-                  key={folder}
-                  type="button"
-                  onClick={() => setTargetFolder(folder)}
-                  className={`text-xs px-2.5 py-1 rounded-md border font-mono transition-colors ${
-                    targetFolder === folder
-                      ? 'bg-indigo-50 border-indigo-400 text-indigo-700 font-bold'
-                      : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
-                  }`}
-                >
-                  {folder}
-                </button>
-              ))}
-            </div>
             <input
               type="text"
               value={targetFolder}
               onChange={(e) => setTargetFolder(e.target.value)}
-              placeholder="layer path, e.g. marts.sales"
+              placeholder="folder path, e.g. marts/sales (blank = root)"
               className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 font-mono text-slate-800 outline-hidden focus:border-indigo-500 focus:bg-white"
             />
           </div>

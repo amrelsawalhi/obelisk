@@ -8,14 +8,11 @@ from typing import Dict, Any, List, Tuple, Optional
 import duckdb
 import polars as pl
 from app.config import settings
+from app.core.catalog import SOURCE, WarehouseScan, quote_ident, scan
 from app.core.resource_advisor import advisor
+from app.core.storage import warehouse_storage
 
 logger = logging.getLogger(__name__)
-
-# TTL cache for recursive lakehouse Parquet scans: avoids re-scanning the entire
-# lakehouse directory tree (rglob) on every single SQL query.
-_PARQUET_FILE_CACHE: Dict[str, Tuple[float, List[Path]]] = {}
-_CACHE_TTL_SECS = 5.0
 
 class DuckDBEngine:
     """
@@ -115,101 +112,149 @@ class DuckDBEngine:
         else:
             conn.execute(f"ATTACH {sql_string(dsn)} AS {safe_alias} (TYPE POSTGRES);")
 
-    def _get_lakehouse_files(self, lakehouse_root: Path) -> List[Path]:
-        """Returns all visible Parquet files under lakehouse_root, TTL-cached for 5 seconds."""
-        now = time.time()
-        cache_key = str(lakehouse_root)
-        cached = _PARQUET_FILE_CACHE.get(cache_key)
-        if cached is not None and now - cached[0] < _CACHE_TTL_SECS:
-            return cached[1]
+    def _warehouse_scan(self) -> WarehouseScan:
+        """The tables that exist, read from the warehouse itself.
 
-        found = [
-            p for p in lakehouse_root.rglob("*.parquet")
-            if not any(part.startswith(".") for part in p.relative_to(lakehouse_root).parts)
-        ]
-        _PARQUET_FILE_CACHE[cache_key] = (now, found)
-        return found
+        No cache here: the walk is a directory listing, and the expensive part — reading
+        each footer — is cached in :func:`app.core.catalog.read_footer` against the
+        file's size and timestamp. A table written a moment ago is therefore visible to
+        the very next query, which a time-based cache could not promise.
+        """
+        return scan(warehouse_storage())
+
+    @staticmethod
+    def _schema_for(folder: str) -> str:
+        """The DuckDB schema a folder maps to, quoted only where it must be.
+
+        SQL identifiers carry three parts, so a nested path becomes one schema whose
+        name contains dots — `supabase/auth` -> `"supabase.auth"`. Root-level files
+        live in the attached catalog's default schema.
+        """
+        if not folder:
+            return "main"
+        return quote_ident(folder.replace("/", "."))
+
+    def _register_view(self, conn: duckdb.DuckDBPyConnection, table, location: str) -> None:
+        """Creates the canonical view for one table, plus a bare alias when unambiguous.
+
+        The canonical name is the three-slot address — `lakehouse.supabase.table1`, or
+        `lakehouse."supabase.auth".table1` when the folder path is deeper than one
+        level. The bare alias exists because `SELECT * FROM orders` is what people
+        type; it is only registered while that name is unique in the warehouse.
+        """
+        schema = self._schema_for(table.folder)
+        table_name = quote_ident(table.name)
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{schema};")
+        conn.execute(
+            f"CREATE OR REPLACE VIEW {SOURCE}.{schema}.{table_name} AS "
+            f"SELECT * FROM read_parquet('{location}');"
+        )
+        if table.bare_alias:
+            conn.execute(
+                f"CREATE OR REPLACE VIEW {table_name} AS SELECT * FROM read_parquet('{location}');"
+            )
+
+    @staticmethod
+    def _rewrite_names(sql: str, mapping: Dict[str, str]) -> str:
+        """Rewrites the dotted address someone typed into the form DuckDB parses.
+
+        `lakehouse.supabase.auth.table1` is four parts, and the parser stops at three.
+        Only names the warehouse actually has are rewritten, in code regions only —
+        string literals, quoted identifiers and comments are copied untouched — so a
+        native three-part name, a Postgres schema or a filename is never disturbed.
+        """
+        if not mapping:
+            return sql
+
+        ordered = sorted(mapping, key=len, reverse=True)
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9_.])(" + "|".join(re.escape(name) for name in ordered) + r")(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+
+        def replace(match: re.Match) -> str:
+            return mapping.get(match.group(1).lower(), match.group(1))
+
+        out: List[str] = []
+        index = 0
+        length = len(sql)
+        while index < length:
+            char = sql[index]
+            if char in ("'", '"'):
+                end = index + 1
+                while end < length:
+                    if sql[end] == char:
+                        if end + 1 < length and sql[end + 1] == char:
+                            end += 2
+                            continue
+                        end += 1
+                        break
+                    end += 1
+                out.append(sql[index:end])
+                index = end
+            elif sql.startswith("--", index):
+                end = sql.find("\n", index)
+                end = length if end == -1 else end
+                out.append(sql[index:end])
+                index = end
+            elif sql.startswith("/*", index):
+                end = sql.find("*/", index + 2)
+                end = length if end == -1 else end + 2
+                out.append(sql[index:end])
+                index = end
+            else:
+                end = index
+                while end < length and sql[end] not in ("'", '"') and not sql.startswith(("--", "/*"), end):
+                    end += 1
+                out.append(pattern.sub(replace, sql[index:end]))
+                index = end
+        return "".join(out)
 
     def _prepare_sql_and_views(self, conn: duckdb.DuckDBPyConnection, sql: str, storage_path: str) -> str:
-        """Registers schemas and views on-demand for Lakehouse Parquet directories referenced in the query."""
-        lakehouse_root = settings.lakehouse_root_path
-        clean_sql = re.sub(r"--[^\n]*", "", sql)
-        clean_sql = re.sub(r"/\*.*?\*/", "", clean_sql, flags=re.DOTALL)
-        tokens = set(re.findall(r"[a-zA-Z0-9_]+", clean_sql.lower()))
+        """Makes the warehouse queryable: views from the scan, then name resolution.
 
-        # Unconditionally attach in-memory 'lakehouse' catalog for 3-tier FQN support
+        This engine keeps no catalog of its own. It asks :func:`app.core.catalog.scan`
+        what exists and creates a view per file, so a table is queryable exactly when
+        its Parquet file is there — the same answer the catalog tree shows.
+        """
+        store = warehouse_storage()
+        result = self._warehouse_scan()
+        tokens = set(re.findall(r"[a-zA-Z0-9_]+", sql.lower()))
+
         try:
-            conn.execute("ATTACH ':memory:' AS lakehouse;")
-        except Exception as e:
-            logger.debug("Failed to attach in-memory lakehouse catalog: %s", e)
+            conn.execute(f"ATTACH ':memory:' AS {SOURCE};")
+        except Exception as exc:
+            logger.debug("Failed to attach in-memory %s catalog: %s", SOURCE, exc)
 
-        if lakehouse_root.exists() and lakehouse_root.is_dir():
-            matched_files = []
-            if tokens:
-                # Fast direct probe: flat in lakehouse root or inside any existing subfolder
-                for t in tokens:
-                    flat_cand = lakehouse_root / f"{t}.parquet"
-                    if flat_cand.is_file():
-                        matched_files.append(flat_cand)
-                    for sub in lakehouse_root.iterdir():
-                        if sub.is_dir():
-                            sub_cand = sub / f"{t}.parquet"
-                            if sub_cand.is_file():
-                                matched_files.append(sub_cand)
+        # Rewriting is independent of what this query mentions: the map is the
+        # warehouse's own address list, so it costs one dictionary pass.
+        names: Dict[str, str] = {}
+        for table in result.tables:
+            if table.fqn.lower() != table.sql_name.lower():
+                names[table.fqn.lower()] = table.sql_name
+            # The layer shorthand -- ``bronze.orders`` -- is what SQL steps and the docs
+            # use, while ``sql_name`` is the canonical address DuckDB parses. Mapping it
+            # here is what makes the shorthand resolve instead of depending on a bare
+            # alias that only exists when the file name happens to be unique.
+            shorthand = f"{table.folder.strip('/').replace('/', '.')}.{table.name}".lower()
+            if table.folder.strip("/"):
+                names.setdefault(shorthand, table.sql_name)
 
-            # If no direct candidates found or tokens empty, scan directory (TTL-cached
-            # to avoid a recursive disk traversal on every single query)
-            if not matched_files:
-                for parquet_file in self._get_lakehouse_files(lakehouse_root):
-                    if not tokens or parquet_file.stem.lower() in tokens:
-                        matched_files.append(parquet_file)
+        for table in result.tables:
+            segments = [segment.lower() for segment in table.folder.split("/") if segment]
+            if not (table.name.lower() in tokens or any(part in tokens for part in segments)):
+                continue
+            try:
+                self._register_view(conn, table, store.location(table.path))
+            except Exception as exc:
+                logger.debug("Could not register a view for %s: %s", table.path, exc)
 
-            for parquet_file in matched_files:
-                rel_parts = parquet_file.relative_to(lakehouse_root).parts
-                table_name = parquet_file.stem
-                escaped_path = parquet_file.as_posix()
+        return self._normalize_parquet_paths(self._rewrite_names(sql, names))
 
-                if len(rel_parts) > 1:
-                    rel_dir = "/".join(rel_parts[:-1])
-                    clean_tier = rel_dir.replace("/", ".")
-                    tier_name = rel_parts[0]
-
-                    # 1. 3-tier canonical catalog view: lakehouse.<folder>.<table_name>
-                    try:
-                        conn.execute(f"CREATE SCHEMA IF NOT EXISTS lakehouse.{clean_tier};")
-                        conn.execute(
-                            f"CREATE OR REPLACE VIEW lakehouse.{clean_tier}.{table_name} AS SELECT * FROM read_parquet('{escaped_path}');"
-                        )
-                    except Exception as e:
-                        logger.debug("Failed to create 3-tier view for %s: %s", parquet_file.name, e)
-
-                    # 2. 2-tier folder view: <folder>.<table_name>
-                    try:
-                        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {tier_name};")
-                        conn.execute(
-                            f"CREATE OR REPLACE VIEW {tier_name}.{table_name} AS SELECT * FROM read_parquet('{escaped_path}');"
-                        )
-                    except Exception as e:
-                        logger.debug("Failed to create 2-tier view for %s: %s", parquet_file.name, e)
-                else:
-                    # Flat file in lakehouse root: lakehouse.<table_name>
-                    try:
-                        conn.execute(
-                            f"CREATE OR REPLACE VIEW lakehouse.{table_name} AS SELECT * FROM read_parquet('{escaped_path}');"
-                        )
-                    except Exception as e:
-                        logger.debug("Failed to create flat view for %s: %s", parquet_file.name, e)
-
-                # 3. 1-tier bare table view: <table_name>
-                try:
-                    conn.execute(
-                        f"CREATE OR REPLACE VIEW {table_name} AS SELECT * FROM read_parquet('{escaped_path}');"
-                    )
-                except Exception as e:
-                    logger.debug("Failed to create bare view for %s: %s", parquet_file.name, e)
-
-        # Normalize relative parquet paths (e.g. data/lakehouse/silver/customers.parquet -> absolute path)
-        lakehouse_root_posix = lakehouse_root.resolve().as_posix()
+    @staticmethod
+    def _normalize_parquet_paths(sql: str) -> str:
+        """Turns a relative ``read_parquet('...')`` argument into an absolute path."""
+        lakehouse_root_posix = settings.lakehouse_root_path.resolve().as_posix()
 
         def _replace_parquet_path(m: re.Match) -> str:
             path_str = m.group(1).strip()
@@ -219,17 +264,17 @@ class DuckDBEngine:
                 or re.match(r"^[A-Za-z]:[/\\]", path_str)
             ):
                 return f"read_parquet('{path_str}')"
-            # Strip relative lakehouse prefix if provided
-            clean_subpath = re.sub(r"^(?:/?data/lakehouse/|lakehouse/)", "", path_str, flags=re.IGNORECASE)
+            clean_subpath = re.sub(
+                r"^(?:/?data/lakehouse/|lakehouse/)", "", path_str, flags=re.IGNORECASE
+            )
             return f"read_parquet('{lakehouse_root_posix}/{clean_subpath}')"
 
-        normalized_sql = re.sub(
+        return re.sub(
             r"read_parquet\(\s*['\"]([^'\"]+\.parquet)['\"]\s*\)",
             _replace_parquet_path,
             sql,
             flags=re.IGNORECASE,
         )
-        return normalized_sql
 
     def execute_query(
         self,

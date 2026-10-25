@@ -7,15 +7,14 @@ from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, or_
+from sqlalchemy import select
 from app.database import get_db
 from app.config import settings
 from app.core.vault import encrypt, decrypt
 from app.core.host_resolver import resolve_connection_host
 from app.core.dsn import sql_string
 from app.models.connection import Connection
-from app.models.catalog_object import CatalogObject
-from app.engines.introspector import introspector
+from app.engines.introspector import format_bytes, introspector
 from app.engines.duckdb_engine import duckdb_engine
 from app.core.sources import (
     DRIVERS,
@@ -26,8 +25,8 @@ from app.core.sources import (
     resolve_source,
 )
 from app.services.catalog import catalog_service
-from app.services.layers import find_layer_path
-from app.core.layers import resolve_layer
+from app.core.catalog import scan
+from app.core.storage import warehouse_storage
 
 router = APIRouter(prefix="/api/catalog", tags=["catalog"])
 
@@ -445,13 +444,24 @@ async def reconcile_connection_objects(
 async def list_catalog_objects(
     kind: Optional[str] = None,
     connection_id: Optional[str] = None,
-    layer_path: Optional[str] = None,
+    folder: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Lists registry rows — the catalog's own view, independent of the filesystem."""
+    """Lists registry rows, refreshed from the files first.
+
+    The lakehouse half of this table is a projection, so the read refreshes it: asking
+    the catalog what exists is also what makes the answer true.
+    """
+    await catalog_service.refresh(db)
     objects = await catalog_service.list_objects(
-        db, kind=kind, connection_id=connection_id, layer_path=layer_path
+        db, kind=kind, connection_id=connection_id
     )
+    if folder is not None:
+        prefix = f"{folder.strip('/')}/"
+        objects = [
+            obj for obj in objects
+            if obj.location and (obj.location == folder or obj.location.startswith(prefix))
+        ]
     return [
         {
             "id": obj.id,
@@ -459,7 +469,8 @@ async def list_catalog_objects(
             "name": obj.name,
             "kind": obj.kind,
             "backend": obj.backend,
-            "layer_path": obj.layer_path,
+            "path": obj.location,
+            "folder": (obj.location.rsplit("/", 1)[0] if "/" in (obj.location or "") else None),
             "connection_id": obj.connection_id,
             "location": obj.location,
             "size_bytes": obj.size_bytes,
@@ -499,17 +510,6 @@ def _clean_lakehouse_path(raw_path: str) -> str:
             detail="Invalid path. Folder names must be alphanumeric and may only contain dashes or underscores."
         )
     return "/".join(parts)
-
-
-def _layer_for_folder(folder: str) -> str:
-    """Maps a lakehouse folder to the layer path it is catalogued under.
-
-    Root-level Parquet files are registered with layer "main" (the /tree endpoint
-    labels the flat root tier "main"), while callers may address that folder as
-    "root" — the same alias the file lookups above already accept. Now that
-    (layer, name) is the uniqueness key, this filter must be exact.
-    """
-    return "main" if folder == "root" else folder
 
 
 def _ensure_lakehouse_directory(target_dir: Path) -> None:
@@ -576,19 +576,9 @@ async def rename_lakehouse_directory(
     dest_rel_path = dest_dir.relative_to(settings.lakehouse_root_path).as_posix()
     await asyncio.to_thread(target_dir.rename, dest_dir)
 
-    # Catalog rows carry the layer path inside their fqn, so the three move together.
-    stmt = select(CatalogObject).where(
-        or_(
-            CatalogObject.layer_path == rel_path,
-            CatalogObject.layer_path.like(f"{rel_path}/%"),
-            CatalogObject.layer_path.like(f"{rel_path}.%"),
-        )
-    )
-    for obj in (await db.execute(stmt)).scalars().all():
-        obj.layer_path = dest_rel_path + obj.layer_path[len(rel_path):]
-        obj.location = (obj.location or "").replace(f"/{rel_path}/", f"/{dest_rel_path}/")
-        obj.fqn = f"lakehouse.{obj.layer_path}.{obj.name}"
-    await db.commit()
+    # The rows are a projection of the files, so there is nothing to recompute by hand:
+    # once the directory has moved, one refresh rewrites the affected rows.
+    await catalog_service.refresh(db)
 
     invalidate_catalog_cache()
     return {"status": "renamed", "old_path": rel_path, "new_path": dest_rel_path}
@@ -620,19 +610,9 @@ async def delete_lakehouse_directory(
             detail=f"Directory '{rel_path}' contains {len(parquet_files)} Parquet table(s). Confirm deletion to remove directory and its tables."
         )
 
-    # One statement instead of listing rows and deleting them one at a time.
-    await db.execute(
-        delete(CatalogObject).where(
-            or_(
-                CatalogObject.layer_path == rel_path,
-                CatalogObject.layer_path.like(f"{rel_path}/%"),
-                CatalogObject.layer_path.like(f"{rel_path}.%"),
-            )
-        )
-    )
-    await db.commit()
-
     await asyncio.to_thread(shutil.rmtree, target_dir, True)
+    # Rows follow the files: the walk no longer sees them, so the projection drops them.
+    await catalog_service.refresh(db)
     invalidate_catalog_cache()
     return {"status": "deleted", "path": rel_path}
 
@@ -671,19 +651,8 @@ async def rename_lakehouse_table(
 
     await asyncio.to_thread(old_file.rename, new_file)
 
-    # fqn carries the table name, so renaming has to move it as well.
-    stmt = select(CatalogObject).where(
-        CatalogObject.name == old_name,
-        CatalogObject.layer_path == _layer_for_folder(clean_folder),
-    )
-    obj = (await db.execute(stmt)).scalars().first()
-    if obj:
-        obj.name = new_name
-        obj.fqn = f"lakehouse.{obj.layer_path}.{new_name}"
-        obj.location = (obj.location or "").replace(
-            f"{old_name}.parquet", f"{new_name}.parquet"
-        )
-        await db.commit()
+    # The file carries the name, so the row follows from the next scan.
+    await catalog_service.refresh(db)
 
     invalidate_catalog_cache()
     return {"status": "renamed", "old_name": old_name, "new_name": new_name}
@@ -704,14 +673,8 @@ async def delete_lakehouse_table(
     if table_file.exists():
         await asyncio.to_thread(table_file.unlink)
 
-    # Clean from the catalog
-    await db.execute(
-        delete(CatalogObject).where(
-            CatalogObject.name == clean_name,
-            CatalogObject.layer_path == _layer_for_folder(clean_folder),
-        )
-    )
-    await db.commit()
+    # Deleting the file is the whole operation: the row has nothing left to describe.
+    await catalog_service.refresh(db)
 
     invalidate_catalog_cache()
     return {"status": "deleted", "folder": clean_folder, "name": clean_name}
@@ -745,19 +708,9 @@ async def move_lakehouse_table(
 
     await asyncio.to_thread(shutil.move, src_file, dst_file)
 
-    # Update the registry row: layer path, fqn and location all follow the file.
-    stmt = select(CatalogObject).where(
-        CatalogObject.name == table_name,
-        CatalogObject.layer_path == _layer_for_folder(src_folder),
-    )
-    obj = (await db.execute(stmt)).scalars().first()
-    if obj:
-        obj.layer_path = dst_folder
-        obj.fqn = f"lakehouse.{dst_folder}.{table_name}"
-        obj.location = (obj.location or "").replace(
-            f"/{src_folder}/", f"/{dst_folder}/"
-        )
-        await db.commit()
+    # The row's identity is the path, so the move is already complete: the scan will
+    # drop the old address and create the new one.
+    await catalog_service.refresh(db)
 
     invalidate_catalog_cache()
     return {"status": "moved", "source": src_folder, "target": dst_folder, "table": table_name}
@@ -831,6 +784,29 @@ async def _introspect_connection(conn: Connection) -> Optional[List[Dict[str, An
     return None
 
 
+def _lakehouse_table_entry(table: Any) -> Dict[str, Any]:
+    """The tree/UI shape for one scanned table.
+
+    Kept byte-for-byte compatible with what the introspector used to emit, so the
+    frontend's ``CatalogTable`` contract does not change when the source of the data
+    moves from a second walker to the catalog scan.
+    """
+    return {
+        "name": table.name,
+        "schema_name": table.folder.replace("/", ".") if table.folder else "main",
+        "fqn": table.fqn,
+        "sql_name": table.sql_name,
+        "columns": [dict(column) for column in table.columns],
+        "row_count": table.num_rows,
+        "size_bytes": table.size_bytes,
+        "size_human": format_bytes(table.size_bytes),
+        "size_is_estimate": False,
+        "file_path": table.path,
+        "folder": table.folder,
+        "modified_at": table.modified_at.isoformat(),
+    }
+
+
 @router.get("/tree")
 async def get_catalog_tree(
     refresh: bool = False,
@@ -848,18 +824,23 @@ async def get_catalog_tree(
 
     tree: List[Dict[str, Any]] = []
 
-    # 1. Lakehouse: one walk over the tree, with every Parquet footer read in it
-    lakehouse_root = settings.lakehouse_root_path
-    await asyncio.to_thread(lakehouse_root.mkdir, parents=True, exist_ok=True)
-
-    discovered_dirs, tables_by_dir = await asyncio.to_thread(
-        introspector.introspect_lakehouse, lakehouse_root
+    # 1. Lakehouse. One walk of the warehouse feeds both answers — the tree the UI
+    # renders and the catalog rows — so the two cannot disagree about what exists.
+    store = warehouse_storage()
+    scan_result, directories = await asyncio.gather(
+        asyncio.to_thread(scan, store),
+        asyncio.to_thread(store.list_directories),
     )
+    await catalog_service.refresh(db, scan_result)
+
+    tables_by_dir: Dict[str, List[Dict[str, Any]]] = {}
+    for table in scan_result.tables:
+        tables_by_dir.setdefault(table.folder, []).append(_lakehouse_table_entry(table))
 
     lakehouse_directories: List[Dict[str, Any]] = []
     all_lakehouse_tables: List[Dict[str, Any]] = []
 
-    for rel_posix in discovered_dirs:
+    for rel_posix in directories:
         parts = rel_posix.split("/")
         dir_tables = tables_by_dir.get(rel_posix, [])
         lakehouse_directories.append({
@@ -894,6 +875,7 @@ async def get_catalog_tree(
         "storage_uri": settings.STORAGE_URI,
         "directories": lakehouse_directories,
         "tables": all_lakehouse_tables,
+        "problems": list(scan_result.problems),
     })
 
     # 2. Registered external sources (Concurrent Introspection)
@@ -974,8 +956,8 @@ async def get_table_preview(
         )
     table_name = _stem
 
-    # 1. Lakehouse Parquet preview. A tier identifier is either a layer path (dots
-    # allowed, resolved through the tree) or a plain folder that predates layers.
+    # 1. Lakehouse Parquet preview. The identifier after "lakehouse:" is a folder
+    # path; "root"/"main"/empty all mean the warehouse root.
     lakehouse_root = settings.lakehouse_root_path
     raw_tier = source_id.split(":", 1)[1] if source_id.startswith("lakehouse:") else source_id
     is_root = raw_tier in ("root", "main", "", "lakehouse")
@@ -983,10 +965,6 @@ async def get_table_preview(
     tier_dir: Optional[Path] = None
     if is_root:
         clean_tier = ""
-    elif find_layer_path(raw_tier):
-        # A layer path may contain dots, which a folder name may not.
-        clean_tier = raw_tier
-        tier_dir = resolve_layer(raw_tier).filesystem_dir
     else:
         clean_tier = _clean_lakehouse_path(raw_tier)
         if (lakehouse_root / clean_tier).is_dir():

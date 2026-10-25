@@ -14,25 +14,15 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-vars:
-  # Which layer each model folder writes to. These are layer *paths* from the
-  # workspace's own layer tree, not fixed tiers - point them at whatever the layers
-  # are called. Obelisk resolves each path to a warehouse schema (marts.sales ->
-  # marts__sales) and passes the mapping in with --vars. Run dbt on its own and the
-  # path is used verbatim as the schema name.
-  #
-  # The defaults are repeated inline below because dbt renders +schema while it is
-  # still reading this file, before the block above is in scope.
-  obelisk_dbt:
-    layer_staging: raw
-    layer_marts: marts
-
+# Folders under models/ are plain folders. `+schema` names the schema a folder's
+# models are written to — dbt's own configuration, with no layer or mapping behind it.
+# Obelisk reads the same names to know which warehouse folder to stage from and into.
 models:
   obelisk_dbt:
     staging:
-      +schema: "{{ var('layer_staging', 'raw') }}"
+      +schema: raw
       +materialized: table
     marts:
-      +schema: "{{ var('layer_marts', 'marts') }}"
+      +schema: marts
       +materialized: table
 

@@ -1,14 +1,19 @@
 """
 dbt Runner & Pipeline Engine:
-- Stages landing Parquet files into the PostgreSQL warehouse, one schema per layer
+- Stages a warehouse folder's Parquet files into the matching PostgreSQL schema
 - Executes dbt run and dbt test via python -m dbt.cli.main
-- Exposes the model graph with node ids keyed by the layer each model targets
-- Tracks pipeline run history and registers the transformed models in SQLite
+- Exposes the model graph with node ids keyed by the folder each model lives in
+- Tracks pipeline run history in SQLite
 
-Which warehouse schema a model lands in comes from the layer it targets, never from
-the folder it sits in: the project declares two configurable slots (staging, marts),
-Obelisk resolves each slot's layer path to a schema and passes the mapping to dbt, and
-a `generate_schema_name` macro applies it. Rename a layer and the pipeline follows.
+Where a model lands is dbt's own business: ``dbt_project.yml`` sets ``+schema`` per
+model folder and dbt uses it as the schema. Obelisk reads those names to know which
+warehouse folder to copy into PostgreSQL, and nothing else. There is no layer table,
+no layer→schema mapping and no schema macro of ours.
+
+Nothing in this module writes data on its own initiative. A build that finds no source
+tables returns :class:`NoSourceData` — a failure that names the empty folder and the
+one call that fills it — instead of seeding sample files behind the operator's back.
+Sample data exists, but only when `POST /api/dbt/sample-data` asks for it.
 """
 
 import os
@@ -17,20 +22,28 @@ import sys
 import time
 import json
 import uuid
-import sqlite3
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import duckdb
 from app.config import settings
+from app.core.catalog import path_for
 from app.core.host_resolver import resolve_connection_host
 from app.core.dsn import build_pg_dsn, sql_ident, sql_string, validate_alias
-from app.core.layers import InvalidLayerPath, LayerLocation, resolve_layer
+from app.core.storage import warehouse_storage
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
-from app.services.layers import default_layer_path, ensure_layer, layer_paths, layer_schemas
 from app.services.state import task_history
+
+
+class NoSourceData(RuntimeError):
+    """A build was asked to run while the folder it reads holds no table at all.
+
+    Distinct from a generic failure so callers can report "there is nothing to read
+    yet" as a fact, not as a broken warehouse connection.
+    """
+
 
 class DbtRunner:
     def __init__(self, dbt_project_dir: Optional[Path] = None):
@@ -58,12 +71,12 @@ class DbtRunner:
             {**run, "run_id": run_id},
         )
 
-    def _dbt_layer_vars(self) -> Dict[str, str]:
-        """Layer paths the bundled project writes to, read from its own ``vars`` block.
+    def _dbt_folders(self) -> Dict[str, str]:
+        """The warehouse folder each model folder writes to, read from the project.
 
-        ``staging`` and ``marts`` are folder names in the project; the layer each one
-        targets is configuration, so repointing or renaming a layer never needs a code
-        change.
+        ``dbt_project.yml`` sets ``+schema`` per model folder, and dbt uses that same
+        name as the warehouse schema. Obelisk reads it rather than imposing a mapping:
+        the project decides where its output lands, and no layer table is involved.
         """
         project_file = self.dbt_project_dir / "dbt_project.yml"
         try:
@@ -73,54 +86,113 @@ class DbtRunner:
         except Exception:
             document = {}
 
-        variables = document.get("vars") or {}
-        if isinstance(variables, dict) and "obelisk_dbt" in variables:
-            variables = variables["obelisk_dbt"] or {}
+        models_config = ((document.get("models") or {}).get("obelisk_dbt") or {})
+
+        def schema_for(folder: str, fallback: str) -> str:
+            block = models_config.get(folder) or {}
+            value = block.get("+schema") if isinstance(block, dict) else None
+            return str(value or fallback).strip().strip("\"'")
 
         return {
-            "staging": str(variables.get("layer_staging") or "raw"),
-            "marts": str(variables.get("layer_marts") or "marts"),
+            "staging": schema_for("staging", "raw"),
+            "marts": schema_for("marts", "marts"),
         }
 
     def _dbt_vars_payload(self) -> Dict[str, Any]:
-        """The ``--vars`` payload: which layer each folder targets, and how paths flatten.
+        """What Obelisk tells dbt about itself: nothing.
 
-        Every known layer is included so a model can target any of them, and the paths
-        the project itself declares are included even when no layer row exists yet —
-        that way a dotted path still resolves to its flattened schema instead of
-        silently becoming a schema with a dot in its name.
+        Kept as a seam because pipeline params are merged into it, but the project no
+        longer needs a layer→schema map — it declares its own schemas.
         """
-        targets = self._dbt_layer_vars()
-        mapping = layer_schemas()
-        for path in targets.values():
-            try:
-                mapping.setdefault(path, resolve_layer(path).warehouse_schema)
-            except InvalidLayerPath:
-                continue
+        return {}
+
+    def _empty_folder_message(self, folder: str, directory: str) -> str:
+        """What a build says when it has nothing to read.
+
+        A fresh install holds no tables, and quietly inventing them turned that fact
+        into a green run. Naming the empty folder and the one call that fills it turns
+        an obscure dbt relation error into an instruction the operator can act on.
+        """
+        return (
+            f"Nothing to build: '{folder}' holds no Parquet files ({directory}), so the "
+            "project has no source tables to read. Ingest a source, or call "
+            "POST /api/dbt/sample-data to load the shipped sample tables, then run again."
+        )
+
+    def _no_source_data_result(
+        self,
+        command: str,
+        selector: Optional[str],
+        target: str,
+        folder: str,
+        directory: str,
+    ) -> Dict[str, Any]:
+        """The shaped-like-a-run failure a build with no source tables returns."""
+        message = self._empty_folder_message(folder, directory)
         return {
-            "layer_staging": targets["staging"],
-            "layer_marts": targets["marts"],
-            "layer_schemas": mapping,
+            "command": f"dbt {command}",
+            "selector": selector or "*",
+            "target": target,
+            "success": False,
+            "exit_code": 1,
+            "duration_seconds": 0.0,
+            "duration_ms": 0,
+            "reason": "no_source_data",
+            "error": message,
+            "output": message,
+            "logs": message,
         }
 
-    def _ensure_core_layer_tables(self, location: LayerLocation) -> None:
-        """Seeds two demo tables into a layer that holds no data yet.
+    def seed_sample_data(self, folder: Optional[str] = None) -> Dict[str, Any]:
+        """Writes the shipped sample tables into one folder, on request only.
 
-        The shipped models reference ``orders`` and ``customers``. On a fresh install
-        there is nothing to read, and a pipeline that dies on a missing relation is a
-        worse first run than one that works on sample data. Only called for an empty
-        layer, so it can never shadow real tables.
+        The explicit replacement for the seeding the runner used to do behind a
+        build's back: the caller decides that an empty workspace needs something to
+        look at, and gets back exactly which tables that created. Idempotent — files
+        that already exist are left untouched.
         """
-        # lakehouse_root_path creates the directory and rejects remote schemes;
-        # no local mkdir logic belongs here (audit B1).
-        directory = location.filesystem_dir
-        directory.mkdir(parents=True, exist_ok=True)
+        target = (folder or self._dbt_folders()["staging"]).strip().strip("/")
+        store = warehouse_storage()
+        before = {info.path for info in store.list_parquet()}
+        self._write_sample_tables(target)
+        after = [info.path for info in store.list_parquet() if info.path.startswith(f"{target}/")]
+        return {
+            "status": "success",
+            "folder": target,
+            "directory": store.display_root(),
+            "tables": sorted(path.rsplit("/", 1)[-1][: -len(".parquet")] for path in after),
+            "created": sorted(
+                path.rsplit("/", 1)[-1][: -len(".parquet")]
+                for path in after
+                if path not in before
+            ),
+        }
 
-        orders_file = directory / "orders.parquet"
-        if not orders_file.exists():
-            import pyarrow as pa
-            import pyarrow.parquet as pq
+    @staticmethod
+    def _write_parquet(store: Any, rel_path: str, table: Any) -> None:
+        """One atomic write through the storage seam, so a bucket changes nothing here."""
+        import io
 
+        import pyarrow.parquet as pq
+
+        buffer = io.BytesIO()
+        pq.write_table(table, buffer, compression="SNAPPY")
+        store.write_atomic(rel_path, buffer.getvalue())
+
+    def _write_sample_tables(self, folder: str) -> None:
+        """Writes the demo tables the shipped models read.
+
+        The shipped models reference ``orders`` and ``customers``. Reached only
+        through :meth:`seed_sample_data` — a build never calls this, because a
+        pipeline that dies on a missing relation is honest and one that silently
+        invents six tables is not.
+        """
+        import pyarrow as pa
+
+        store = warehouse_storage()
+
+        orders_file = path_for(folder, "orders")
+        if not store.exists(orders_file):
             orders_data = {
                 "order_id": pa.array([1, 2, 3, 4, 5], type=pa.int64()),
                 "customer_id": pa.array([101, 102, 101, 103, 102], type=pa.int64()),
@@ -134,28 +206,22 @@ class DbtRunner:
                     datetime(2026, 1, 19, 16, 20, 0, tzinfo=timezone.utc),
                 ]),
             }
-            pq.write_table(pa.Table.from_pydict(orders_data), orders_file, compression="SNAPPY")
+            self._write_parquet(store, orders_file, pa.Table.from_pydict(orders_data))
 
-        customers_file = directory / "customers.parquet"
-        if not customers_file.exists():
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-
+        customers_file = path_for(folder, "customers")
+        if not store.exists(customers_file):
             customers_data = {
                 "customer_id": pa.array([101, 102, 103], type=pa.int64()),
                 "name": pa.array(["Acme Corp", "Globex", "Initech"], type=pa.string()),
                 "tier": pa.array(["Enterprise", "Pro", "Standard"], type=pa.string()),
                 "country": pa.array(["USA", "UK", "Germany"], type=pa.string()),
             }
-            pq.write_table(pa.Table.from_pydict(customers_data), customers_file, compression="SNAPPY")
+            self._write_parquet(store, customers_file, pa.Table.from_pydict(customers_data))
 
-        # The project's two "enterprise" models read these, so a fresh install needs
-        # them too — otherwise a default run fails on a missing relation.
-        ecommerce_orders_file = directory / "ecommerce_orders.parquet"
-        if not ecommerce_orders_file.exists():
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-
+        # The project's two "enterprise" models read these, so the sample set covers
+        # both model families — a run on sample data exercises every shipped model.
+        ecommerce_orders_file = path_for(folder, "ecommerce_orders")
+        if not store.exists(ecommerce_orders_file):
             orders_data = {
                 "order_id": pa.array([9001, 9002], type=pa.int64()),
                 "order_uuid": pa.array(
@@ -189,15 +255,12 @@ class DbtRunner:
                     type=pa.string(),
                 ),
             }
-            pq.write_table(
-                pa.Table.from_pydict(orders_data), ecommerce_orders_file, compression="SNAPPY"
+            self._write_parquet(
+                store, ecommerce_orders_file, pa.Table.from_pydict(orders_data)
             )
 
-        ecommerce_customers_file = directory / "ecommerce_customers.parquet"
-        if not ecommerce_customers_file.exists():
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-
+        ecommerce_customers_file = path_for(folder, "ecommerce_customers")
+        if not store.exists(ecommerce_customers_file):
             ecommerce_customers_data = {
                 "customer_id": pa.array(
                     [
@@ -222,25 +285,25 @@ class DbtRunner:
                     type=pa.string(),
                 ),
             }
-            pq.write_table(
-                pa.Table.from_pydict(ecommerce_customers_data),
-                ecommerce_customers_file,
-                compression="SNAPPY",
+            self._write_parquet(
+                store, ecommerce_customers_file, pa.Table.from_pydict(ecommerce_customers_data)
             )
 
-    def sync_layer_to_postgres(
+    def sync_folder_to_postgres(
         self,
         postgres_params: Dict[str, Any],
         table_names: Optional[List[str]] = None,
-        layer_path: Optional[str] = None,
+        folder: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Copies one layer's Parquet files into that layer's warehouse schema.
+        """Copies one folder's Parquet files into the matching warehouse schema.
 
-        The schema comes from the layer path (``marts.sales`` -> ``marts__sales``) and
-        the files come from that same layer's directory, so a layer is the single thing
-        that decides where its data lives.
+        The folder is the schema — ``marts/sales`` → ``marts__sales``, flattened
+        because Postgres schemas cannot nest — and the files come from that same
+        folder, so the path is the only thing that decides where data lives.
         """
-        location = resolve_layer(layer_path or default_layer_path())
+        target_folder = (folder or self._dbt_folders()["staging"]).strip().strip("/")
+        store = warehouse_storage()
+        schema_name = target_folder.replace("/", "__") or "main"
         port = int(postgres_params["port"])
         host = resolve_connection_host(postgres_params["host"], port)
         database = postgres_params["database"]
@@ -248,27 +311,33 @@ class DbtRunner:
         password = postgres_params["password"]
         sslmode = postgres_params.get("sslmode", "disable")
 
-        all_parquet = self._discover_layer_parquet(location)
+        all_parquet = [
+            info for info in store.list_parquet()
+            if (info.path.rsplit("/", 1)[0] if "/" in info.path else "") == target_folder
+        ]
         if not all_parquet:
-            # Nothing to copy and nothing to overwrite: seed sample tables so the
-            # shipped models have something to read on a fresh install.
-            self._ensure_core_layer_tables(location)
-            all_parquet = self._discover_layer_parquet(location)
+            # Nothing to copy: the project has no source tables to read. Say that
+            # plainly instead of writing sample tables the operator never asked for.
+            raise NoSourceData(
+                self._empty_folder_message(target_folder or "/", store.location(target_folder or ""))
+            )
         if table_names:
-            target_files = [f for f in all_parquet if f.stem in table_names]
+            target_files = [
+                info for info in all_parquet if info.path.rsplit("/", 1)[-1][: -len(".parquet")] in table_names
+            ]
         else:
             target_files = all_parquet
 
         if not target_files:
             return {
                 "status": "success",
-                "layer": location.path,
-                "schema": location.warehouse_schema,
+                "folder": target_folder,
+                "schema": schema_name,
                 "synced_tables": 0,
                 "tables": [],
             }
 
-        schema = sql_ident(location.warehouse_schema)
+        schema = sql_ident(schema_name)
 
         conn = duckdb.connect(":memory:")
         synced_info = []
@@ -287,12 +356,12 @@ class DbtRunner:
             alias = validate_alias(f"pg_sync_{uuid.uuid4().hex[:6]}")
             conn.execute(f"ATTACH {sql_string(conn_str)} AS {alias} (TYPE POSTGRES);")
 
-            # The layer's own schema, created on first use.
+            # The folder's own schema, created on first use.
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{schema};")
 
             for pf in target_files:
-                table_name = pf.stem
-                posix_src = pf.resolve().as_posix()
+                table_name = pf.path.rsplit("/", 1)[-1][: -len(".parquet")]
+                posix_src = store.location(pf.path)
                 query = f"""
                     CREATE OR REPLACE TABLE {alias}.{schema}."{table_name}" AS
                     SELECT * FROM read_parquet('{posix_src}');
@@ -310,8 +379,8 @@ class DbtRunner:
 
         return {
             "status": "success",
-            "layer": location.path,
-            "schema": location.warehouse_schema,
+            "folder": target_folder,
+            "schema": schema_name,
             "synced_tables": len(synced_info),
             "tables": synced_info,
         }
@@ -322,6 +391,7 @@ class DbtRunner:
         env_vars: Optional[Dict[str, str]] = None,
         select: Optional[str] = None,
         dbt_vars: Optional[Dict[str, Any]] = None,
+        on_line: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """
         Executes a dbt command (run, test, seed, compile) inside the dbt_project directory.
@@ -350,25 +420,54 @@ class DbtRunner:
             env.update(env_vars)
 
         start_time = time.time()
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=str(self.dbt_project_dir),
-        )
-        duration = round(time.time() - start_time, 2)
+        if on_line is None:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(self.dbt_project_dir),
+            )
+            output = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
+            # Filter out noisy runpy import warnings
+            clean_lines = [l for l in output.splitlines() if "RuntimeWarning: 'dbt.cli.main'" not in l]
+            output = "\n".join(clean_lines).strip()
+            exit_code = proc.returncode
+        else:
+            # Streaming mode: hand each line to the caller as dbt writes it, so a step's
+            # log is readable while the step runs instead of appearing all at once at the
+            # end. ``output`` is rebuilt from the same kept lines, so callers that only
+            # want the text see no difference.
+            kept: List[str] = []
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env,
+                cwd=str(self.dbt_project_dir),
+            )
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip("\n")
+                if "RuntimeWarning: 'dbt.cli.main'" in line:
+                    continue
+                kept.append(line)
+                on_line(line)
+            proc.wait()
+            output = "\n".join(kept).strip()
+            exit_code = proc.returncode
 
-        output = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
-        # Filter out noisy runpy import warnings
-        clean_lines = [l for l in output.splitlines() if "RuntimeWarning: 'dbt.cli.main'" not in l]
-        output = "\n".join(clean_lines).strip()
-        success = proc.returncode == 0
+        duration = round(time.time() - start_time, 2)
+        success = exit_code == 0
 
         return {
             "command": f"dbt {command}",
             "success": success,
-            "exit_code": proc.returncode,
+            "exit_code": exit_code,
             "duration_seconds": duration,
             "output": output,
         }
@@ -382,10 +481,9 @@ class DbtRunner:
     ) -> Dict[str, Any]:
         """
         Runs the pipeline end to end:
-        1. Copies the landing layer's Parquet files into that layer's warehouse schema
-        2. Runs the selected dbt models, each into the schema its layer resolves to
+        1. Copies the source folder's Parquet files into the matching warehouse schema
+        2. Runs the selected dbt models, each into the schema its folder declares
         3. Runs the dbt tests
-        4. Registers the materialised models in the catalog
         """
         run_id = str(uuid.uuid4())
         now_dt = datetime.now(timezone.utc)
@@ -407,25 +505,25 @@ class DbtRunner:
         }
 
         dbt_vars = self._dbt_vars_payload()
-        staging_layer = dbt_vars["layer_staging"]
-        staging_schema = dbt_vars["layer_schemas"].get(staging_layer, staging_layer)
+        folders = self._dbt_folders()
+        staging_folder = folders["staging"]
 
-        # Step 1: copy the landing layer into its schema
+        # Step 1: copy the source folder into its schema
         logs.append(
-            f"[{time_str}] Step 1/3: Copying layer '{staging_layer}' into warehouse "
-            f"schema '{staging_schema}'..."
+            f"[{time_str}] Step 1/3: Copying folder '{staging_folder}' into warehouse "
+            f"schema '{staging_folder}'..."
         )
         try:
-            sync_res = self.sync_layer_to_postgres(
+            sync_res = self.sync_folder_to_postgres(
                 postgres_params=postgres_params,
                 table_names=table_names,
-                layer_path=staging_layer,
+                folder=staging_folder,
             )
             tbl_summary = ", ".join([f"{t['table']} ({t['rows']} rows)" for t in sync_res.get("tables", [])])
             logs.append(f"[{time_str}] Synced {sync_res['synced_tables']} tables to warehouse: {tbl_summary}")
         except Exception as e:
             err_msg = (
-                f"Failed to copy layer '{staging_layer}' into the warehouse at "
+                f"Failed to copy folder '{staging_folder}' into the warehouse at "
                 f"{host}:{port}: {str(e)}"
             )
             logs.append(f"[{time_str}] ERROR: {err_msg}")
@@ -446,12 +544,12 @@ class DbtRunner:
         # Step 2: dbt run with selector
         dbt_select = selector if selector and selector != "*" else None
         select_display = f" (selector: '{dbt_select}')" if dbt_select else " (all models)"
-        target_layers = ", ".join(
-            f"'{self._dbt_layer_vars()[slot]}'" for slot in ("staging", "marts")
+        target_folders = ", ".join(
+            f"'{folders[slot]}'" for slot in ("staging", "marts")
         )
         logs.append(
             f"\nStep 2/3: Executing dbt run{select_display} "
-            f"(writing to layers {target_layers})..."
+            f"(writing to schemas {target_folders})..."
         )
         run_res = self.run_dbt(
             command="run", env_vars=env_vars, select=dbt_select, dbt_vars=dbt_vars
@@ -481,8 +579,8 @@ class DbtRunner:
 
         status = "success" if test_res["success"] else "test_failure"
 
-        # Step 4: register the materialised models in the catalog
-        self._catalog_dbt_models()
+        # Nothing is registered here: a model's output is a Parquet file, and the
+        # catalog finds it the next time anyone reads the catalog.
 
         run_data = {
             "run_id": run_id,
@@ -499,121 +597,28 @@ class DbtRunner:
         self._record_run(run_data)
         return run_data
 
-    def _discover_layer_parquet(self, location: Optional[LayerLocation] = None) -> List[Path]:
-        """Finds the Parquet files that belong to one layer.
+    def folder_tables(self, folder: str) -> List[str]:
+        """The table names this warehouse folder holds, from the scan."""
+        target = (folder or "").strip().strip("/")
+        names = []
+        for info in warehouse_storage().list_parquet():
+            parent = info.path.rsplit("/", 1)[0] if "/" in info.path else ""
+            if parent == target:
+                names.append(info.path.rsplit("/", 1)[-1][: -len(".parquet")])
+        return names
 
-        The layer's own directory is authoritative, but the lakehouse root is scanned
-        too: installs that predate layers wrote their tables straight there. On a stem
-        collision the layer directory wins.
-        """
-        location = location or resolve_layer(default_layer_path())
-        found: Dict[str, Path] = {}
-        for directory in (location.filesystem_dir, settings.lakehouse_root_path):
-            if not directory.is_dir():
-                continue
-            for parquet in sorted(directory.glob("*.parquet")):
-                found.setdefault(parquet.stem, parquet)
-        return list(found.values())
-
-    def _dbt_model_descriptions(self) -> Dict[str, str]:
-        """Reads model descriptions from models/schema.yml (best effort)."""
-        schema_file = self.dbt_project_dir / "models" / "schema.yml"
-        if not schema_file.exists():
-            return {}
-        try:
-            import yaml
-            document = yaml.safe_load(schema_file.read_text(encoding="utf-8")) or {}
-        except Exception:
-            return {}
-        return {
-            entry["name"]: entry.get("description", "")
-            for entry in (document.get("models") or [])
-            if isinstance(entry, dict) and entry.get("name")
-        }
-
-    def _catalog_dbt_models(self) -> None:
-        """Registers every dbt model found on disk in the SQLite catalog.
-
-        A model's layer is whatever its folder is configured to write to, resolved the
-        same way dbt resolves it, so the catalog and the warehouse cannot disagree
-        about where a model landed.
-        """
-        db_path = settings.sqlite_db_path
-        now_iso = datetime.now(timezone.utc).isoformat()
-        descriptions = self._dbt_model_descriptions()
-
-        models: List[Dict[str, str]] = []
-        for folder, layer_path in self._dbt_layer_vars().items():
-            models_dir = self.dbt_project_dir / "models" / folder
-            if not models_dir.exists():
-                continue
-            # The layer must exist as a row too: a dbt run writes into whichever layer
-            # the project configures, and the tree has to describe what exists.
-            ensure_layer(layer_path, description=f"Written by the dbt project ({folder})")
-            try:
-                schema = resolve_layer(layer_path).warehouse_schema
-            except InvalidLayerPath:
-                schema = layer_path
-            for sql_file in sorted(models_dir.glob("*.sql")):
-                models.append(
-                    {"name": sql_file.stem, "layer": layer_path, "schema": schema}
-                )
-
-        try:
-            with sqlite3.connect(db_path, timeout=10.0) as conn:
-                cur = conn.cursor()
-                cur.execute("PRAGMA journal_mode=WAL;")
-                for m in models:
-                    cur.execute(
-                        """
-                        INSERT INTO catalog_objects (
-                            id, fqn, name, layer_path, kind, backend, location,
-                            schema_json, row_count, size_bytes, version, created_at,
-                            last_materialized_at
-                        )
-                        VALUES (?, ?, ?, ?, 'model', 'postgres', ?, ?, 0, NULL, 1, ?, ?)
-                        ON CONFLICT(fqn) DO UPDATE SET
-                            location=excluded.location,
-                            schema_json=excluded.schema_json,
-                            last_materialized_at=excluded.last_materialized_at,
-                            version=catalog_objects.version + 1;
-                        """,
-                        (
-                            str(uuid.uuid4()),
-                            f"lakehouse.{m['layer']}.{m['name']}",
-                            m["name"],
-                            m["layer"],
-                            f"postgresql:///{m['schema']}.{m['name']}",
-                            json.dumps({"description": descriptions.get(m["name"], "")}),
-                            now_iso,
-                            now_iso,
-                        ),
-                    )
-                conn.commit()
-        except Exception:
-            pass
-
-    def _folder_for_layer(self, layer: str) -> str:
-        """Maps a layer path onto the project folder configured to write to it."""
-        wanted = (layer or "").strip()
-        targets = self._dbt_layer_vars()
-        for folder in ("marts", "staging"):
-            if wanted == targets[folder]:
-                return folder
-        return "marts"
-
-    def get_model_code(self, layer: str, name: str) -> Optional[str]:
+    def get_model_code(self, folder: str, name: str) -> Optional[str]:
         """Reads SQL source code of a dbt model from git_repo/dbt_project/models/."""
-        target_dir = self._folder_for_layer(layer)
+        target_dir = (folder or "marts").strip().strip("/")
         file_path = self.dbt_project_dir / "models" / target_dir / f"{name}.sql"
         if file_path.exists():
             return file_path.read_text(encoding="utf-8")
         return None
 
-    def save_model_code(self, layer: str, name: str, sql: str) -> Dict[str, Any]:
+    def save_model_code(self, folder: str, name: str, sql: str) -> Dict[str, Any]:
         """Saves or creates a dbt SQL transformation model on disk."""
         clean_name = name.lower().strip().replace(".sql", "")
-        target_dir = self._folder_for_layer(layer)
+        target_dir = (folder or "marts").strip().strip("/")
         dir_path = self.dbt_project_dir / "models" / target_dir
         dir_path.mkdir(parents=True, exist_ok=True)
         file_path = dir_path / f"{clean_name}.sql"
@@ -621,7 +626,7 @@ class DbtRunner:
         return {
             "status": "success",
             "name": clean_name,
-            "layer": layer.lower(),
+            "folder": target_dir,
             "path": file_path.as_posix(),
         }
 
@@ -632,73 +637,69 @@ class DbtRunner:
         return list(reversed(self._runs_history))
 
     def get_asset_graph(self, selector: Optional[str] = None) -> Dict[str, Any]:
-        """Builds the lineage graph from what is on disk, keyed by layer path.
+        """Builds the lineage graph from what is on disk.
 
-        Node ids are ``<layer>.<model>`` using the layer each folder is configured to
-        target, so a graph node always points at the schema the model actually landed
-        in — whatever the workspace decided to call its layers.
+        Node ids are ``<schema>.<name>``, where the schema is the folder the model is
+        configured to write to (from ``+schema`` in the project). A node therefore points
+        at the schema the model actually lands in.
         """
         import re
 
-        targets = self._dbt_layer_vars()
-        staging_layer = targets["staging"]
-        marts_layer = targets["marts"]
+        folders = self._dbt_folders()
+        staging_folder = folders["staging"]
+        marts_folder = folders["marts"]
 
         nodes: List[Dict[str, Any]] = []
         edges: List[Dict[str, str]] = []
         node_map: Dict[str, str] = {}
+        store = warehouse_storage()
 
-        try:
-            landing = resolve_layer(staging_layer)
-        except InvalidLayerPath:
-            landing = None
-
-        for f in self._discover_layer_parquet(landing):
-            node_id = f"{staging_layer}.{f.stem}"
-            node_map.setdefault(f.stem, node_id)
+        for table_name in self.folder_tables(staging_folder):
+            node_id = f"{staging_folder}.{table_name}"
+            node_map.setdefault(table_name, node_id)
             nodes.append({
                 "id": node_id,
-                "name": f.stem,
-                "layer": staging_layer,
+                "name": table_name,
+                "schema": staging_folder,
                 "type": "parquet",
-                "path": f.as_posix(),
+                "path": store.location(path_for(staging_folder, table_name)),
             })
 
         # 1 & 2. Scan the project's model folders, in dependency order
-        for folder, layer_path, node_type in (
-            ("staging", staging_layer, "dbt_model"),
-            ("marts", marts_layer, "dbt_mart"),
+        for folder, schema_name, node_type in (
+            ("staging", staging_folder, "dbt_model"),
+            ("marts", marts_folder, "dbt_mart"),
         ):
             models_dir = self.dbt_project_dir / "models" / folder
             if not models_dir.exists():
                 continue
             for sql_file in sorted(models_dir.glob("*.sql")):
                 model_name = sql_file.stem
-                node_id = f"{layer_path}.{model_name}"
+                node_id = f"{schema_name}.{model_name}"
                 node_map[model_name] = node_id
                 code = sql_file.read_text(encoding="utf-8")
                 nodes.append({
                     "id": node_id,
                     "name": model_name,
-                    "layer": layer_path,
+                    "schema": schema_name,
                     "folder": folder,
                     "type": node_type,
                     "path": sql_file.as_posix(),
                     "sql_code": code,
                 })
-                # source('<name>', '<table>') always reads the landing layer.
+                # source('<name>', '<table>') reads the staging schema.
                 for src_match in re.finditer(
                     r"source\(\s*['\"][^'\"]+['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)", code
                 ):
                     table = src_match.group(1)
                     edges.append({
-                        "source": node_map.get(table, f"{staging_layer}.{table}"),
+                        "source": node_map.get(table, f"{staging_folder}.{table}"),
                         "target": node_id,
                     })
                 for ref_match in re.finditer(r"ref\(\s*['\"]([^'\"]+)['\"]\s*\)", code):
                     ref_name = ref_match.group(1)
                     edges.append({
-                        "source": node_map.get(ref_name, f"{staging_layer}.{ref_name}"),
+                        "source": node_map.get(ref_name, f"{staging_folder}.{ref_name}"),
                         "target": node_id,
                     })
 
@@ -788,15 +789,15 @@ class DbtRunner:
         for n in all_nodes:
             n["is_in_pipeline"] = n["id"] in active_ids
 
-        layers = {n["layer"] for n in all_nodes if n.get("layer")}
+        schemas = {n["schema"] for n in all_nodes if n.get("schema")}
         if custom_dag_nodes:
-            layers.add("custom")
-        layers = sorted(layers)
+            schemas.add("custom")
+        schemas = sorted(schemas)
 
         return {
             "nodes": all_nodes,
             "edges": unique_edges,
-            "layers": layers,
+            "schemas": schemas,
             "active_pipeline_selector": selector or "*",
             "active_node_count": len([n for n in all_nodes if n.get("is_in_pipeline", False)]),
         }
@@ -994,17 +995,40 @@ class DbtRunner:
             clean_target = "postgres"
 
         dbt_vars = self._dbt_vars_payload()
-        staging_layer = dbt_vars["layer_staging"]
+        staging_folder = self._dbt_folders()["staging"]
+        store = warehouse_storage()
 
-        # A layer with no data yet gets sample tables, so the shipped models have
-        # something to read. Never when the operator already has data.
-        if not self._discover_layer_parquet(resolve_layer(staging_layer)):
-            self._ensure_core_layer_tables(resolve_layer(staging_layer))
+        # A build against an empty source folder has nothing to read: report that,
+        # with the fix, rather than seeding sample tables and calling it a success.
+        if clean_target == "postgres" and command in ("run", "test"):
+            if not self.folder_tables(staging_folder):
+                return self._no_source_data_result(
+                    command,
+                    selector,
+                    clean_target,
+                    staging_folder,
+                    store.location(staging_folder),
+                )
 
         if clean_target == "postgres" and command == "run":
             pg_params = self._resolve_postgres_params()
             try:
-                self.sync_layer_to_postgres(pg_params, layer_path=staging_layer)
+                self.sync_folder_to_postgres(pg_params, folder=staging_folder)
+            except NoSourceData as exc:
+                # Scoped syncs pass their own table filter; an empty folder is still
+                # nothing to build, so keep the explicit answer.
+                return {
+                    **self._no_source_data_result(
+                        command,
+                        selector,
+                        clean_target,
+                        staging_folder,
+                        store.location(staging_folder),
+                    ),
+                    "error": str(exc),
+                    "output": str(exc),
+                    "logs": str(exc),
+                }
             except Exception:
                 pass
 
@@ -1046,12 +1070,8 @@ class DbtRunner:
         output = "\n".join(clean_lines).strip()
         success = proc.returncode == 0
 
-        # If run was successful on postgres, update SQLite catalog assets
-        if command == "run" and success and clean_target == "postgres":
-            try:
-                self._catalog_dbt_models()
-            except Exception:
-                pass
+        # No catalog write on success: the models' Parquet files are the record, and
+        # the catalog projection reads them when someone asks what exists.
 
         return {
             "command": f"dbt {command}",
@@ -1181,18 +1201,18 @@ class DbtRunner:
             else:
                 stat = path.stat()
                 ext = path.suffix.lower()
-                layer = None
+                folder = None
                 if "models/staging" in rel_path or "models\\staging" in rel_path:
-                    layer = "staging"
+                    folder = "staging"
                 elif "models/marts" in rel_path or "models\\marts" in rel_path:
-                    layer = "marts"
+                    folder = "marts"
 
                 return {
                     "name": path.name,
                     "path": rel_path,
                     "type": "file",
                     "extension": ext,
-                    "layer": layer,
+                    "folder": folder,
                     "size_bytes": stat.st_size,
                     "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
                 }
@@ -1267,7 +1287,7 @@ class DbtRunner:
             if target.suffix.lower() == ".sql":
                 if "staging" in posix_rel:
                     content = (
-                        "{{ config(materialized='table', schema=var('layer_staging')) }}\n\n"
+                        "{{ config(materialized='table') }}\n\n"
                         "with source as (\n"
                         f"    select * from {{{{ source('landing', '{model_stem.replace('stg_', '')}') }}}}\n"
                         "),\n\n"
@@ -1281,7 +1301,7 @@ class DbtRunner:
                     )
                 else:
                     content = (
-                        "{{ config(materialized='table', schema=var('layer_marts')) }}\n\n"
+                        "{{ config(materialized='table') }}\n\n"
                         "with staging as (\n"
                         "    select * from {{ ref('stg_orders') }}\n"
                         ")\n\n"
@@ -1339,9 +1359,9 @@ class DbtRunner:
         clean_name = model_name.strip().replace(".sql", "")
         manifest_path = self.dbt_project_dir / "target" / "manifest.json"
 
-        targets = self._dbt_layer_vars()
-        staging_layer = targets["staging"]
-        marts_layer = targets["marts"]
+        folders = self._dbt_folders()
+        staging_folder = folders["staging"]
+        marts_folder = folders["marts"]
 
         nodes: List[Dict[str, Any]] = []
         edges: List[Dict[str, Any]] = []
@@ -1370,7 +1390,7 @@ class DbtRunner:
                     target_path = target_node.get("original_file_path", "")
                     target_folder = "staging" if "staging" in target_path else "marts"
                     schema = target_node.get("config", {}).get("schema") or (
-                        staging_layer if target_folder == "staging" else marts_layer
+                        staging_folder if target_folder == "staging" else marts_folder
                     )
 
                     # Current Node
@@ -1378,7 +1398,7 @@ class DbtRunner:
                         "id": matching_id,
                         "name": clean_name,
                         "type": "model",
-                        "layer": schema,
+                        "schema": schema,
                         "folder": target_folder,
                         "is_current": True,
                         "materialized": target_node.get("config", {}).get("materialized", "table"),
@@ -1394,12 +1414,12 @@ class DbtRunner:
                         is_source = up_id.startswith("source.")
                         up_path = manifest_nodes.get(up_id, {}).get("original_file_path", "")
                         up_folder = "staging" if "staging" in up_path else "marts"
-                        up_layer = staging_layer if is_source or up_folder == "staging" else marts_layer
+                        up_schema = staging_folder if is_source or up_folder == "staging" else marts_folder
                         nodes.append({
                             "id": up_id,
                             "name": up_name,
                             "type": "source" if is_source else "model",
-                            "layer": up_layer,
+                            "schema": up_schema,
                             "folder": "landing" if is_source else up_folder,
                             "is_current": False,
                         })
@@ -1412,12 +1432,12 @@ class DbtRunner:
                         is_test = down_id.startswith("test.")
                         down_path = manifest_nodes.get(down_id, {}).get("original_file_path", "")
                         down_folder = "staging" if "staging" in down_path else "marts"
-                        down_layer = staging_layer if down_folder == "staging" else marts_layer
+                        down_schema = staging_folder if down_folder == "staging" else marts_folder
                         nodes.append({
                             "id": down_id,
                             "name": down_name if not is_test else down_id.split(".")[2],
                             "type": "test" if is_test else "model",
-                            "layer": down_layer if not is_test else "test",
+                            "schema": down_schema if not is_test else "test",
                             "folder": down_folder,
                             "is_current": False,
                         })
@@ -1426,13 +1446,13 @@ class DbtRunner:
                 pass
 
         if not found_in_manifest:
-            code = self.get_model_code(staging_layer, clean_name) or self.get_model_code(marts_layer, clean_name)
-            current_layer = staging_layer if self.get_model_code(staging_layer, clean_name) else marts_layer
+            code = self.get_model_code(staging_folder, clean_name) or self.get_model_code(marts_folder, clean_name)
+            current_folder = staging_folder if self.get_model_code(staging_folder, clean_name) else marts_folder
             nodes.append({
                 "id": target_node_id,
                 "name": clean_name,
                 "type": "model",
-                "layer": current_layer,
+                "schema": current_folder,
                 "is_current": True,
             })
 
@@ -1445,7 +1465,7 @@ class DbtRunner:
                         "id": s_id,
                         "name": s_name,
                         "type": "source",
-                        "layer": staging_layer,
+                        "schema": staging_folder,
                         "is_current": False,
                     })
                     edges.append({"source": s_id, "target": target_node_id})
@@ -1453,12 +1473,12 @@ class DbtRunner:
                 for ref_match in re.finditer(r"ref\(\s*['\"]([^'\"]+)['\"]\s*\)", code):
                     r_name = ref_match.group(1)
                     r_id = f"model.obelisk_dbt.{r_name}"
-                    r_layer = staging_layer if "stg_" in r_name else marts_layer
+                    r_folder = staging_folder if "stg_" in r_name else marts_folder
                     nodes.append({
                         "id": r_id,
                         "name": r_name,
                         "type": "model",
-                        "layer": r_layer,
+                        "schema": r_folder,
                         "is_current": False,
                     })
                     edges.append({"source": r_id, "target": target_node_id})
@@ -1472,12 +1492,12 @@ class DbtRunner:
                     other_code = other_file.read_text(encoding="utf-8")
                     if f"ref('{clean_name}')" in other_code or f'ref("{clean_name}")' in other_code:
                         other_id = f"model.obelisk_dbt.{other_file.stem}"
-                        other_layer = staging_layer if "staging" in str(other_file) else marts_layer
+                        other_folder = staging_folder if "staging" in str(other_file) else marts_folder
                         nodes.append({
                             "id": other_id,
                             "name": other_file.stem,
                             "type": "model",
-                            "layer": other_layer,
+                            "schema": other_folder,
                             "is_current": False,
                         })
                         edges.append({"source": target_node_id, "target": other_id})

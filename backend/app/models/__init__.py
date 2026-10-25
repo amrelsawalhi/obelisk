@@ -4,7 +4,6 @@ from app.models.service_config import ServiceConfig
 from app.models.query import QueryHistory
 from app.models.asset import Asset
 from app.models.variable import Variable
-from app.models.layer import Layer
 from app.models.catalog_object import CatalogObject
 from app.models.pipeline import (
     Pipeline,
@@ -23,7 +22,6 @@ __all__ = [
     "QueryHistory",
     "Asset",
     "Variable",
-    "Layer",
     "CatalogObject",
     "Pipeline",
     "PipelineParam",

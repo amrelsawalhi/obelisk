@@ -29,7 +29,6 @@ import {
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import type { CatalogNode, CatalogTable, LakehouseDirectory } from '../../lib/types';
-import { LayersModal } from './LayersModal';
 
 interface CatalogTreeProps {
   nodes: CatalogNode[];
@@ -58,8 +57,6 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
   onOpenInQuery,
   onOpenInNotebook,
 }) => {
-  const [isLayersOpen, setIsLayersOpen] = useState(false);
-
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({
     lakehouse: true,
   });
@@ -392,13 +389,6 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
               className="p-1 rounded text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-            </button>
-            <button
-              onClick={() => setIsLayersOpen(true)}
-              title="Manage layers"
-              className="p-1 rounded text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
-            >
-              <Layers className="w-3.5 h-3.5" />
             </button>
             <button
               onClick={onOpenAddConnection}
@@ -1278,10 +1268,6 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
             </div>
           </form>
         </div>
-      )}
-      {/* Layer management: the only place layer names are invented. */}
-      {isLayersOpen && (
-        <LayersModal onClose={() => setIsLayersOpen(false)} onChanged={onRefresh} />
       )}
     </div>
   );

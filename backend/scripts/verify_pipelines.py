@@ -283,6 +283,23 @@ class Verifier:
         )
 
 
+    def ensure_sample_data(self) -> None:
+        """Puts the shipped sample tables in place — the one way they can appear.
+
+        A build no longer seeds anything behind the operator's back, so a workspace
+        with an empty warehouse has to be filled deliberately before the dbt checks
+        below have something to read.
+        """
+        response = self.client.post("/api/dbt/sample-data", json={})
+        payload = response.json() if response.status_code == 200 else {}
+        self.report.add(
+            "sample tables are written only when the API is asked",
+            response.status_code == 200 and bool(payload.get("tables")),
+            ", ".join(payload.get("tables", []))
+            if response.status_code == 200
+            else response.text[:160],
+        )
+
     def check_dbt_pipeline(self) -> None:
         """dbt run → dbt test through the orchestrator.
 
@@ -400,7 +417,7 @@ class Verifier:
                             "select 1 as id union all select 2 as id",
                             x=40,
                             y=120,
-                            args={"materialize": {"layer": "bronze", "name": table_name}},
+                            args={"materialize": {"folder": "bronze", "name": table_name}},
                         ),
                         step(
                             "read",
@@ -436,12 +453,12 @@ class Verifier:
         )
         self.report.add(
             "the table name was published as a step output",
-            outputs.get("table", {}).get("value") == f"bronze.{table_name}",
+            outputs.get("table", {}).get("value") == f"lakehouse.bronze.{table_name}",
             str(outputs.get("table")),
         )
         self.report.add(
             "the child resolved the parent's table binding",
-            f"from bronze.{table_name}" in read_logs.lower()
+            f"from lakehouse.bronze.{table_name}" in read_logs.lower()
             and steps["read"]["status"] == "success",
             f"read={steps['read']['status']}",
         )
@@ -614,6 +631,7 @@ class Verifier:
             self.check_success_chain()
             self.check_failure_branch(receiver)
         self.check_params_and_retries()
+        self.ensure_sample_data()
         self.check_dbt_pipeline()
         self.check_materialize_and_outputs()
         self.check_pipeline_dependencies()

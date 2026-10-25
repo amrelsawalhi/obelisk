@@ -47,28 +47,25 @@ def test_docker_manager_service_blueprints():
 def test_dbt_pipeline_end_to_end(source_postgres_params):
     """
     Full pipeline integration test:
-    1. Creates real Parquet files (orders & customers) in the landing layer.
-    2. DuckDB copies the layer into its warehouse schema.
-    3. dbt-core transforms raw tables into the staging layer (stg_orders, stg_customers).
-    4. dbt-core aggregates business marts into the marts layer (fct_revenue, dim_customers).
+    1. Creates real Parquet files (orders & customers) in the staging folder.
+    2. DuckDB copies the folder into its warehouse schema.
+    3. dbt-core transforms raw tables into the staging schema (stg_orders, stg_customers).
+    4. dbt-core aggregates business marts into the marts schema (fct_revenue, dim_customers).
     5. dbt test validates unique and not-null constraints.
     6. Directly queries PostgreSQL to assert data integrity and aggregated calculations.
 
-    The two schemas are read from the project's own config, so renaming a layer does
-    not require editing this test.
+    The two schemas are read from the project's own config, so changing a folder's
+    +schema does not require editing this test.
     """
     p = source_postgres_params
 
     # Which schemas the run will write to, taken from the project's own config.
-    from app.core.layers import resolve_layer
+    folders = dbt_runner._dbt_folders()
+    staging_schema = folders["staging"]
+    marts_schema = folders["marts"]
 
-    targets = dbt_runner._dbt_layer_vars()
-    staging_layer = resolve_layer(targets["staging"])
-    staging_schema = staging_layer.warehouse_schema
-    marts_schema = resolve_layer(targets["marts"]).warehouse_schema
-
-    # Files live in the landing layer's directory — that is what the pipeline copies.
-    staging_dir = staging_layer.filesystem_dir
+    # Files live in the staging folder — that is what the pipeline copies.
+    staging_dir = settings.lakehouse_root_path / staging_schema
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Create real Parquet files
@@ -226,11 +223,11 @@ async def test_pipelines_api_flow(source_postgres_params):
         graph_data = graph_resp.json()
         assert "nodes" in graph_data
         assert "edges" in graph_data
-        assert "layers" in graph_data
-        # The graph is keyed by layer path, so it only names layers this workspace has.
-        targets = dbt_runner._dbt_layer_vars()
-        assert targets["staging"] in graph_data["layers"]
-        assert targets["marts"] in graph_data["layers"]
+        assert "schemas" in graph_data
+        # The graph is keyed by the schema each model folder declares.
+        folders = dbt_runner._dbt_folders()
+        assert folders["staging"] in graph_data["schemas"]
+        assert folders["marts"] in graph_data["schemas"]
 
         # 2. Pipeline Run Trigger
         payload = {

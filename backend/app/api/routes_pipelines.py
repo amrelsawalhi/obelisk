@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 
 from app.database import AsyncSessionLocal
+from app.core.catalog import InvalidTablePath, split_table_path
 from app.engines.pipeline_engine import (
     EDGE_CONDITIONS,
     MAX_PIPELINE_DEPTH,
@@ -371,12 +372,13 @@ async def _validate_graph(graph: GraphIn, pipeline_id: Optional[str] = None) -> 
                     f"Step '{clean_name}' has an incomplete materialize target.",
                     steps=[step.key],
                 )
-            layer = str(materialize.get("layer") or "bronze")
+            folder = str(materialize.get("folder") or materialize.get("layer") or "")
             name = str(materialize.get("name"))
-            if not STEP_NODE_NAME.fullmatch(name) or not STEP_LAYER_NAME.fullmatch(layer):
+            try:
+                split_table_path(f"{folder}/{name}" if folder else name)
+            except InvalidTablePath as exc:
                 raise _invalid(
-                    f"Step '{clean_name}' materializes to an invalid table name "
-                    f"'{layer}.{name}'. Use letters, digits and underscores.",
+                    f"Step '{clean_name}' materializes to an invalid table path: {exc}",
                     steps=[step.key],
                 )
 

@@ -82,8 +82,11 @@ async def test_lakehouse_catalog_tree_and_preview():
         assert delete_res.json()["status"] == "deleted"
         assert not (lakehouse_root / new_dir_name).exists()
 
-        # E. Test executing SQL query in DuckDB referencing custom_tier.sample_table
-        query_sql = f"SELECT event_id, event_type, revenue FROM {custom_tier}.{sample_table} WHERE revenue > 0"
+        # E. Query it by its address: the warehouse is the source, the folder the schema.
+        query_sql = (
+            f"SELECT event_id, event_type, revenue FROM lakehouse.{custom_tier}.{sample_table}"
+            " WHERE revenue > 0"
+        )
         query_res = duckdb_engine.execute_query(query_sql)
         assert query_res["row_count"] == 1
         assert query_res["rows"][0]["revenue"] == 149.99

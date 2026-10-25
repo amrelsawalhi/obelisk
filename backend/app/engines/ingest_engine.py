@@ -18,8 +18,7 @@ import httpx
 from app.config import settings
 from app.engines.duckdb_engine import duckdb_engine
 from app.core.host_resolver import resolve_connection_host
-from app.core.layers import resolve_layer, safe_layer_path
-from app.services.layers import default_layer_path, ensure_layer
+from app.core.storage import warehouse_storage
 from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 
 logger = logging.getLogger(__name__)
@@ -73,52 +72,13 @@ class IngestEngine:
         record_count: int,
         schema_metadata: Dict[str, Any],
     ) -> None:
-        """Records or updates the lakehouse asset metadata in SQLite brain."""
-        db_path = settings.sqlite_db_path
-        now_iso = datetime.now(timezone.utc).isoformat()
-        metadata_json = json.dumps(schema_metadata)
-        asset_id = str(uuid.uuid4())
+        """No-op kept for call sites: the catalog is a projection, not a ledger.
 
-        # A written table always belongs to a layer. If the caller named a folder that
-        # is not in the tree yet, add it (and its parents) so the tree never lags
-        # behind what is on disk.
-        layer_path = ensure_layer(layer)
-
-        try:
-            conn = sqlite3.connect(db_path, timeout=10.0)
-            with conn:
-                cur = conn.cursor()
-                cur.execute("PRAGMA journal_mode=WAL;")
-                # One table knows what exists; `assets` is only a projection of it now.
-                cur.execute(
-                    """
-                    INSERT INTO catalog_objects (
-                        id, fqn, name, layer_path, kind, backend, location,
-                        schema_json, row_count, version, created_at, last_materialized_at
-                    )
-                    VALUES (?, ?, ?, ?, 'parquet', 'local', ?, ?, ?, 1, ?, ?)
-                    ON CONFLICT(fqn) DO UPDATE SET
-                        location=excluded.location,
-                        schema_json=excluded.schema_json,
-                        row_count=excluded.row_count,
-                        last_materialized_at=excluded.last_materialized_at,
-                        version=catalog_objects.version + 1;
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        f"lakehouse.{layer_path}.{name}",
-                        name,
-                        layer_path,
-                        storage_uri,
-                        metadata_json,
-                        record_count,
-                        now_iso,
-                        now_iso,
-                    ),
-                )
-            conn.close()
-        except Exception:
-            pass
+        A written Parquet file is the record. Registering it here would mean two
+        writers for one fact, which is exactly the drift the projection removes — the
+        next catalog read finds the file by itself.
+        """
+        return
 
     def _apply_write_strategy(
         self,
@@ -202,11 +162,12 @@ class IngestEngine:
         Executes ingestion and writes a Snappy Parquet file atomically to lakehouse storage.
         Returns execution statistics and registers asset in Obelisk catalog.
         """
-        # Everything lands in a layer. An unspecified target means the default layer,
-        # not the lakehouse root, so the tree always covers what is on disk.
+        # Everything lands in a folder. An empty target means the warehouse root, so
+        # what is on disk is exactly what the catalog will report.
         requested = target_folder.strip("/\\").replace("..", "") if target_folder else ""
-        clean_folder = safe_layer_path(requested) if requested else default_layer_path()
-        target_dir = resolve_layer(clean_folder).filesystem_dir
+        clean_folder = "/".join(part for part in requested.split("/") if part)
+        store = warehouse_storage()
+        target_dir = store.root / clean_folder if clean_folder else store.root
         target_dir.mkdir(parents=True, exist_ok=True)
 
         # Default clean table stem without database/schema prefixes

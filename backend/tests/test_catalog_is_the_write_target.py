@@ -12,17 +12,24 @@ import polars as pl
 import pytest
 
 from app.config import settings
+from app.database import AsyncSessionLocal
 from app.sdk import obelisk
+from app.services.catalog import catalog_service
 
 
-def _cleanup(layer: str, name: str) -> None:
+def _cleanup(folder: str, name: str) -> None:
     with sqlite3.connect(settings.sqlite_db_path) as con:
-        con.execute("DELETE FROM catalog_objects WHERE fqn = ?", (f"lakehouse.{layer}.{name}",))
-        con.execute("DELETE FROM layers WHERE path = ?", (layer,))
+        con.execute("DELETE FROM catalog_objects WHERE fqn = ?", (f"lakehouse.{folder}.{name}",))
         con.commit()
-    # The write also landed a Parquet file in the lakehouse; remove it so later tests
+    # The write also landed a Parquet file in the warehouse; remove it so later tests
     # do not discover a probe table.
-    shutil.rmtree(settings.lakehouse_root_path / layer, ignore_errors=True)
+    shutil.rmtree(settings.lakehouse_root_path / folder, ignore_errors=True)
+
+
+async def _project() -> None:
+    """Refreshes the catalog the way a read does. Nothing else registers a table."""
+    async with AsyncSessionLocal() as session:
+        await catalog_service.refresh(session)
 
 
 def test_assets_is_a_view_not_a_table() -> None:
@@ -42,12 +49,14 @@ def test_writing_through_the_view_is_refused() -> None:
             )
 
 
-def test_the_view_projects_what_a_write_recorded() -> None:
-    layer = f"zz{uuid.uuid4().hex[:6]}"
+@pytest.mark.asyncio
+async def test_the_view_projects_what_a_write_recorded() -> None:
+    folder = f"zz{uuid.uuid4().hex[:6]}"
     name = f"probe_{uuid.uuid4().hex[:4]}"
 
     try:
-        obelisk.save(pl.DataFrame({"id": [1, 2, 3]}), f"{layer}.{name}", sync_postgres=False)
+        obelisk.save(pl.DataFrame({"id": [1, 2, 3]}), f"{folder}/{name}", sync_postgres=False)
+        await _project()
 
         with sqlite3.connect(settings.sqlite_db_path) as con:
             row = con.execute(
@@ -55,9 +64,9 @@ def test_the_view_projects_what_a_write_recorded() -> None:
                 (name,),
             ).fetchone()
 
-        assert row == (name, layer, 3, "parquet")
+        assert row == (name, folder, 3, "parquet")
     finally:
-        _cleanup(layer, name)
+        _cleanup(folder, name)
 
 
 def test_external_sources_do_not_appear_as_lakehouse_assets() -> None:
@@ -66,9 +75,9 @@ def test_external_sources_do_not_appear_as_lakehouse_assets() -> None:
     try:
         with sqlite3.connect(settings.sqlite_db_path) as con:
             con.execute(
-                "INSERT INTO catalog_objects (id, fqn, name, kind, backend, layer_path,"
+                "INSERT INTO catalog_objects (id, fqn, name, kind, backend,"
                 " version, created_at) VALUES (?, ?, 'orders', 'shortcut', 'postgres',"
-                " NULL, 1, CURRENT_TIMESTAMP)",
+                " 1, CURRENT_TIMESTAMP)",
                 (str(uuid.uuid4()), fqn),
             )
             con.commit()

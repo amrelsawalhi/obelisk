@@ -467,8 +467,26 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       setRunLog(null);
       const runs = await api.listPipelineExecutions({ pipeline_id: pipelineId, limit: 40 });
       setExecutions(runs);
-      const newest = runs.find((run) => TERMINAL.includes(run.status)) ?? runs[0] ?? null;
+      // A run that is still going is the most useful thing to put on screen. Attaching
+      // to it (instead of to the newest *finished* run) is what makes the logs live,
+      // and it also makes opening a pipeline mid-run mean "watch what is happening"
+      // rather than "show me the last thing that happened". Runs started from the API
+      // or from another tab are exactly the case the graph view used to miss.
+      const running = runs.find((run) => !TERMINAL.includes(run.status)) ?? null;
+      const newest =
+        running ?? runs.find((run) => TERMINAL.includes(run.status)) ?? runs[0] ?? null;
       setLatestRun(newest ? await api.getPipelineExecution(newest.id) : null);
+      if (running) {
+        const live = await api.getPipelineExecution(running.id);
+        setMonitor(live);
+        // Land on the step that is doing work, so the dock opens on output that is
+        // arriving right now instead of on a step that has not started.
+        setSelectedStepKey(
+          live.step_runs.find((step) => step.status === "running")?.step_id ??
+            live.step_runs[0]?.step_id ??
+            null,
+        );
+      }
     } catch (error) {
       toast.error(readApiError(error, "Could not load this pipeline.").message);
     } finally {

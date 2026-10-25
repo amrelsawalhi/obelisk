@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.config import settings
+from app.core.security import authorize_websocket
 
 logger = logging.getLogger(__name__)
 
@@ -235,66 +236,157 @@ def create_terminal_session(cwd: str) -> BaseTerminalSession:
         return PipeFallbackSession(cwd)
 
 
+# One shell per open tab is the intent; the cap is what keeps a forgotten tab from
+# turning into an unbounded number of processes on the host.
+_active_sessions = 0
+MAX_MESSAGE_CHARS = 65_536
+
+
+def _clamp(value: object, low: int, high: int, default: int) -> int:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
+# One shell per open tab is the intent; the cap is what keeps a forgotten tab from
+# turning into an unbounded number of processes on the host.
+_active_sessions = 0
+MAX_MESSAGE_CHARS = 65_536
+
+CRLF = chr(13) + chr(10)
+RED = chr(27) + "[31m"
+YELLOW = chr(27) + "[33m"
+RESET = chr(27) + "[0m"
+
+
+def _clamp(value: object, low: int, high: int, default: int) -> int:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
 @router.websocket("/ws")
 async def terminal_websocket(websocket: WebSocket):
-    await websocket.accept()
+    """A real shell on the host, so this is the one socket that asks who is calling.
 
-    cwd = str(settings.git_repo_path.resolve())
-    session = create_terminal_session(cwd)
+    Refusals close *before* ``accept`` so a browser gets a handshake denial instead of
+    a socket that opens and then dies. Origin is checked even while auth is off: that
+    is what stops a page on another site from driving this shell through the
+    operator's browser.
+    """
+    global _active_sessions
 
-    try:
-        await session.start(cols=100, rows=30)
-        shell_label = "PowerShell (Windows)" if sys.platform == "win32" else "bash (Linux)"
-        await websocket.send_text(json.dumps({"type": "session_info", "shell": shell_label, "os": sys.platform}))
-    except Exception as e:
-
-        logger.error(f"Failed to start terminal session: {e}", exc_info=True)
-        await websocket.send_text(f"\r\n\x1b[31mFailed to start terminal: {str(e)}\x1b[0m\r\n")
-        await websocket.close()
+    if not settings.TERMINAL_ENABLED:
+        await websocket.close(code=1008, reason="The terminal is disabled on this deployment.")
         return
 
-    # Task for reading from process and sending to client
-    async def process_to_websocket():
-        try:
-            while True:
-                output = await session.read()
-                if output is None:
-                    break
-                await websocket.send_text(output)
-        except (WebSocketDisconnect, asyncio.CancelledError):
-            pass
-        except Exception as e:
-            logger.debug(f"Terminal read loop ended: {e}")
+    principal = await authorize_websocket(websocket, "terminal")
+    if principal is None:
+        return
 
-    read_task = asyncio.create_task(process_to_websocket())
+    if _active_sessions >= max(1, int(settings.TERMINAL_MAX_SESSIONS)):
+        logger.warning("Refused terminal: %s session(s) already open.", _active_sessions)
+        await websocket.close(code=1013, reason="Too many terminal sessions open.")
+        return
+
+    await websocket.accept()
+    _active_sessions += 1
+
+    client = (
+        f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "unknown"
+    )
+    cwd = str(settings.git_repo_path.resolve())
+    logger.info("Terminal opened for %r from %s (cwd=%s)", principal.get("sub"), client, cwd)
+
+    idle_seconds = max(30, int(settings.TERMINAL_IDLE_TIMEOUT_SECONDS))
+    session = create_terminal_session(cwd)
+    read_task: Optional[asyncio.Task] = None
 
     try:
-        while True:
-            message = await websocket.receive_text()
-            # Check if message is a JSON control frame (e.g. resize)
-            if message.startswith("{") and message.endswith("}"):
+        try:
+            await session.start(cols=100, rows=30)
+        except Exception as exc:
+            logger.error("Failed to start terminal session: %s", exc, exc_info=True)
+            await websocket.send_text(
+                f"{CRLF}{RED}Failed to start terminal: {exc}{RESET}{CRLF}"
+            )
+            return
+
+        shell_label = "PowerShell (Windows)" if sys.platform == "win32" else "bash (Linux)"
+        await websocket.send_text(json.dumps({
+            "type": "session_info",
+            "shell": shell_label,
+            "os": sys.platform,
+            "principal": principal.get("sub"),
+        }))
+
+        async def process_to_websocket():
+            try:
+                while True:
+                    output = await session.read()
+                    if output is None:
+                        break
+                    await websocket.send_text(output)
+            except (WebSocketDisconnect, asyncio.CancelledError):
+                pass
+            except Exception as exc:
+                logger.debug("Terminal read loop ended: %s", exc)
+
+        read_task = asyncio.create_task(process_to_websocket())
+
+        try:
+            while True:
                 try:
-                    payload = json.loads(message)
-                    msg_type = payload.get("type")
-                    if msg_type == "resize":
-                        cols = int(payload.get("cols", 80))
-                        rows = int(payload.get("rows", 24))
-                        await session.resize(cols, rows)
-                        continue
-                    elif msg_type == "input":
-                        data = payload.get("data", "")
-                        await session.write(data)
-                        continue
-                except json.JSONDecodeError:
-                    pass
+                    message = await asyncio.wait_for(
+                        websocket.receive_text(), timeout=idle_seconds
+                    )
+                except asyncio.TimeoutError:
+                    logger.info("Terminal idle for %ss; closing.", idle_seconds)
+                    await websocket.send_text(
+                        f"{CRLF}{YELLOW}Session closed after {idle_seconds}s of inactivity.{RESET}{CRLF}"
+                    )
+                    break
 
-            # Otherwise write raw keystrokes/data to terminal
-            await session.write(message)
+                if len(message) > MAX_MESSAGE_CHARS:
+                    logger.warning("Terminal input of %s chars refused.", len(message))
+                    break
 
-    except (WebSocketDisconnect, asyncio.CancelledError):
-        pass
-    except Exception as e:
-        logger.warning(f"Terminal websocket error: {e}")
+                payload = None
+                if message.startswith("{") and message.endswith("}"):
+                    try:
+                        decoded = json.loads(message)
+                        payload = decoded if isinstance(decoded, dict) else None
+                    except json.JSONDecodeError:
+                        payload = None
+
+                if payload is not None:
+                    kind = payload.get("type")
+                    if kind == "resize":
+                        await session.resize(
+                            _clamp(payload.get("cols"), 1, 500, 80),
+                            _clamp(payload.get("rows"), 1, 200, 24),
+                        )
+                        continue
+                    if kind == "input":
+                        await session.write(str(payload.get("data", "")))
+                        continue
+
+                await session.write(message)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            logger.warning("Terminal websocket error: %s", exc)
     finally:
-        read_task.cancel()
+        if read_task is not None:
+            read_task.cancel()
         await session.close()
+        _active_sessions = max(0, _active_sessions - 1)
+        logger.info(
+            "Terminal closed for %r (%s session(s) open)",
+            principal.get("sub"),
+            _active_sessions,
+        )
