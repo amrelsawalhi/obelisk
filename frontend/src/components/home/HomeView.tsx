@@ -390,22 +390,13 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => onNavigate('pipelines')}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-50 text-slate-700 rounded-lg text-xs font-semibold border border-slate-200 transition-all shadow-2xs"
-            >
-              <span>Pipelines Orchestrator</span>
-              <ArrowUpRight className="w-3.5 h-3.5 text-slate-400" />
-            </button>
-            <button
-              onClick={() => onNavigate('pipelines')}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-xs font-semibold transition-all shadow-2xs"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Create Pipeline</span>
-            </button>
-          </div>
+          <button
+            onClick={() => onNavigate('pipelines')}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-xs font-semibold transition-all shadow-2xs"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>Create Pipeline</span>
+          </button>
         </div>
 
         {/* Card Body: Runs Table or Empty State */}
