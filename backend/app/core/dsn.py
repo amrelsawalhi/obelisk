@@ -11,6 +11,7 @@ a SQL literal. Nothing is interpolated raw.
 from __future__ import annotations
 
 import re
+from urllib.parse import quote
 
 _ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -38,6 +39,39 @@ def build_pg_dsn(**fields: object) -> str:
         for key, value in fields.items()
         if value is not None
     )
+
+
+def build_kv_dsn(**fields: object) -> str:
+    """DuckDB's ``key=value`` attach string (the mysql scanner). Same quoting as libpq."""
+    return build_pg_dsn(**fields)
+
+
+def build_mongo_uri(
+    host: str,
+    port: int,
+    *,
+    username: object = None,
+    password: object = None,
+    auth_source: str = "admin",
+) -> str:
+    """Builds a ``mongodb://`` URI with the credentials percent-encoded.
+
+    A password may contain ``@``, ``:`` or ``/`` — all of which change the meaning of a
+    URI — so it is quoted rather than interpolated. ``auth_source`` is where the user was
+    created, which is ``admin`` for every deployment this platform creates.
+    """
+    if username:
+        userinfo = quote(str(username), safe="")
+        if password is not None:
+            userinfo += ":" + quote(str(password), safe="")
+        authority = f"{userinfo}@"
+    else:
+        authority = ""
+    host = (host or "127.0.0.1").strip()
+    if ":" in host and not host.startswith("["):  # IPv6 literal
+        host = f"[{host}]"
+    query = f"?authSource={quote(str(auth_source or 'admin'), safe='')}"
+    return f"mongodb://{authority}{host}:{int(port)}{query}"
 
 
 def sql_string(value: object) -> str:

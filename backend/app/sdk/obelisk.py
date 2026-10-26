@@ -127,8 +127,8 @@ class TableWrapper:
         c = conn or _implicit_connection()
         if self._readable_file:
             return c.from_parquet(self._readable_file.resolve().as_posix())
-        for att in _get_sdk_pg_attachments(self.full_identifier):
-            duckdb_engine.attach_postgres(c, **att)
+        for attachment in _attachments_for_sql(self.full_identifier):
+            duckdb_engine.attach(c, attachment)
         return c.query(f"SELECT * FROM {self.full_identifier}")
 
     def to_spark(self, spark_session=None):
@@ -279,8 +279,8 @@ def table(identifier: str) -> TableWrapper:
             )
             raise SourceNotQueryable(
                 f"'{clean_id}' names the {source_type or 'external'} source {conn_name!r}, which "
-                f"cannot be queried live: only attached databases (PostgreSQL) have a DuckDB "
-                f"scanner; {source_type or 'this'} rows are pulled.{hint}"
+                f"cannot be queried live: DuckDB has no scanner for it (Postgres, MySQL and "
+                f"Mongo do; Oracle and SQL Server need an ODBC DSN).{hint}"
             )
         # Naming an attached source means *that* table, even if a lakehouse table happens to
         # share the leaf name.
@@ -314,40 +314,58 @@ def table(identifier: str) -> TableWrapper:
     )
 
 
-def _get_sdk_pg_attachments(sql: str) -> list:
-    """Discovers and resolves referenced PostgreSQL connections from the SQLite vault."""
-    attachments = []
+def _attachments_for_sql(sql: str) -> list:
+    """Sources the SQL names that DuckDB can attach live, credentials decrypted.
+
+    The vault is read directly because the SDK is synchronous. The *shape* of each dict
+    comes from :func:`app.core.sources.attachment_for`, so a notebook, the SQL editor and
+    the orchestrator all attach a source the same way — and a source with no scanner never
+    appears here.
+    """
+    from types import SimpleNamespace
+
+    from app.core.sources import UnsupportedSource, attachment_for, resolve_source
+    from app.core.vault import decrypt
+    from app.services.connections import is_connection_referenced
+
+    attachments: list = []
     try:
-        import re
-        from app.core.vault import decrypt
-        from app.core.host_resolver import resolve_connection_host
         db_path = settings.sqlite_db_path
         if not Path(db_path).exists():
             return attachments
         with sqlite3.connect(db_path, timeout=5.0) as con:
-            cur = con.cursor()
-            rows = cur.execute(
-                "SELECT name, host, port, database, username, encrypted_credentials, options FROM connections WHERE source_type = 'postgres';"
+            rows = con.execute(
+                "SELECT name, source_type, driver, host, port, database, username, "
+                "encrypted_credentials, options, read_only FROM connections;"
             ).fetchall()
-            for name, host, port, dbname, user, enc_pw, options_json in rows:
-                alias = re.sub(r"[^a-zA-Z0-9_]", "_", name.lower())
-                clean_sql = re.sub(r"--[^\n]*", "", sql)
-                clean_sql = re.sub(r"/\*.*?\*/", "", clean_sql, flags=re.DOTALL)
-                tokens = set(re.findall(r"[a-zA-Z0-9_]+", clean_sql.lower()))
-                if alias.lower() in tokens or (dbname and dbname.lower() in tokens):
-                    pw = decrypt(enc_pw)
-                    opts = json.loads(options_json) if options_json else {}
-                    attachments.append({
-                        "alias": alias,
-                        "host": resolve_connection_host(host, int(port)),
-                        "port": int(port),
-                        "database": dbname,
-                        "username": user,
-                        "password": pw,
-                        "sslmode": opts.get("sslmode", "disable"),
-                    })
     except Exception:
-        pass
+        return attachments
+
+    for row in rows:
+        (name, source_type, driver, host, port, database, username,
+         enc_pw, options_json, read_only) = row
+        connection = SimpleNamespace(
+            name=name,
+            source_type=source_type,
+            driver=driver,
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            options=json.loads(options_json) if options_json else {},
+            read_only=None if read_only is None else bool(read_only),
+        )
+        try:
+            recipe = resolve_source(connection)
+        except UnsupportedSource:
+            continue
+        if not recipe.is_attachable:
+            continue
+        if not is_connection_referenced(sql, recipe.alias, database):
+            continue
+        attachments.append(
+            attachment_for(recipe, connection, password=decrypt(enc_pw))
+        )
     return attachments
 
 
@@ -356,17 +374,8 @@ def query(sql: str) -> pl.DataFrame:
     conn = duckdb_engine.get_connection()
     try:
         storage_path = duckdb_engine._ensure_storage()
-        for att in _get_sdk_pg_attachments(sql):
-            duckdb_engine.attach_postgres(
-                conn=conn,
-                alias=att["alias"],
-                host=att["host"],
-                port=att["port"],
-                database=att["database"],
-                username=att["username"],
-                password=att["password"],
-                sslmode=att.get("sslmode", "disable"),
-            )
+        for attachment in _attachments_for_sql(sql):
+            duckdb_engine.attach(conn, attachment)
         exec_sql = duckdb_engine._prepare_sql_and_views(conn, sql, storage_path)
         rel = conn.sql(exec_sql)
         if rel is None:
@@ -382,17 +391,8 @@ def query_arrow(sql: str) -> pa.Table:
     conn = duckdb_engine.get_connection()
     try:
         storage_path = duckdb_engine._ensure_storage()
-        for att in _get_sdk_pg_attachments(sql):
-            duckdb_engine.attach_postgres(
-                conn=conn,
-                alias=att["alias"],
-                host=att["host"],
-                port=att["port"],
-                database=att["database"],
-                username=att["username"],
-                password=att["password"],
-                sslmode=att.get("sslmode", "disable"),
-            )
+        for attachment in _attachments_for_sql(sql):
+            duckdb_engine.attach(conn, attachment)
         exec_sql = duckdb_engine._prepare_sql_and_views(conn, sql, storage_path)
         rel = conn.sql(exec_sql)
         if rel is None:

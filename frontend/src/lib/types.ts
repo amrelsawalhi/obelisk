@@ -190,7 +190,7 @@ export interface CreateConnectionRequest {
   username: string;
   password?: string;
   options?: Record<string, unknown>;
-  /** Omit to let the driver decide (postgres read-only, everything else writable). */
+  /** Omit to let the driver decide (an attached source is read-only, a pulled one is not). */
   read_only?: boolean;
 }
 

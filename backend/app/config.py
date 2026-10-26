@@ -132,6 +132,16 @@ class Settings(BaseSettings):
     DUCKDB_THREADS: int | None = Field(
         default_factory=lambda: int(os.getenv("DUCKDB_THREADS", "0")) or None
     )
+    # DuckDB's community repository hosts the *mongo* scanner; installing from it runs
+    # unsigned code downloaded at startup (core scanners — postgres, mysql, sqlite, odbc —
+    # are signed and unaffected). Off means a MongoDB source stays pull-only, and nothing
+    # is downloaded.
+    ALLOW_COMMUNITY_EXTENSIONS: bool = Field(
+        default_factory=lambda: os.getenv(
+            "OBELISK_ALLOW_COMMUNITY_EXTENSIONS", "true"
+        ).lower()
+        in ("1", "true", "yes", "on")
+    )
     DUCKDB_TEMP_SIZE_LIMIT: str = Field(
         default_factory=lambda: os.getenv("DUCKDB_TEMP_SIZE_LIMIT", "50GB")
     )

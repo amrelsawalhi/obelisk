@@ -30,14 +30,17 @@ HTTP = "http"
 DRIVERS: tuple[str, ...] = (ATTACH, SDK, HTTP)
 
 _DRIVER_BY_SOURCE_TYPE: dict[str, str] = {
-    # DuckDB has a native postgres scanner, so these never need a copy.
+    # DuckDB reads these live through a scanner of its own, so they never need a copy:
+    # postgres (core), mysql/mariadb (core ``mysql``), mongo (community ``mongo``).
     "postgres": ATTACH,
     "postgresql": ATTACH,
-    # Client libraries only — no attach path exists yet.
-    "mysql": SDK,
-    "mariadb": SDK,
-    "mongodb": SDK,
-    "mongo": SDK,
+    "mysql": ATTACH,
+    "mariadb": ATTACH,
+    "mongodb": ATTACH,
+    "mongo": ATTACH,
+    # No scanner ships with DuckDB for these. Oracle and SQL Server are reachable through
+    # the ODBC extension, but only when the operator has installed a driver and a DSN — a
+    # prerequisite the connection row cannot express, so they stay pulled until it can.
     "oracle": SDK,
     "sqlserver": SDK,
     "mssql": SDK,
@@ -46,6 +49,17 @@ _DRIVER_BY_SOURCE_TYPE: dict[str, str] = {
     "rest": HTTP,
     "rest_api": HTTP,
     "erp": HTTP,
+}
+
+# Which scanner reaches an attachable source. The engine dispatches on this value, so a
+# new scanner is a registry entry rather than a new branch at every call site.
+_ATTACH_FAMILY: dict[str, str] = {
+    "postgres": "postgres",
+    "postgresql": "postgres",
+    "mysql": "mysql",
+    "mariadb": "mysql",
+    "mongodb": "mongo",
+    "mongo": "mongo",
 }
 
 _CAPABILITIES: dict[str, tuple[str, ...]] = {
@@ -84,6 +98,7 @@ class Recipe:
     alias: str
     capabilities: tuple[str, ...]
     read_only: bool
+    attach_family: str = ""
 
     @property
     def is_attachable(self) -> bool:
@@ -99,6 +114,7 @@ class Recipe:
             "alias": self.alias,
             "capabilities": list(self.capabilities),
             "read_only": self.read_only,
+            "attach_family": self.attach_family,
         }
 
 
@@ -119,6 +135,60 @@ def capabilities_for(driver: str) -> tuple[str, ...]:
     return _CAPABILITIES[driver]
 
 
+def attach_family(source_type: str) -> str:
+    """The DuckDB scanner that reaches this source live, or ``""`` when none exists."""
+    return _ATTACH_FAMILY.get((source_type or "").lower().strip(), "")
+
+
+def attachment_for(recipe: Recipe, connection: Any, *, password: str) -> dict[str, Any]:
+    """The dict :meth:`DuckDBEngine.attach` needs, credentials already decrypted.
+
+    One shape for every scanner: ``kind`` selects the helper and only the keys that
+    scanner accepts are present, so a Mongo URI never travels as a password field and a
+    MySQL attach never receives a ``sslmode`` it would reject.
+    """
+    from app.core.dsn import build_mongo_uri
+    from app.core.host_resolver import resolve_connection_host
+
+    host = resolve_connection_host(getattr(connection, "host", "127.0.0.1"),
+                                   getattr(connection, "port", 0) or 0)
+    options = dict(getattr(connection, "options", None) or {})
+    family = recipe.attach_family
+    base: dict[str, Any] = {"kind": family, "alias": recipe.alias}
+
+    if family == "mongo":
+        return {
+            **base,
+            "uri": build_mongo_uri(
+                host,
+                int(getattr(connection, "port", 0) or 27017),
+                username=getattr(connection, "username", None),
+                password=password,
+                auth_source=options.get("auth_source", "admin"),
+            ),
+        }
+    if family == "mysql":
+        return {
+            **base,
+            "host": host,
+            "port": int(getattr(connection, "port", 0) or 3306),
+            "database": getattr(connection, "database", None),
+            "username": getattr(connection, "username", None),
+            "password": password,
+            "connect_timeout": int(options.get("connect_timeout", 8)),
+        }
+    return {
+        **base,
+        "host": host,
+        "port": int(getattr(connection, "port", 0) or 5432),
+        "database": getattr(connection, "database", None),
+        "username": getattr(connection, "username", None),
+        "password": password,
+        "sslmode": options.get("sslmode", "disable"),
+        "connect_timeout": int(options.get("connect_timeout", 8)),
+    }
+
+
 def resolve_source(connection: Any) -> Recipe:
     """Builds the :class:`Recipe` for a ``Connection`` row (or any duck-typed one).
 
@@ -133,6 +203,12 @@ def resolve_source(connection: Any) -> Recipe:
         raise UnsupportedSource(
             f"Connection driver {driver!r} is not one of {DRIVERS}."
         )
+    family = attach_family(source_type)
+    if driver == ATTACH and not family:
+        raise UnsupportedSource(
+            f"{source_type!r} has no DuckDB scanner, so it cannot be attached; "
+            f"use the {SDK!r} driver."
+        )
 
     read_only = getattr(connection, "read_only", None)
     if read_only is None:
@@ -144,6 +220,7 @@ def resolve_source(connection: Any) -> Recipe:
         alias=connection_alias(getattr(connection, "name", "")),
         capabilities=capabilities_for(driver),
         read_only=bool(read_only),
+        attach_family=family if driver == ATTACH else "",
     )
 
 

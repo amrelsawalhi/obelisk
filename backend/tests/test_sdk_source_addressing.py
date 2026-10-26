@@ -1,10 +1,9 @@
 """Reading a source table through the SDK: attached or refused, never a mystery.
 
-`obelisk.table("mongo_telemetry_source.sourcedb.sessions")` used to hand the identifier
-straight to DuckDB, which answered ``schema "mongo_telemetry_source.sourcedb" does not
-exist``. The truth is that only PostgreSQL has a DuckDB scanner; Mongo/MySQL/Oracle/HTTP
-sources have to be ingested into the lakehouse before SQL can see them, so the SDK says
-that — and points at the lakehouse table when one already exists.
+`obelisk.table("<source>.db.table")` must answer one of two things. For a source DuckDB can
+scan (postgres, mysql, mongo) it returns a wrapper that attaches on read; for one it cannot
+(Oracle, SQL Server — reachable only through an operator-installed ODBC DSN) it says why,
+instead of handing the identifier to DuckDB and printing ``schema "..." does not exist``.
 """
 from __future__ import annotations
 
@@ -49,29 +48,29 @@ async def _delete(conn_id: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_pulled_source_is_refused_with_the_reason() -> None:
-    mongo = await _create("mongodb")
+async def test_a_scanner_less_source_is_refused_with_the_reason() -> None:
+    oracle = await _create("oracle", port=1521)
     try:
         with pytest.raises(SourceNotQueryable) as exc:
-            obelisk.table(f"{mongo['name']}.sourcedb.sessions")
+            obelisk.table(f"{oracle['name']}.ORCL.SESSIONS")
         message = str(exc.value)
         assert "cannot be queried live" in message
         assert "Ingest" in message
     finally:
-        await _delete(mongo["id"])
+        await _delete(oracle["id"])
 
 
 @pytest.mark.asyncio
 async def test_the_refusal_points_at_the_lakehouse_table_when_it_exists() -> None:
     layer = unique_name("zzsdk")
-    mongo = await _create("mongodb")
+    oracle = await _create("oracle", port=1521)
     write_table(f"{layer}/sessions.parquet", pa.table({"id": [1, 2, 3]}))
     try:
         with pytest.raises(SourceNotQueryable) as exc:
-            obelisk.table(f"{mongo['name']}.sourcedb.sessions")
+            obelisk.table(f"{oracle['name']}.ORCL.sessions")
         assert f"lakehouse.{layer}.sessions" in str(exc.value)
     finally:
-        await _delete(mongo["id"])
+        await _delete(oracle["id"])
         drop_schema(layer)
 
 
@@ -86,11 +85,13 @@ def test_a_lakehouse_table_still_reads_normally() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_postgres_source_is_still_treated_as_attachable() -> None:
-    """The refusal is about capability, not about naming a connection."""
-    postgres = await _create("postgres", port=5432)
+@pytest.mark.parametrize("source_type", ["postgres", "mysql", "mongodb"])
+async def test_a_scannable_source_is_addressed_as_that_source(source_type: str) -> None:
+    """A live source wins over a lakehouse table that happens to share the leaf name."""
+    created = await _create(source_type)
     try:
-        wrapper = obelisk.table(f"{postgres['name']}.public.orders")
-        assert postgres["name"] in wrapper.full_identifier
+        wrapper = obelisk.table(f"{created['name']}.sourcedb.sessions")
+        assert wrapper.full_identifier == f"{created['name']}.sourcedb.sessions"
+        assert wrapper.file_path is None
     finally:
-        await _delete(postgres["id"])
+        await _delete(created["id"])

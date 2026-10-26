@@ -14,7 +14,7 @@ from app.core.vault import decrypt
 from app.engines.duckdb_engine import duckdb_engine
 from app.engines.native_query_engine import native_query_engine
 from app.core.docker_manager import docker_mgr
-from app.services.connections import attachable_postgres_attachments
+from app.services.connections import attachable_attachments
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 
 router = APIRouter(prefix="/api/query", tags=["query"])
@@ -325,16 +325,16 @@ async def execute_sql(
             )
 
     # Route 2: DuckDB In-Process Engine (Default)
-    pg_attachments = req.postgres_attachments
-    if pg_attachments is None:
-        pg_attachments = await attachable_postgres_attachments(db, sql=req.sql)
+    attachments = req.postgres_attachments
+    if attachments is None:
+        attachments = await attachable_attachments(db, sql=req.sql)
 
     try:
         res = await asyncio.wait_for(
             asyncio.to_thread(
                 duckdb_engine.execute_query,
                 sql=req.sql,
-                postgres_attachments=pg_attachments,
+                attachments=attachments,
             ),
             timeout=float(req.timeout_seconds),
         )
@@ -386,16 +386,16 @@ async def export_sql_results(
             detail=f"Unsupported export format '{req.format}'. Supported: 'parquet', 'csv'",
         )
 
-    pg_attachments = req.postgres_attachments
-    if pg_attachments is None:
-        pg_attachments = await attachable_postgres_attachments(db, sql=req.sql)
+    attachments = req.postgres_attachments
+    if attachments is None:
+        attachments = await attachable_attachments(db, sql=req.sql)
 
     try:
         data_bytes = await asyncio.to_thread(
             duckdb_engine.export_query,
             sql=req.sql,
             output_format=fmt,
-            postgres_attachments=pg_attachments,
+            attachments=attachments,
         )
     except Exception as e:
         raise HTTPException(

@@ -25,9 +25,12 @@ class DuckDBEngine:
     In-process DuckDB analytical engine with:
     - Zero-cost storage URI integration (reads from settings.duckdb_storage_path)
     - Dynamic memory sizing via ResourceAdvisor
-    - Dynamic scanner attaching for PostgreSQL (ATTACH ... TYPE POSTGRES)
+    - Dynamic scanner attaching (PostgreSQL, MySQL, MongoDB)
     - Non-blocking query execution & Parquet/CSV streaming exports
     """
+
+    # Scanners DuckDB keeps in its community repository rather than the signed core.
+    COMMUNITY_EXTENSIONS: tuple[str, ...] = ("mongo",)
 
     def __init__(self):
         self._ensure_storage()
@@ -130,6 +133,130 @@ class DuckDBEngine:
             )
         else:
             conn.execute(f"ATTACH {sql_string(dsn)} AS {safe_alias} (TYPE POSTGRES);")
+
+    def attach_mysql(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        alias: str,
+        host: str,
+        port: int,
+        database: Optional[str],
+        username: Optional[str],
+        password: Optional[str],
+        connect_timeout: int = 8,
+    ) -> None:
+        """Attaches a MySQL/MariaDB database through DuckDB's own ``mysql`` scanner.
+
+        ``READ_ONLY`` is not decoration: DuckDB can ``INSERT`` through this scanner, and a
+        source attached by the platform is a source it does not own.
+        """
+        try:
+            conn.execute("LOAD mysql;")
+        except Exception:
+            try:
+                conn.execute("INSTALL mysql; LOAD mysql;")
+            except Exception as exc:
+                logger.debug("DuckDB mysql extension load failed: %s", exc)
+
+        from app.core.dsn import build_kv_dsn, sql_string, validate_alias
+        from app.core.host_resolver import resolve_connection_host
+
+        dsn = build_kv_dsn(
+            host=resolve_connection_host(host, port),
+            port=port,
+            database=database,
+            user=username,
+            password=password,
+            connect_timeout=connect_timeout,
+        )
+        safe_alias = validate_alias(alias)
+        conn.execute(
+            f"ATTACH {sql_string(dsn)} AS {safe_alias} (TYPE MYSQL, READ_ONLY);"
+        )
+
+    def attach_mongo(self, conn: duckdb.DuckDBPyConnection, alias: str, uri: str) -> None:
+        """Attaches a MongoDB deployment through the community ``mongo`` scanner.
+
+        Only ``LOAD`` happens here. ``INSTALL`` needs ``allow_unsigned_extensions``, which
+        DuckDB refuses to change once a database is running, so the install is a startup
+        step (:meth:`install_community_extensions`) and a session can only load a scanner
+        that is already on disk.
+        """
+        try:
+            conn.execute("LOAD mongo;")
+        except Exception as exc:
+            raise RuntimeError(
+                "The mongo scanner is not installed, so this source cannot be attached. "
+                "Start the backend once with network access (and "
+                "OBELISK_ALLOW_COMMUNITY_EXTENSIONS=true), or keep the source pull-only."
+            ) from exc
+
+        from app.core.dsn import sql_string, validate_alias
+
+        safe_alias = validate_alias(alias)
+        conn.execute(
+            f"ATTACH {sql_string(uri)} AS {safe_alias} (TYPE MONGO, READ_ONLY);"
+        )
+
+    def attach(
+        self, conn: duckdb.DuckDBPyConnection, attachment: Dict[str, Any]
+    ) -> None:
+        """Attaches one dict from :func:`app.core.sources.attachment_for`.
+
+        A dict without ``kind`` is the pre-MySQL shape, which could only ever mean
+        Postgres, so it is still accepted: the notebooks and the editor ship their own
+        helper, and an out-of-tree caller should not break because a scanner was added.
+        """
+        kind = attachment.get("kind") or "postgres"
+        fields = {key: value for key, value in attachment.items() if key != "kind"}
+        if kind == "mongo":
+            self.attach_mongo(conn, uri=fields.pop("uri"), **fields)
+        elif kind == "mysql":
+            self.attach_mysql(conn, **fields)
+        elif kind == "postgres":
+            self.attach_postgres(conn, **fields)
+        else:
+            raise ValueError(
+                f"Unknown attachment kind {kind!r}; expected postgres, mysql or mongo."
+            )
+
+    def install_community_extensions(self) -> List[str]:
+        """Installs the community scanners once, where the unsigned flag can be set.
+
+        ``allow_unsigned_extensions`` is a connection-level config that cannot be changed
+        while a database runs, so this opens its own short-lived connection, installs, and
+        closes it. Sessions then load a signed-on-disk copy without the flag. Failure is
+        logged, not fatal: an air-gapped install simply keeps such sources pull-only.
+        """
+        if not settings.ALLOW_COMMUNITY_EXTENSIONS:
+            logger.info(
+                "Community DuckDB extensions are disabled; MongoDB sources stay pull-only."
+            )
+            return []
+
+        installed: List[str] = []
+        for name in self.COMMUNITY_EXTENSIONS:
+            try:
+                con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+            except Exception as exc:
+                logger.warning("Could not open a connection to install %s: %s", name, exc)
+                continue
+            try:
+                try:
+                    con.execute(f"LOAD {name};")
+                except Exception:
+                    con.execute(f"INSTALL {name} FROM community; LOAD {name};")
+                installed.append(name)
+            except Exception as exc:
+                logger.warning(
+                    "DuckDB community extension %r is unavailable (%s); sources that need "
+                    "it stay pull-only.",
+                    name,
+                    exc,
+                )
+            finally:
+                con.close()
+        return installed
 
     def _lakehouse_tables(self, conn: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
         """``(schema, table)`` pairs the catalog knows about."""
@@ -271,32 +398,24 @@ class DuckDBEngine:
     def execute_query(
         self,
         sql: str,
+        attachments: Optional[List[Dict[str, Any]]] = None,
         postgres_attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Executes a SQL query against DuckDB in a thread-safe synchronous runner.
         Can resolve tables in Bronze Parquet directly via read_parquet() or table name.
+
+        ``attachments`` carries one dict per source to attach (see
+        :func:`app.core.sources.attachment_for`); ``postgres_attachments`` is the old name
+        and is still accepted so an out-of-tree caller keeps working.
         """
         start_time = time.time()
         storage_path = self._ensure_storage()
         conn = self.get_connection()
 
         try:
-            # Attach any requested PostgreSQL sources
-            if postgres_attachments:
-                for att in postgres_attachments:
-                    self.attach_postgres(
-                        conn=conn,
-                        alias=att["alias"],
-                        host=att["host"],
-                        port=att["port"],
-                        database=att["database"],
-                        username=att["username"],
-                        password=att["password"],
-                        schema=att.get("schema"),
-                        sslmode=att.get("sslmode", "disable"),
-                        connect_timeout=att.get("connect_timeout", 8),
-                    )
+            for attachment in attachments or postgres_attachments or []:
+                self.attach(conn, attachment)
 
             # Register bronze parquet views and normalize relative paths
             exec_sql = self._prepare_sql_and_views(conn, sql, storage_path)
@@ -333,26 +452,15 @@ class DuckDBEngine:
         self,
         sql: str,
         output_format: str = "parquet",
+        attachments: Optional[List[Dict[str, Any]]] = None,
         postgres_attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> bytes:
         """Executes a query and returns the serialized result as Parquet or CSV bytes."""
         storage_path = self._ensure_storage()
         conn = self.get_connection()
         try:
-            if postgres_attachments:
-                for att in postgres_attachments:
-                    self.attach_postgres(
-                        conn=conn,
-                        alias=att["alias"],
-                        host=att["host"],
-                        port=att["port"],
-                        database=att["database"],
-                        username=att["username"],
-                        password=att["password"],
-                        schema=att.get("schema"),
-                        sslmode=att.get("sslmode", "disable"),
-                        connect_timeout=att.get("connect_timeout", 8),
-                    )
+            for attachment in attachments or postgres_attachments or []:
+                self.attach(conn, attachment)
 
             # Register bronze parquet views and normalize relative paths
             exec_sql = self._prepare_sql_and_views(conn, sql, storage_path)

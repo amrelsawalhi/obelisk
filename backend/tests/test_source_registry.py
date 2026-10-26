@@ -48,8 +48,12 @@ def _connection(source_type: str = "postgres", **overrides) -> SimpleNamespace:
     [
         ("postgres", ATTACH),
         ("postgresql", ATTACH),
-        ("mysql", SDK),
-        ("mongodb", SDK),
+        # DuckDB has a scanner for these: core ``mysql`` and community ``mongo``.
+        ("mysql", ATTACH),
+        ("mariadb", ATTACH),
+        ("mongodb", ATTACH),
+        ("mongo", ATTACH),
+        # No scanner ships with DuckDB; these are reached through a client library.
         ("oracle", SDK),
         ("sqlserver", SDK),
         ("api", HTTP),
@@ -76,15 +80,30 @@ def test_unknown_source_type_raises_instead_of_guessing() -> None:
 
 
 def test_pinned_driver_wins_over_inference() -> None:
-    recipe = resolve_source(_connection("mysql", driver="attach"))
-    assert recipe.driver == ATTACH
+    recipe = resolve_source(_connection("mysql", driver="sdk"))
+    assert recipe.driver == SDK
     # ... and an explicit read_only=False is respected even for an attach driver.
     assert resolve_source(_connection("postgres", read_only=False)).read_only is False
 
 
+def test_pinning_attach_on_a_scannerless_source_is_refused() -> None:
+    """Attaching Oracle would fail at query time; say so when the pin is made."""
+    with pytest.raises(UnsupportedSource):
+        resolve_source(_connection("oracle", driver="attach"))
+
+
 def test_sdk_and_http_are_not_attachable() -> None:
-    assert resolve_source(_connection("mysql")).is_attachable is False
+    assert resolve_source(_connection("oracle")).is_attachable is False
     assert resolve_source(_connection("api")).is_attachable is False
+
+
+def test_attach_family_names_the_scanner() -> None:
+    """The engine dispatches on this, so each attachable type must name its scanner."""
+    assert resolve_source(_connection("postgres")).attach_family == "postgres"
+    assert resolve_source(_connection("mysql")).attach_family == "mysql"
+    assert resolve_source(_connection("mongodb")).attach_family == "mongo"
+    # A source that is pulled has no scanner, and says so rather than guessing.
+    assert resolve_source(_connection("oracle", driver="sdk")).attach_family == ""
 
 
 def test_alias_is_safe_and_stable() -> None:
@@ -150,17 +169,18 @@ async def test_reconcile_records_shortcuts_and_prunes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reconcile_marks_pulled_sources_external() -> None:
-    conn = _connection("mysql")
+async def test_reconcile_marks_scanner_less_sources_external() -> None:
+    """A source DuckDB cannot scan is catalogued as something to pull, not to query."""
+    conn = _connection("oracle")
     alias = connection_alias(conn.name)
     try:
         async with AsyncSessionLocal() as session:
             result = await catalog_service.reconcile_connection(
-                session, conn, [{"name": "customers", "schema_name": "shop"}]
+                session, conn, [{"name": "customers", "schema_name": "SHOP"}]
             )
             assert result["kind"] == "external"
             row = (await catalog_service.list_objects(session, connection_id=conn.id))[0]
-            assert row.fqn == f"{alias}.shop.customers"
+            assert row.fqn == f"{alias}.SHOP.customers"
             assert row.kind == "external"
             assert "pushdown" not in (row.capabilities_json or [])
     finally:
@@ -217,9 +237,18 @@ async def test_create_connection_records_the_recipe() -> None:
             json=_payload(source_type="mysql", port=3306, database="shop"),
         )
         assert mysql.status_code == 200, mysql.text
-        assert mysql.json()["driver"] == "sdk"
-        assert mysql.json()["read_only"] is False
+        assert mysql.json()["driver"] == "attach"
+        assert mysql.json()["read_only"] is True
         await client.delete(f"/api/catalog/connections/{mysql.json()['id']}")
+
+        # Oracle has no DuckDB scanner, so it stays a pulled source.
+        oracle = await client.post(
+            "/api/catalog/connections",
+            json=_payload(source_type="oracle", port=1521, database="orcl"),
+        )
+        assert oracle.status_code == 200, oracle.text
+        assert oracle.json()["driver"] == "sdk"
+        await client.delete(f"/api/catalog/connections/{oracle.json()['id']}")
 
 
 @pytest.mark.asyncio

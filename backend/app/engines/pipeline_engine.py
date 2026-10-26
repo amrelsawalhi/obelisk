@@ -1440,7 +1440,7 @@ class PipelineEngine:
         if isinstance(materialize, dict) and materialize.get("name"):
             return await self._materialize_sql(sql, materialize, log, timeout)
 
-        attachments = await self._postgres_attachments(sql)
+        attachments = await self._live_attachments(sql)
         result = await asyncio.wait_for(
             asyncio.to_thread(duckdb_engine.execute_query, sql, attachments),
             timeout=timeout,
@@ -1452,7 +1452,7 @@ class PipelineEngine:
             log.append(str(row))
         return {"rows": {"type": "scalar", "value": rows}}
 
-    async def _postgres_attachments(self, sql: str) -> List[Dict[str, Any]]:
+    async def _live_attachments(self, sql: str) -> List[Dict[str, Any]]:
         """The live sources this SQL references, so a raw_sql step can federate.
 
         The editor and the notebook SDK already resolve this; the orchestrator is the
@@ -1460,11 +1460,11 @@ class PipelineEngine:
         copy of it. A metadata read that fails yields no attachments rather than failing
         the step: the SQL then fails loudly on its own if it truly needed the source.
         """
-        from app.services.connections import attachable_postgres_attachments
+        from app.services.connections import attachable_attachments
 
         try:
             async with AsyncSessionLocal() as session:
-                return await attachable_postgres_attachments(session, sql=sql)
+                return await attachable_attachments(session, sql=sql)
         except Exception as exc:
             logger.warning("Could not resolve live sources for raw SQL: %s", exc)
             return []

@@ -90,6 +90,10 @@ async def lifespan(app: FastAPI):
         # ducklake extension, rather than at somebody's first query.
         from app.engines.duckdb_engine import duckdb_engine
         await asyncio.to_thread(lambda: duckdb_engine.get_connection().close())
+        # Community scanners (mongo) are installed here, where the unsigned-extension flag
+        # can be set; sessions only ever LOAD what startup put on disk. Failure is logged
+        # and MongoDB sources stay pull-only rather than the app refusing to boot.
+        await asyncio.to_thread(duckdb_engine.install_community_extensions)
         # Initialize SQLite database and enforce WAL mode
         await init_db()
         # Close out runs killed by the previous shutdown and reload recent history, so a
