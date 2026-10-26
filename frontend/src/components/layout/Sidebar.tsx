@@ -133,7 +133,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
         ))}
       </nav>
 
-      {/* Footer Workspace & Node Status */}
+      {/* Footer Workspace Status */}
       <div className="p-3 border-t border-slate-200/80 bg-slate-50/50">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2 min-w-0">
@@ -141,13 +141,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
               <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
             </span>
-            <div className="truncate">
-              <p className="text-xs font-semibold text-slate-800 leading-tight">DuckDB Lakehouse</p>
-              <p className="text-[10px] text-slate-400 leading-tight">Air-Gapped Node</p>
-            </div>
+            <span className="text-xs font-semibold text-slate-800 leading-tight truncate">
+              DuckDB Lakehouse
+            </span>
           </div>
-          <span className="text-[10px] font-mono text-slate-500 bg-white border border-slate-200/80 px-1.5 py-0.5 rounded shadow-2xs shrink-0">
-            v0.1.0
+          <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200/80 px-2 py-0.5 rounded-full shrink-0">
+            Online
           </span>
         </div>
       </div>
