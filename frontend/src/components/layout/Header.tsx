@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Search, HardDrive, Cpu, Activity, Plus, ChevronDown, Sparkles, ExternalLink } from 'lucide-react';
+import { Search, HardDrive, Cpu, Activity, ChevronDown, Sparkles, ExternalLink } from 'lucide-react';
 import { useTelemetry } from '../../lib/useTelemetry';
 import { MOD_KEY } from '../../lib/platform';
 import type { NavigationTab } from './Sidebar';
@@ -87,19 +87,8 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
         <p className="text-xs text-slate-500 font-normal">{current.subtitle}</p>
       </div>
 
-      {/* Right Controls: New Query, Search, & Interactive Engine Popover */}
+      {/* Right Controls: Search & Interactive Engine Popover */}
       <div className="flex items-center gap-2.5">
-        {/* Quick Action: New Query */}
-        {onNavigate && activeTab !== 'query' && (
-          <button
-            onClick={() => onNavigate('query')}
-            className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 hover:bg-sky-700 active:bg-sky-800 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span>New Query</span>
-          </button>
-        )}
-
         {/* Cmd+K Search Trigger */}
         <button
           onClick={onOpenCommand}

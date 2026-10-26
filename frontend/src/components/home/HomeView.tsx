@@ -10,9 +10,6 @@ import {
   BookOpen,
   Terminal,
   Plus,
-  Code2,
-  Boxes,
-  GitFork,
   Sparkles,
 } from 'lucide-react';
 import { useTelemetry } from '../../lib/useTelemetry';
@@ -107,109 +104,34 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
 
   const runningServicesCount = services.filter((s) => s.status === 'running' || s.status === 'connected').length;
 
-  const quickActions = [
-    {
-      title: 'Query Studio',
-      description: 'Run high-speed analytical SQL queries on DuckDB',
-      icon: Code2,
-      tab: 'query' as NavigationTab,
-      badge: 'SQL Editor',
-      color: 'text-sky-600 bg-sky-50 border-sky-100 hover:border-sky-300',
-    },
-    {
-      title: 'Data Catalog',
-      description: 'Explore schemas, ingest Parquet/CSV, or attach databases',
-      icon: Database,
-      tab: 'catalog' as NavigationTab,
-      badge: 'Lakehouse',
-      color: 'text-emerald-600 bg-emerald-50 border-emerald-100 hover:border-emerald-300',
-    },
-    {
-      title: 'dbt Studio',
-      description: 'Build transformation models with live SQL and lineage',
-      icon: Boxes,
-      tab: 'dbt' as NavigationTab,
-      badge: 'Transform',
-      color: 'text-purple-600 bg-purple-50 border-purple-100 hover:border-purple-300',
-    },
-    {
-      title: 'Pipelines',
-      description: 'Orchestrate multi-step DAG workflows and schedules',
-      icon: GitFork,
-      tab: 'pipelines' as NavigationTab,
-      badge: 'Automate',
-      color: 'text-amber-600 bg-amber-50 border-amber-100 hover:border-amber-300',
-    },
-  ];
-
   return (
-    <div className="flex-1 overflow-y-auto bg-slate-50/50 p-6 space-y-6">
-      {/* 1. Quick Actions Hub */}
-      <div>
-        <div className="flex items-center justify-between mb-3">
-          <div>
-            <h2 className="text-sm font-bold text-slate-900 tracking-tight">Quick Workflows</h2>
-            <p className="text-xs text-slate-500">Jump directly into analytics, data modeling, or pipeline orchestration</p>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
-          {quickActions.map((action) => {
-            const Icon = action.icon;
-            return (
-              <button
-                key={action.tab}
-                onClick={() => onNavigate(action.tab)}
-                className={`p-4 rounded-xl border bg-white shadow-2xs hover:shadow-md transition-all text-left flex flex-col justify-between group ${action.color}`}
-              >
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="p-2 rounded-lg bg-white border border-slate-200/80 shadow-2xs">
-                      <Icon className="w-4 h-4" />
-                    </span>
-                    <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 font-mono px-2 py-0.5 rounded-md bg-slate-100/80">
-                      {action.badge}
-                    </span>
-                  </div>
-                  <h3 className="font-bold text-slate-900 text-sm group-hover:text-sky-600 transition-colors">
-                    {action.title}
-                  </h3>
-                  <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                    {action.description}
-                  </p>
-                </div>
-                <div className="mt-3 pt-2.5 border-t border-slate-100 flex items-center justify-between text-xs font-semibold text-slate-600 group-hover:text-sky-600">
-                  <span>Open workspace</span>
-                  <ArrowUpRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
-                </div>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* 2. Platform Key Metrics */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
+    <div className="flex-1 overflow-y-auto bg-slate-100/75 p-6 space-y-6">
+      {/* 1. Platform Key Metrics (Distinct cards with contrast against slate-100 canvas) */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
         {/* Data Sources */}
         <div
           onClick={() => onNavigate('catalog')}
-          className="p-4 rounded-xl border border-slate-200 bg-white hover:border-slate-300 transition-all cursor-pointer group shadow-2xs"
+          className="p-5 rounded-xl border border-slate-200/90 bg-white hover:border-sky-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-slate-600">Data Sources</span>
-            <Database className="w-4 h-4 text-sky-600 group-hover:scale-110 transition-transform" />
+            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+              Data Sources
+            </span>
+            <span className="p-2 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80 group-hover:scale-105 transition-transform">
+              <Database className="w-4 h-4" />
+            </span>
           </div>
-          <div className="text-2xl font-bold font-mono text-slate-900 mt-1.5">
+          <div className="text-3xl font-extrabold font-mono text-slate-900 mt-2">
             {externalConnsCount}
           </div>
-          <div className="mt-2 pt-2 border-t border-slate-100 text-[11px] text-slate-500 truncate flex items-center gap-1.5">
+          <div className="mt-3 pt-2.5 border-t border-slate-100 text-xs text-slate-500 truncate flex items-center gap-1.5">
             {externalConnsCount > 0 ? (
               <>
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                <span className="font-medium text-emerald-700">{sourceTypesSummary}</span>
+                <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
+                <span className="font-semibold text-emerald-700 truncate">{sourceTypesSummary}</span>
               </>
             ) : (
-              <span>Lakehouse active • No external DBs</span>
+              <span className="text-slate-400">Lakehouse active • No external DBs</span>
             )}
           </div>
         </div>
@@ -217,66 +139,96 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         {/* Pipelines */}
         <div
           onClick={() => onNavigate('pipelines')}
-          className="p-4 rounded-xl border border-slate-200 bg-white hover:border-slate-300 transition-all cursor-pointer group shadow-2xs"
+          className="p-5 rounded-xl border border-slate-200/90 bg-white hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-slate-600">Pipelines</span>
-            <Clock className="w-4 h-4 text-indigo-600 group-hover:scale-110 transition-transform" />
+            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+              Pipelines
+            </span>
+            <span className="p-2 rounded-lg bg-indigo-50 text-indigo-600 border border-indigo-100/80 group-hover:scale-105 transition-transform">
+              <Clock className="w-4 h-4" />
+            </span>
           </div>
-          <div className="text-2xl font-bold font-mono text-slate-900 mt-1.5">
+          <div className="text-3xl font-extrabold font-mono text-slate-900 mt-2">
             {totalPipelineCount}
           </div>
-          <div className="mt-2 pt-2 border-t border-slate-100 text-[11px] text-slate-500 truncate flex items-center gap-1.5">
-            <span className={`w-1.5 h-1.5 rounded-full ${activePipelineCount > 0 ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-            <span>{activePipelineCount > 0 ? `${activePipelineCount} active schedules` : 'No active schedules'}</span>
+          <div className="mt-3 pt-2.5 border-t border-slate-100 text-xs text-slate-500 truncate flex items-center gap-1.5">
+            <span
+              className={`w-2 h-2 rounded-full shrink-0 ${
+                activePipelineCount > 0 ? 'bg-emerald-500' : 'bg-slate-300'
+              }`}
+            />
+            <span className="truncate">
+              {activePipelineCount > 0
+                ? `${activePipelineCount} active schedules`
+                : 'No active schedules'}
+            </span>
           </div>
         </div>
 
         {/* dbt Models */}
         <div
           onClick={() => onNavigate('dbt')}
-          className="p-4 rounded-xl border border-slate-200 bg-white hover:border-slate-300 transition-all cursor-pointer group shadow-2xs"
+          className="p-5 rounded-xl border border-slate-200/90 bg-white hover:border-purple-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-slate-600">dbt Models</span>
-            <Layers className="w-4 h-4 text-purple-600 group-hover:scale-110 transition-transform" />
+            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+              dbt Models
+            </span>
+            <span className="p-2 rounded-lg bg-purple-50 text-purple-600 border border-purple-100/80 group-hover:scale-105 transition-transform">
+              <Layers className="w-4 h-4" />
+            </span>
           </div>
-          <div className="text-2xl font-bold font-mono text-slate-900 mt-1.5">
+          <div className="text-3xl font-extrabold font-mono text-slate-900 mt-2">
             {totalDbtModels}
           </div>
-          <div className="mt-2 pt-2 border-t border-slate-100 text-[11px] text-slate-500 truncate">
-            {totalDbtModels > 0 ? `${stagingModels.length} staging • ${martModels.length} marts` : 'Zero dbt models defined'}
+          <div className="mt-3 pt-2.5 border-t border-slate-100 text-xs text-slate-500 truncate">
+            {totalDbtModels > 0
+              ? `${stagingModels.length} staging • ${martModels.length} marts`
+              : 'Zero dbt models defined'}
           </div>
         </div>
 
         {/* Notebooks */}
         <div
           onClick={() => onNavigate('notebooks')}
-          className="p-4 rounded-xl border border-slate-200 bg-white hover:border-slate-300 transition-all cursor-pointer group shadow-2xs"
+          className="p-5 rounded-xl border border-slate-200/90 bg-white hover:border-amber-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-slate-600">Notebooks</span>
-            <BookOpen className="w-4 h-4 text-amber-600 group-hover:scale-110 transition-transform" />
+            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+              Notebooks
+            </span>
+            <span className="p-2 rounded-lg bg-amber-50 text-amber-600 border border-amber-100/80 group-hover:scale-105 transition-transform">
+              <BookOpen className="w-4 h-4" />
+            </span>
           </div>
-          <div className="text-2xl font-bold font-mono text-slate-900 mt-1.5">
+          <div className="text-3xl font-extrabold font-mono text-slate-900 mt-2">
             {notebooksCount}
           </div>
-          <div className="mt-2 pt-2 border-t border-slate-100 text-[11px] text-slate-500 truncate flex items-center gap-1.5">
-            <span className={`w-1.5 h-1.5 rounded-full ${isMarimoRunning ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-            <span>{isMarimoRunning ? 'Marimo Engine Live' : 'Reactive Python Engine'}</span>
+          <div className="mt-3 pt-2.5 border-t border-slate-100 text-xs text-slate-500 truncate flex items-center gap-1.5">
+            <span
+              className={`w-2 h-2 rounded-full shrink-0 ${
+                isMarimoRunning ? 'bg-emerald-500' : 'bg-slate-300'
+              }`}
+            />
+            <span className="truncate">
+              {isMarimoRunning ? 'Marimo Engine Live' : 'Reactive Python Engine'}
+            </span>
           </div>
         </div>
       </div>
 
-      {/* 3. Pipeline Orchestration Activity Banner */}
-      <div className="p-3.5 rounded-xl border border-slate-200 bg-white shadow-2xs flex flex-wrap items-center justify-between gap-3 text-xs">
-        <div className="flex items-center gap-2.5">
-          <span className="font-semibold text-slate-800">Orchestrator:</span>
+      {/* 2. Pipeline Orchestration Activity Banner */}
+      <div className="p-4 rounded-xl border border-slate-200/90 bg-white shadow-xs flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div className="flex items-center gap-3">
+          <span className="font-bold text-slate-800 uppercase tracking-wider text-[11px]">
+            Orchestrator:
+          </span>
           {latestPipelineRun ? (
             <div className="flex items-center gap-2">
-              <span className="font-medium text-slate-900">{latestPipelineRun.name}</span>
+              <span className="font-semibold text-slate-900">{latestPipelineRun.name}</span>
               <span
-                className={`px-2 py-0.5 rounded-full font-mono text-[10px] font-semibold uppercase ${
+                className={`px-2.5 py-0.5 rounded-full font-mono text-[10px] font-semibold uppercase ${
                   latestPipelineRun.last_status === 'success'
                     ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                     : latestPipelineRun.last_status === 'failed'
@@ -306,21 +258,19 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
           )}
         </div>
 
-        <div className="flex items-center gap-3">
-          <button
-            onClick={() => onNavigate('pipelines')}
-            className="inline-flex items-center gap-1.5 px-3 py-1 bg-slate-100 hover:bg-slate-200/80 text-slate-700 rounded-lg text-xs font-semibold border border-slate-200 transition-colors"
-          >
-            <Plus className="w-3.5 h-3.5 text-slate-500" />
-            <span>Create Pipeline</span>
-          </button>
-        </div>
+        <button
+          onClick={() => onNavigate('pipelines')}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-50 hover:bg-slate-100 active:bg-slate-200/80 text-slate-700 rounded-lg text-xs font-semibold border border-slate-200 transition-all shadow-2xs"
+        >
+          <Plus className="w-3.5 h-3.5 text-slate-500" />
+          <span>Create Pipeline</span>
+        </button>
       </div>
 
-      {/* 4. Two-Column Layout: Managed Services (2/3) + Engine Health (1/3) */}
+      {/* 3. Two-Column Layout: Managed Services (2/3) + Engine Health (1/3) */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Managed Services Grid */}
-        <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200 p-5 shadow-2xs space-y-4">
+        <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs space-y-4">
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
             <div>
               <h3 className="text-sm font-bold text-slate-900 tracking-tight">
@@ -349,7 +299,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
               return (
                 <div
                   key={key}
-                  className="p-3.5 rounded-xl border border-slate-200 bg-white hover:border-slate-300 transition-all shadow-2xs flex flex-col justify-between space-y-3"
+                  className="p-4 rounded-xl border border-slate-200/80 bg-slate-50/50 hover:bg-white hover:border-slate-300 hover:shadow-xs transition-all flex flex-col justify-between space-y-3"
                 >
                   <div className="flex items-start justify-between">
                     <div>
@@ -365,16 +315,16 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                       className={`px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase ${
                         isRunning
                           ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                          : 'bg-slate-100 text-slate-500'
+                          : 'bg-slate-200/70 text-slate-500'
                       }`}
                     >
                       {isRunning ? 'Running' : 'Stopped'}
                     </span>
                   </div>
 
-                  <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs">
+                  <div className="pt-2.5 border-t border-slate-200/60 flex items-center justify-between text-xs">
                     {isRunning ? (
-                      <span className="font-mono text-[11px] text-slate-600">
+                      <span className="font-mono text-[11px] text-slate-700 font-medium">
                         {status?.allocated_memory_mb && status.allocated_memory_mb > 0
                           ? `${(status.allocated_memory_mb / 1024).toFixed(1)} GB RAM`
                           : 'Localhost Node'}
@@ -397,7 +347,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                       )}
                       <button
                         onClick={() => onNavigate('services')}
-                        className="px-2.5 py-1 rounded-lg text-slate-600 hover:bg-slate-100 font-medium text-xs transition-colors"
+                        className="px-2.5 py-1 rounded-lg text-slate-600 hover:bg-slate-200/60 font-medium text-xs transition-colors"
                       >
                         Configure
                       </button>
@@ -409,8 +359,8 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
           </div>
         </div>
 
-        {/* Engine & Hardware Telemetry (Clean, compact 1/3 sidebar) */}
-        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-2xs flex flex-col justify-between space-y-4">
+        {/* Engine & Hardware Telemetry (Clean, compact 1/3 card) */}
+        <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex flex-col justify-between space-y-4">
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
             <div className="flex items-center gap-2">
               <Sparkles className="w-4 h-4 text-sky-600" />
