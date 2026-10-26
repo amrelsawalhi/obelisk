@@ -22,7 +22,7 @@ const coerce = (params: PipelineParamDef[], values: Record<string, string>) => {
 };
 
 const inputClass =
-  'w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:border-indigo-500 focus:outline-hidden';
+  'w-full rounded-lg border border-slate-300 px-3 py-1.5 text-xs text-slate-800 placeholder-slate-400 focus:border-sky-500 focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 transition-colors';
 
 interface PipelineRunDialogProps {
   pipeline: PipelineDetail;
@@ -87,16 +87,16 @@ export const PipelineRunDialog: React.FC<PipelineRunDialogProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-[75] flex items-center justify-center bg-slate-900/30 p-4">
+    <div className="fixed inset-0 z-[75] flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4 animate-in fade-in duration-150">
       <div
         role="dialog"
         aria-modal="true"
         aria-label="Run pipeline"
-        className="w-[440px] max-w-full rounded-xl border border-slate-200 bg-white shadow-2xl"
+        className="w-[440px] max-w-full rounded-xl border border-slate-200 bg-white shadow-2xl overflow-hidden"
       >
-        <div className="border-b border-slate-100 px-4 py-3">
-          <h2 className="text-sm font-semibold text-slate-800">Run {pipeline.name}</h2>
-          <p className="mt-0.5 text-[11px] text-slate-500">
+        <div className="border-b border-slate-100 bg-slate-50/50 px-5 py-3.5">
+          <h2 className="text-sm font-bold text-slate-900">Run {pipeline.name}</h2>
+          <p className="mt-0.5 text-xs text-slate-500">
             Values apply to this run only. Scheduled runs use the defaults.
           </p>
         </div>
@@ -151,11 +151,11 @@ export const PipelineRunDialog: React.FC<PipelineRunDialogProps> = ({
           })}
         </div>
 
-        <div className="flex items-center justify-between gap-2 border-t border-slate-100 px-4 py-3">
+        <div className="flex items-center justify-between gap-2 border-t border-slate-100 bg-slate-50/50 px-5 py-3">
           <button
             type="button"
             onClick={() => setValues(defaults(params))}
-            className="flex items-center gap-1 text-[11px] font-semibold text-slate-500 hover:text-slate-700"
+            className="flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-800 transition-colors"
           >
             <RotateCcw className="h-3 w-3" /> Reset to defaults
           </button>
@@ -163,7 +163,7 @@ export const PipelineRunDialog: React.FC<PipelineRunDialogProps> = ({
             <button
               type="button"
               onClick={onClose}
-              className="rounded-lg border border-slate-300 px-3 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 transition-colors shadow-2xs"
             >
               Cancel
             </button>
@@ -171,12 +171,12 @@ export const PipelineRunDialog: React.FC<PipelineRunDialogProps> = ({
               type="button"
               onClick={submit}
               disabled={running}
-              className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+              className="flex items-center gap-1.5 rounded-lg bg-sky-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 transition-colors shadow-2xs disabled:opacity-50"
             >
               {running ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
-                <Play className="h-3.5 w-3.5" />
+                <Play className="h-3.5 w-3.5 fill-current" />
               )}
               Run now
             </button>

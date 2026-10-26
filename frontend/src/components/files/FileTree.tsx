@@ -90,10 +90,10 @@ const TreeNodeItem: React.FC<TreeNodeItemProps> = ({
     <div>
       <div
         onClick={handleClick}
-        style={{ paddingLeft: `${Math.max(12, level * 16)}px` }}
-        className={`group flex items-center justify-between pr-2 py-1.5 cursor-pointer text-xs font-medium rounded-md transition-colors select-none ${
+        style={{ paddingLeft: `${6 + level * 14}px` }}
+        className={`group flex h-7 items-center justify-between pr-2 cursor-pointer text-xs font-medium rounded-md transition-colors select-none ${
           isSelected
-            ? 'bg-sky-50 text-sky-900 font-semibold'
+            ? 'bg-sky-50 text-sky-950 font-semibold'
             : 'text-slate-700 hover:bg-slate-100/80 hover:text-slate-900'
         }`}
       >

@@ -38,7 +38,7 @@ interface DirEditTarget {
 export interface LakehouseTreeProps {
   directories: LakehouseDirectory[];
   expandedNodes: Record<string, boolean>;
-  onToggleNode: (id: string, defaultExpanded: boolean) => void;
+  onToggleNode: (id: string, isCurrentlyExpanded?: boolean) => void;
   searchTerm: string;
   selectedTableKey: string | null;
   onSelectTable: (
@@ -176,7 +176,7 @@ export const LakehouseTree: React.FC<LakehouseTreeProps> = (props) => {
                 onMoveTable(folder.path, table.name);
               }}
               title={`Move table '${table.name}' to another folder`}
-              className={`${treeActionClass} hover:bg-indigo-50 hover:text-indigo-600`}
+              className={`${treeActionClass} hover:bg-sky-50 hover:text-sky-700`}
             >
               <FolderInput className="h-3 w-3" />
             </button>
@@ -206,7 +206,7 @@ export const LakehouseTree: React.FC<LakehouseTreeProps> = (props) => {
     const isRenaming = renamingDir !== null && renamingDir.path === node.path;
     const isAddingSubfolder = creatingSubdirParent === node.path;
     const isEmpty = node.tables.length === 0 && node.children.length === 0;
-    const toggle = () => onToggleNode(node.id, node.tableCount > 0);
+    const toggle = () => onToggleNode(node.id, isExpanded);
 
     return (
       <React.Fragment key={node.id}>
@@ -237,7 +237,7 @@ export const LakehouseTree: React.FC<LakehouseTreeProps> = (props) => {
                     onRenamingDirChange({ ...renamingDir, newName: event.target.value })
                   }
                   aria-label="Folder name"
-                  className="min-w-0 flex-1 rounded border border-indigo-400 bg-white px-1.5 py-0.5 font-mono text-[11px] text-slate-900 outline-hidden"
+                  className="min-w-0 flex-1 rounded border border-sky-400 bg-white px-1.5 py-0.5 font-mono text-[11px] text-slate-900 outline-hidden focus:ring-1 focus:ring-sky-400"
                 />
                 <button
                   type="submit"
@@ -277,7 +277,7 @@ export const LakehouseTree: React.FC<LakehouseTreeProps> = (props) => {
                     onCreatingSubdirParentChange(isAddingSubfolder ? null : node.path);
                   }}
                   title={`Add subfolder inside '${node.path}'`}
-                  className={`${treeActionClass} hover:bg-indigo-50 hover:text-indigo-600`}
+                  className={`${treeActionClass} hover:bg-sky-50 hover:text-sky-700`}
                 >
                   <FolderPlus className="h-3 w-3" />
                 </button>
@@ -322,20 +322,20 @@ export const LakehouseTree: React.FC<LakehouseTreeProps> = (props) => {
             style={treeIndent(depth + 1)}
             className="flex h-8 items-center gap-1.5 pr-2"
           >
-            <CornerDownRight className="h-3.5 w-3.5 shrink-0 text-indigo-500" />
+            <CornerDownRight className="h-3.5 w-3.5 shrink-0 text-sky-500" />
             <input
               autoFocus
               placeholder={`New folder in ${node.name}`}
               value={subfolderName}
               onChange={(event) => onSubfolderNameChange(event.target.value)}
               aria-label="Subfolder name"
-              className="min-w-0 flex-1 rounded border border-indigo-200 bg-white px-2 py-1 font-mono text-[11px] text-slate-800 outline-hidden focus:border-indigo-500"
+              className="min-w-0 flex-1 rounded border border-sky-200 bg-white px-2 py-1 font-mono text-[11px] text-slate-800 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500"
             />
             <button
               type="submit"
               disabled={subfolderLoading || !subfolderName.trim()}
               title="Create subfolder"
-              className="rounded bg-indigo-600 p-1 text-white transition-colors hover:bg-indigo-700 disabled:opacity-50"
+              className="rounded bg-sky-600 p-1 text-white transition-colors hover:bg-sky-700 shadow-2xs disabled:opacity-50"
             >
               {subfolderLoading ? (
                 <RefreshCw className="h-3 w-3 animate-spin" />

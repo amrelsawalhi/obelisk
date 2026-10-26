@@ -5,7 +5,7 @@ import type { PipelineSummary } from '../../lib/types';
 const DOT: Record<string, string> = {
   success: 'bg-emerald-500',
   failed: 'bg-rose-500',
-  running: 'bg-indigo-500',
+  running: 'bg-sky-500',
   cancelled: 'bg-amber-500',
   interrupted: 'bg-orange-500',
   skipped: 'bg-slate-300',
@@ -81,12 +81,12 @@ export const PipelineRail: React.FC<PipelineRailProps> = ({
         type="button"
         onClick={() => onSelect(pipeline.id)}
         className={`flex w-full flex-col gap-1 rounded-lg px-2.5 py-2 text-left transition-colors ${
-          active ? 'bg-indigo-50 ring-1 ring-inset ring-indigo-200' : 'hover:bg-slate-50'
+          active ? 'bg-sky-50 ring-1 ring-inset ring-sky-200' : 'hover:bg-slate-50'
         }`}
       >
         <span className="flex items-center gap-1.5">
           {pipeline.is_running ? (
-            <Loader2 className="h-3 w-3 shrink-0 animate-spin text-indigo-600" />
+            <Loader2 className="h-3 w-3 shrink-0 animate-spin text-sky-600" />
           ) : pipeline.is_enabled ? (
             <Zap className="h-3 w-3 shrink-0 text-slate-400" />
           ) : (
@@ -94,7 +94,7 @@ export const PipelineRail: React.FC<PipelineRailProps> = ({
           )}
           <span
             className={`min-w-0 flex-1 truncate text-xs font-semibold ${
-              active ? 'text-indigo-900' : 'text-slate-700'
+              active ? 'text-sky-950 font-bold' : 'text-slate-700'
             }`}
           >
             {pipeline.name}
@@ -138,13 +138,13 @@ export const PipelineRail: React.FC<PipelineRailProps> = ({
             onChange={(event) => setQuery(event.target.value)}
             placeholder="Search pipelines"
             aria-label="Search pipelines"
-            className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1 pl-7 pr-2 text-[11px] text-slate-700 placeholder:text-slate-400 focus:border-indigo-400 focus:bg-white focus:outline-hidden"
+            className="w-full rounded-lg border border-slate-200 bg-slate-50 py-1 pl-7 pr-2 text-[11px] text-slate-700 placeholder:text-slate-400 focus:border-sky-500 focus:bg-white focus:outline-hidden"
           />
         </div>
         <button
           type="button"
           onClick={onNew}
-          className="rounded-lg bg-indigo-600 p-1.5 text-white hover:bg-indigo-700"
+          className="rounded-lg bg-sky-600 p-1.5 text-white hover:bg-sky-700 shadow-2xs transition-colors"
           aria-label="New pipeline"
           title="New pipeline"
         >

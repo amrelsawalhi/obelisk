@@ -124,17 +124,17 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-      <div className="w-full max-w-2xl bg-white rounded-xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[92vh]">
+      <div className="w-full max-w-2xl bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[92vh]">
         {/* Header */}
         <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50 shrink-0">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 bg-indigo-50 text-indigo-700 rounded-lg">
+            <div className="p-2.5 bg-sky-50 text-sky-700 rounded-lg">
               <Layers className="w-5 h-5" />
             </div>
             <div>
               <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
                 <span>Batch Lakehouse Ingestion</span>
-                <span className="px-2 py-0.5 text-[10px] font-mono bg-indigo-100 text-indigo-800 rounded-full font-semibold">
+                <span className="px-2 py-0.5 text-[10px] font-mono bg-sky-100 text-sky-800 rounded-full font-semibold">
                   {selectedTables.length} / {availableTables.length} Tables Selected
                 </span>
               </h3>
@@ -145,7 +145,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                     {' '}• Schema: <span className="text-slate-800 font-semibold">{schemaName}</span>
                   </>
                 )}
-                {' '}→ <span className="text-indigo-600 font-semibold">data/lakehouse/{targetFolder || 'root'}/</span>
+                {' '}→ <span className="text-sky-600 font-semibold">data/lakehouse/{targetFolder || 'root'}/</span>
               </p>
             </div>
           </div>
@@ -167,10 +167,10 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                 <button
                   type="button"
                   onClick={toggleSelectAll}
-                  className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 hover:text-indigo-600 transition-colors"
+                  className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 hover:text-sky-600 transition-colors"
                 >
                   {allFilteredSelected ? (
-                    <CheckSquare className="w-4 h-4 text-indigo-600" />
+                    <CheckSquare className="w-4 h-4 text-sky-600" />
                   ) : (
                     <Square className="w-4 h-4 text-slate-400" />
                   )}
@@ -185,7 +185,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                   placeholder="Filter tables..."
                   value={tableSearch}
                   onChange={(e) => setTableSearch(e.target.value)}
-                  className="w-full text-xs pl-8 pr-2.5 py-1 bg-white border border-slate-200 rounded-lg outline-hidden focus:border-indigo-500"
+                  className="w-full text-xs pl-8 pr-2.5 py-1 bg-white border border-slate-200 rounded-lg outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500"
                 />
               </div>
             </div>
@@ -201,7 +201,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                       key={t.name}
                       onClick={() => toggleTable(t.name)}
                       className={`flex items-center justify-between p-2 rounded-lg cursor-pointer transition-colors ${
-                        isChecked ? 'bg-indigo-50/50 text-indigo-950 font-medium' : 'hover:bg-slate-50 text-slate-700'
+                        isChecked ? 'bg-sky-50/70 text-sky-950 font-medium' : 'hover:bg-slate-50 text-slate-700'
                       }`}
                     >
                       <div className="flex items-center gap-2">
@@ -209,7 +209,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                           type="checkbox"
                           checked={isChecked}
                           onChange={() => {}}
-                          className="w-3.5 h-3.5 text-indigo-600 rounded-sm border-slate-300 focus:ring-indigo-500 cursor-pointer"
+                          className="w-3.5 h-3.5 text-sky-600 rounded-sm border-slate-300 focus:ring-sky-500 cursor-pointer"
                         />
                         <span className="text-xs font-mono">{t.name}</span>
                       </div>
@@ -239,7 +239,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                 onClick={() => setMode('snapshot')}
                 className={`py-2 px-3 text-xs font-medium rounded-lg border text-left transition-all ${
                   mode === 'snapshot'
-                    ? 'border-indigo-600 bg-indigo-50 text-indigo-900 ring-1 ring-indigo-500'
+                    ? 'border-sky-500 bg-sky-50 text-sky-900 ring-1 ring-sky-500 font-semibold'
                     : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
                 }`}
               >
@@ -254,7 +254,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                 onClick={() => setMode('incremental')}
                 className={`py-2 px-3 text-xs font-medium rounded-lg border text-left transition-all ${
                   mode === 'incremental'
-                    ? 'border-indigo-600 bg-indigo-50 text-indigo-900 ring-1 ring-indigo-500'
+                    ? 'border-sky-500 bg-sky-50 text-sky-900 ring-1 ring-sky-500 font-semibold'
                     : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
                 }`}
               >
@@ -268,7 +268,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
 
           {/* Incremental Parameters */}
           {mode === 'incremental' && (
-            <div className="space-y-3 p-3 bg-indigo-50/40 border border-indigo-100 rounded-xl">
+            <div className="space-y-3 p-3 bg-sky-50/40 border border-sky-100 rounded-xl">
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
@@ -279,7 +279,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                     value={watermarkCol}
                     onChange={(e) => setWatermarkCol(e.target.value)}
                     placeholder="updated_at"
-                    className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-2 outline-hidden focus:border-indigo-500 font-mono text-slate-800"
+                    className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-2 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500 font-mono text-slate-800"
                   />
                   <p className="text-[10px] text-slate-500 mt-0.5">
                     Applied to tables possessing this column
@@ -293,7 +293,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                   <select
                     value={writeStrategy}
                     onChange={(e) => setWriteStrategy(e.target.value as 'append' | 'upsert')}
-                    className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-2 outline-hidden focus:border-indigo-500 text-slate-800"
+                    className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-2 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500 text-slate-800"
                   >
                     <option value="append">Append Only</option>
                     <option value="upsert">Upsert (Deduplicate on PK)</option>
@@ -311,7 +311,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                     value={primaryKey}
                     onChange={(e) => setPrimaryKey(e.target.value)}
                     placeholder="id"
-                    className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-1.5 outline-hidden focus:border-indigo-500 font-mono text-slate-800"
+                    className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-1.5 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500 font-mono text-slate-800"
                   />
                 </div>
               )}
@@ -322,7 +322,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
-                <Folder className="w-3.5 h-3.5 text-indigo-600" />
+                <Folder className="w-3.5 h-3.5 text-sky-600" />
                 <span>Target Lakehouse Folder</span>
               </label>
               <span className="text-[10px] text-slate-400 font-mono">data/lakehouse/{targetFolder || 'root'}</span>
@@ -332,7 +332,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
               value={targetFolder}
               onChange={(e) => setTargetFolder(e.target.value)}
               placeholder="folder path, e.g. marts/sales (blank = root)"
-              className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 font-mono text-slate-800 outline-hidden focus:border-indigo-500 focus:bg-white"
+              className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 font-mono text-slate-800 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:bg-white transition-all"
             />
           </div>
 
@@ -343,7 +343,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                 htmlFor="batch-sample-toggle"
                 className="text-xs font-semibold text-slate-700 flex items-center gap-1.5 cursor-pointer"
               >
-                <Filter className="w-3.5 h-3.5 text-indigo-600" />
+                <Filter className="w-3.5 h-3.5 text-sky-600" />
                 <span>Sample Ingestion (Limit rows per table)</span>
               </label>
               <input
@@ -351,7 +351,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                 type="checkbox"
                 checked={isSample}
                 onChange={(e) => setIsSample(e.target.checked)}
-                className="w-4 h-4 text-indigo-600 rounded-sm border-slate-300 focus:ring-indigo-500 cursor-pointer"
+                className="w-4 h-4 text-sky-600 rounded-sm border-slate-300 focus:ring-sky-500 cursor-pointer"
               />
             </div>
             {isSample && (
@@ -363,7 +363,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
                   max="1000000"
                   value={sampleLimit}
                   onChange={(e) => setSampleLimit(Number(e.target.value))}
-                  className="w-24 text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1 font-mono text-slate-800 outline-hidden focus:border-indigo-500"
+                  className="w-24 text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1 font-mono text-slate-800 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500"
                 />
                 <span className="text-xs text-slate-600">rows per table</span>
               </div>
@@ -394,7 +394,7 @@ export const BatchIngestModal: React.FC<BatchIngestModalProps> = ({
               <button
                 type="submit"
                 disabled={submitting || selectedTables.length === 0}
-                className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors disabled:opacity-50"
+                className="flex items-center gap-1.5 px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white rounded-lg text-xs font-semibold shadow-2xs transition-colors disabled:opacity-50"
               >
                 {submitting ? (
                   <>

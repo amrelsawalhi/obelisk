@@ -37,31 +37,31 @@ export const ConfirmDialog: React.FC<{
   if (!request) return null;
 
   return (
-    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-900/30 p-4">
+    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4 animate-in fade-in duration-150">
       <div
         role="dialog"
         aria-modal="true"
         aria-label={request.title}
-        className="w-[420px] max-w-full rounded-xl border border-slate-200 bg-white shadow-2xl"
+        className="w-[420px] max-w-full rounded-xl border border-slate-200 bg-white shadow-2xl overflow-hidden"
       >
-        <div className="flex items-start gap-2.5 px-4 pt-4">
+        <div className="flex items-start gap-3 px-5 pt-5">
           {request.destructive && (
-            <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-rose-50 text-rose-600">
+            <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-rose-50 text-rose-600 border border-rose-200/60">
               <AlertTriangle className="h-4 w-4" />
             </span>
           )}
           <div className="min-w-0">
-            <h2 className="text-sm font-semibold text-slate-800">{request.title}</h2>
+            <h2 className="text-sm font-bold text-slate-900">{request.title}</h2>
             {request.body && (
               <p className="mt-1 text-xs leading-relaxed text-slate-500">{request.body}</p>
             )}
           </div>
         </div>
-        <div className="mt-4 flex justify-end gap-2 border-t border-slate-100 px-4 py-3">
+        <div className="mt-5 flex justify-end gap-2 border-t border-slate-100 bg-slate-50/50 px-5 py-3">
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg border border-slate-300 px-3 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+            className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-50 transition-colors shadow-2xs"
           >
             Cancel
           </button>
@@ -72,10 +72,10 @@ export const ConfirmDialog: React.FC<{
               void request.onConfirm();
               onClose();
             }}
-            className={`rounded-lg px-3 py-1.5 text-[11px] font-semibold text-white ${
+            className={`rounded-lg px-3.5 py-1.5 text-xs font-semibold text-white shadow-2xs transition-colors ${
               request.destructive
                 ? 'bg-rose-600 hover:bg-rose-700'
-                : 'bg-indigo-600 hover:bg-indigo-700'
+                : 'bg-sky-600 hover:bg-sky-700'
             }`}
           >
             {request.confirmLabel ?? 'Confirm'}

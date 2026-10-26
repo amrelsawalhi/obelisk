@@ -876,11 +876,11 @@ export const DbtStudio: React.FC = () => {
                 }}
                 className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-semibold transition-all ${
                   dockTab === 'lineage' && !isDockCollapsed
-                    ? 'bg-white text-indigo-800 shadow-2xs border border-slate-200 font-bold'
+                    ? 'bg-white text-sky-800 shadow-2xs border border-slate-200 font-bold'
                     : 'text-slate-500 hover:text-slate-900'
                 }`}
               >
-                <Split className="w-3.5 h-3.5 text-indigo-600" />
+                <Split className="w-3.5 h-3.5 text-sky-600" />
                 <span>Model Lineage DAG</span>
               </button>
 

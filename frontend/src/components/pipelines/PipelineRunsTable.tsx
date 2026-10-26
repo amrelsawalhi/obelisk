@@ -5,7 +5,7 @@ import type { PipelineExecution } from '../../lib/types';
 const STATUS: Record<string, { chip: string; icon: React.ElementType; label: string }> = {
   success: { chip: 'bg-emerald-50 text-emerald-700', icon: CheckCircle2, label: 'Success' },
   failed: { chip: 'bg-rose-50 text-rose-700', icon: XCircle, label: 'Failed' },
-  running: { chip: 'bg-indigo-50 text-indigo-700', icon: Loader2, label: 'Running' },
+  running: { chip: 'bg-sky-50 text-sky-700', icon: Loader2, label: 'Running' },
   pending: { chip: 'bg-slate-100 text-slate-600', icon: Clock, label: 'Queued' },
   cancelled: { chip: 'bg-amber-50 text-amber-700', icon: Ban, label: 'Cancelled' },
   interrupted: { chip: 'bg-orange-50 text-orange-700', icon: Ban, label: 'Interrupted' },
@@ -86,7 +86,7 @@ export const PipelineRunsTable: React.FC<PipelineRunsTableProps> = ({
                 key={run.id}
                 onClick={() => onOpen(run)}
                 className={`cursor-pointer border-t border-slate-100 text-xs transition-colors ${
-                  selected ? 'bg-indigo-50/70' : 'hover:bg-slate-50'
+                  selected ? 'bg-sky-50/70 text-sky-950 font-medium' : 'hover:bg-slate-50'
                 }`}
               >
                 <td className="px-4 py-2">

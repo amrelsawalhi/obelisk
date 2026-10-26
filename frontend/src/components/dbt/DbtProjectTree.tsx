@@ -85,9 +85,9 @@ export const DbtProjectTree: React.FC<DbtProjectTreeProps> = ({
         <div key={node.path} className="select-none">
           <div
             onClick={() => toggleCollapse(node.path)}
-            style={{ paddingLeft: `${depth * 12 + 6}px` }}
-            className={`group flex items-center justify-between py-1 px-2 rounded-md hover:bg-slate-100 cursor-pointer text-xs font-medium text-slate-700 transition-colors ${
-              isSelected ? 'bg-sky-50 text-sky-900 font-semibold' : ''
+            style={{ paddingLeft: `${6 + depth * 14}px` }}
+            className={`group flex h-7 items-center justify-between pr-2 cursor-pointer text-xs font-medium rounded-md transition-colors select-none ${
+              isSelected ? 'bg-sky-50 text-sky-950 font-semibold' : 'text-slate-700 hover:bg-slate-100/80 hover:text-slate-900'
             }`}
           >
             <div className="flex items-center gap-1.5 truncate">
@@ -135,11 +135,11 @@ export const DbtProjectTree: React.FC<DbtProjectTreeProps> = ({
       <div
         key={node.path}
         onClick={() => onSelectFile(node)}
-        style={{ paddingLeft: `${depth * 12 + 18}px` }}
-        className={`group flex items-center justify-between py-1 px-2 rounded-md cursor-pointer text-xs transition-colors ${
+        style={{ paddingLeft: `${6 + (depth + 1) * 14}px` }}
+        className={`group flex h-7 items-center justify-between pr-2 cursor-pointer text-xs font-medium rounded-md transition-colors select-none ${
           isSelected
-            ? 'bg-sky-100/70 text-sky-900 font-semibold shadow-2xs'
-            : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+            ? 'bg-sky-50 text-sky-950 font-semibold'
+            : 'text-slate-700 hover:bg-slate-100/80 hover:text-slate-900'
         }`}
       >
         <div className="flex items-center gap-2 truncate">

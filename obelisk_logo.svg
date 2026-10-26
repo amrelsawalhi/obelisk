@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="100%" height="100%">
+  <!-- Left Face: Pyramidion + Tapered Shaft (Lit) -->
+  <polygon points="16,2 16,7 13.5,7" fill="#7dd3fc" />
+  <polygon points="16,8 16,27 11,27 13.5,8" fill="#38bdf8" />
+
+  <!-- Right Face: Pyramidion + Tapered Shaft (Shadow) -->
+  <polygon points="16,2 18.5,7 16,7" fill="#0284c7" />
+  <polygon points="16,8 18.5,8 21,27 16,27" fill="#0369a1" />
+
+  <!-- Stepped Plinth Foundation -->
+  <rect x="9" y="28" width="14" height="2" rx="0.5" fill="#0284c7" />
+</svg>

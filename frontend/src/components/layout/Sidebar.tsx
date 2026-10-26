@@ -87,17 +87,17 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
   return (
     <aside className="w-64 border-r border-slate-200 bg-white flex flex-col select-none shrink-0">
       {/* Brand Header */}
-      <div className="h-16 border-b border-slate-200 flex items-center px-5 gap-3">
-        <div className="w-8 h-8 rounded-lg bg-sky-600 flex items-center justify-center text-white shadow-sm shadow-sky-200">
-          <ObeliskIcon className="w-5 h-5" />
+      <div className="h-16 border-b border-slate-200 flex items-center px-4 gap-3 bg-gradient-to-b from-slate-50/50 to-transparent">
+        <div className="w-9 h-9 rounded-xl bg-white border border-slate-200/90 shadow-2xs flex items-center justify-center shrink-0 ring-2 ring-slate-100">
+          <ObeliskIcon className="w-6.5 h-6.5" />
         </div>
-        <div>
-          <div className="font-bold text-slate-900 tracking-tight leading-none text-base">
-            OBELISK
-          </div>
-          <div className="text-[10px] text-slate-500 font-mono tracking-wider uppercase mt-1">
+        <div className="flex flex-col min-w-0">
+          <span className="text-[18px] font-black tracking-tight text-slate-950 leading-none">
+            Obelisk
+          </span>
+          <span className="text-[10px] font-bold text-sky-600 tracking-wider uppercase mt-1">
             Data Platform
-          </div>
+          </span>
         </div>
       </div>
 

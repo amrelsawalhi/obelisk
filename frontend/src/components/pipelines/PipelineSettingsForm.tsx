@@ -10,7 +10,7 @@ const CRON_PRESETS: Array<{ label: string; expr: string }> = [
 ];
 
 const inputClass =
-  'w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:border-indigo-500 focus:outline-hidden';
+  'w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:outline-hidden transition-all';
 
 const Field: React.FC<{ label: string; hint?: string; children: React.ReactNode }> = ({
   label,
@@ -135,9 +135,9 @@ export const PipelineSettingsForm: React.FC<PipelineSettingsFormProps> = ({
                 key={preset.expr}
                 type="button"
                 onClick={() => patch({ cron_expression: preset.expr })}
-                className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold transition-colors ${
                   form.cron_expression === preset.expr
-                    ? 'border-indigo-300 bg-indigo-50 text-indigo-700'
+                    ? 'border-sky-300 bg-sky-50 text-sky-700'
                     : 'border-slate-300 text-slate-600 hover:bg-slate-50'
                 }`}
               >
@@ -254,7 +254,7 @@ export const PipelineSettingsForm: React.FC<PipelineSettingsFormProps> = ({
               type="button"
               disabled={!dirty || saving}
               onClick={() => void onSave(form)}
-              className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-40"
+              className="flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors disabled:opacity-40"
             >
               {saving ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />

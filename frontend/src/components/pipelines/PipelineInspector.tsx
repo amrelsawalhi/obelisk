@@ -72,7 +72,7 @@ const Field: React.FC<{ label: string; hint?: string; children: React.ReactNode 
 );
 
 const inputClass =
-  'w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:border-indigo-500 focus:outline-hidden';
+  'w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:outline-hidden transition-all';
 
 const token = (name: string, output: string) => `{{steps.${name}.${output}}}`;
 
@@ -129,7 +129,7 @@ const OutputValue: React.FC<{ name: string; output: { type: string; value: unkno
         <button
           type="button"
           onClick={() => setRevealed((current) => !current)}
-          className="mt-1 text-[10px] font-semibold text-indigo-600 hover:underline"
+          className="mt-1 text-[10px] font-semibold text-sky-600 hover:underline"
         >
           {revealed ? 'Hide value' : 'Reveal value'}
         </button>
@@ -448,7 +448,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                     <button
                       type="button"
                       onClick={() => onEditEdge?.(edge.from_key, edge.to_key)}
-                      className="shrink-0 rounded border border-slate-300 bg-white px-1 text-[9px] font-bold uppercase text-slate-500 hover:border-indigo-300 hover:text-indigo-600"
+                      className="shrink-0 rounded border border-slate-300 bg-white px-1 text-[9px] font-bold uppercase text-slate-500 hover:border-sky-300 hover:text-sky-700"
                       title="Change when this edge runs"
                     >
                       {edge.condition}
@@ -620,7 +620,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                       const value = token(slug(step.name), entry.name);
                       return (
                         <div key={entry.name} className="flex items-center gap-1">
-                          <code className="min-w-0 flex-1 truncate font-mono text-[10px] text-indigo-700">
+                          <code className="min-w-0 flex-1 truncate font-mono text-[10px] text-sky-800">
                             {value}
                           </code>
                           {entry.derived && (
@@ -640,7 +640,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                             <button
                               type="button"
                               onClick={() => insertToken(value)}
-                              className="shrink-0 rounded p-0.5 text-slate-400 hover:bg-white hover:text-indigo-600"
+                              className="shrink-0 rounded p-0.5 text-slate-400 hover:bg-white hover:text-sky-700"
                               aria-label={`Insert ${entry.name}`}
                               title="Insert at the caret"
                             >
@@ -752,7 +752,7 @@ with open(os.environ["OBELISK_OUTPUT_FILE"], "w") as fh:
               <button
                 type="button"
                 onClick={onRerunFrom}
-                className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-indigo-600 px-2 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700"
+                className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-sky-600 px-2 py-1.5 text-[11px] font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors"
               >
                 <RefreshCw className="h-3.5 w-3.5" /> Re-run from this step
               </button>

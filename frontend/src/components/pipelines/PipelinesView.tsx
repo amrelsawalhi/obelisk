@@ -995,7 +995,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             </span>
             <span
               className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-                monitorActive ? "bg-indigo-50 text-indigo-700" : "bg-slate-100 text-slate-500"
+                monitorActive ? "bg-sky-50 text-sky-700" : "bg-slate-100 text-slate-500"
               }`}
             >
               {monitorActive && <Loader2 className="mr-1 inline h-2.5 w-2.5 animate-spin" />}
@@ -1007,7 +1007,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 onClick={() =>
                   monitor.parent?.pipeline_id && setSelectedId(monitor.parent.pipeline_id)
                 }
-                className="shrink-0 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                className="shrink-0 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700"
                 title="Open the pipeline that started this run"
               >
                 Started by {monitor.parent.pipeline_name}
@@ -1029,13 +1029,13 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 type="button"
                 onClick={() => void requestRun()}
                 disabled={starting}
-                className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+                className="flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors disabled:opacity-50"
                 title="Run now (Ctrl+Enter)"
               >
                 {starting ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <Play className="h-3.5 w-3.5" />
+                  <Play className="h-3.5 w-3.5 fill-current" />
                 )}
                 Run now
               </button>
@@ -1043,7 +1043,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 type="button"
                 onClick={() => void saveGraph()}
                 disabled={!dirty || saving}
-                className="flex items-center gap-1.5 rounded-lg border border-indigo-300 bg-indigo-50 px-2.5 py-1.5 text-[11px] font-semibold text-indigo-700 hover:bg-indigo-100 disabled:opacity-40"
+                className="flex items-center gap-1.5 rounded-lg border border-sky-300 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-700 hover:bg-sky-100 transition-colors disabled:opacity-40"
                 title="Save graph (Ctrl+S)"
               >
                 {saving ? (
@@ -1057,7 +1057,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 <button
                   type="button"
                   onClick={() => setMenuOpen((open) => !open)}
-                  className="rounded-lg border border-slate-300 p-1.5 text-slate-600 hover:bg-slate-50"
+                  className="rounded-lg border border-slate-300 p-1.5 text-slate-600 hover:bg-slate-50 transition-colors shadow-2xs"
                   aria-label="Pipeline actions"
                   aria-expanded={menuOpen}
                 >
@@ -1068,12 +1068,12 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     <button
                       type="button"
                       onClick={() => void togglePipeline()}
-                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] text-slate-700 hover:bg-slate-50"
+                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-50 transition-colors"
                     >
                       {detail.is_enabled ? (
-                        <Pause className="h-3.5 w-3.5" />
+                        <Pause className="h-3.5 w-3.5 text-slate-500" />
                       ) : (
-                        <Zap className="h-3.5 w-3.5" />
+                        <Zap className="h-3.5 w-3.5 text-amber-500" />
                       )}
                       {detail.is_enabled ? "Pause schedule" : "Enable schedule"}
                     </button>
@@ -1083,14 +1083,14 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                         setMenuOpen(false);
                         setTab("settings");
                       }}
-                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] text-slate-700 hover:bg-slate-50"
+                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-700 hover:bg-slate-50 transition-colors"
                     >
-                      <RefreshCw className="h-3.5 w-3.5" /> Pipeline settings
+                      <RefreshCw className="h-3.5 w-3.5 text-slate-500" /> Pipeline settings
                     </button>
                     <button
                       type="button"
                       onClick={deletePipeline}
-                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] text-rose-600 hover:bg-rose-50"
+                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-rose-600 hover:bg-rose-50 transition-colors"
                     >
                       <Trash2 className="h-3.5 w-3.5" /> Delete pipeline
                     </button>
@@ -1103,7 +1103,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             <button
               type="button"
               onClick={() => setShowNew(true)}
-              className="rounded-lg bg-indigo-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700"
+              className="rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors"
             >
               New pipeline
             </button>
@@ -1128,7 +1128,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
         </aside>
         <div
           {...railHandle}
-          className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-indigo-300"
+          className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-sky-300"
           aria-label="Resize pipeline list"
         />
 
@@ -1143,10 +1143,10 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 key={key}
                 type="button"
                 onClick={() => setTab(key)}
-                className={`-mb-px border-b-2 px-2.5 py-2 text-[11px] font-semibold ${
+                className={`-mb-px border-b-2 px-3 py-2 text-xs font-semibold transition-colors ${
                   tab === key
-                    ? "border-indigo-600 text-indigo-700"
-                    : "border-transparent text-slate-500 hover:text-slate-700"
+                    ? "border-sky-600 text-sky-700"
+                    : "border-transparent text-slate-500 hover:text-slate-800 hover:border-slate-300"
                 }`}
               >
                 {label}
@@ -1155,19 +1155,19 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             {detail && tab === "graph" && (
               <div className="ml-auto flex items-center gap-2 py-1">
                 {watching && (
-                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500">
+                  <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[10px] font-semibold text-slate-500 border border-slate-200">
                     Read-only while watching a run
                   </span>
                 )}
                 {monitor && (
-                  <span className="flex items-center gap-1.5 rounded-md bg-slate-100 px-2 py-0.5 text-[10px] text-slate-600">
-                    Watching <span className="font-mono">{monitor.id.slice(0, 8)}</span>
+                  <span className="flex items-center gap-1.5 rounded-full bg-slate-100 px-2.5 py-0.5 text-[10px] text-slate-600 border border-slate-200 font-mono">
+                    Watching <span className="font-bold">{monitor.id.slice(0, 8)}</span>
                     <span className="text-slate-400">·</span>
                     <span>{fmtDuration(monitor.duration_seconds)}</span>
                     <button
                       type="button"
                       onClick={() => setMonitor(null)}
-                      className="font-semibold text-indigo-600 hover:underline"
+                      className="font-semibold text-sky-600 hover:underline ml-1"
                     >
                       Back to design
                     </button>
@@ -1181,18 +1181,18 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
             <div className="flex flex-1 items-center justify-center p-10 text-center">
               <div className="max-w-[320px] space-y-2">
                 {loadingDetail ? (
-                  <Loader2 className="mx-auto h-5 w-5 animate-spin text-indigo-500" />
+                  <Loader2 className="mx-auto h-5 w-5 animate-spin text-sky-500" />
                 ) : (
                   <>
-                    <p className="text-sm font-semibold text-slate-700">No pipeline selected</p>
-                    <p className="text-[11px] leading-relaxed text-slate-500">
+                    <p className="text-sm font-bold text-slate-800">No pipeline selected</p>
+                    <p className="text-xs leading-relaxed text-slate-500">
                       Pick one on the left, or create a pipeline to schedule dbt, a script, a
                       notebook, SQL or a webhook.
                     </p>
                     <button
                       type="button"
                       onClick={() => setShowNew(true)}
-                      className="rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700"
+                      className="rounded-lg bg-sky-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors mt-2"
                     >
                       New pipeline
                     </button>
@@ -1208,27 +1208,27 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 <button
                   type="button"
                   onClick={() => setShowAdd(true)}
-                  className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700"
+                  className="flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors"
                 >
                   <Plus className="h-3.5 w-3.5" /> Add step
                 </button>
-                <span className="text-[11px] text-slate-500">
+                <span className="text-xs text-slate-500">
                   {draft.steps.length} step{draft.steps.length === 1 ? "" : "s"}
                 </span>
-                <span className="hidden text-[11px] text-slate-500 sm:inline">
+                <span className="hidden text-xs text-slate-500 sm:inline">
                   {"\u00b7"} {draft.edges.length} connection{draft.edges.length === 1 ? "" : "s"}
                 </span>
                 <button
                   type="button"
                   onClick={arrange}
                   disabled={draft.steps.length < 2}
-                  className="flex items-center gap-1.5 rounded-lg border border-slate-300 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+                  className="flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 shadow-2xs transition-colors disabled:opacity-40"
                   title="Lay the graph out left to right by dependency"
                 >
-                  <Wand2 className="h-3.5 w-3.5" /> Arrange
+                  <Wand2 className="h-3.5 w-3.5 text-slate-500" /> Arrange
                 </button>
                 {!draft.steps.length && (
-                  <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                  <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700 border border-amber-200">
                     Add a step before saving
                   </span>
                 )}
@@ -1250,9 +1250,9 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                   <button
                     type="button"
                     onClick={() => setDockOpen((open) => !open)}
-                    className={`flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-semibold ${
+                    className={`flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
                       dockOpen
-                        ? "border-indigo-200 bg-indigo-50 text-indigo-700"
+                        ? "border-sky-200 bg-sky-50 text-sky-700"
                         : "border-slate-200 text-slate-600 hover:bg-slate-50"
                     }`}
                   >
@@ -1296,7 +1296,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 </div>
                 <div
                   {...inspectorHandle}
-                  className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-indigo-300"
+                  className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-sky-300"
                   aria-label="Resize step inspector"
                 />
                 <div
@@ -1331,7 +1331,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 <>
                   <div
                     {...dockHandle}
-                    className={`h-1 shrink-0 cursor-row-resize transition-colors hover:bg-indigo-300 ${
+                    className={`h-1 shrink-0 cursor-row-resize transition-colors hover:bg-sky-300 ${
                       dockExpanded ? "hidden" : "bg-slate-200"
                     }`}
                     aria-label="Resize log panel"
@@ -1429,10 +1429,10 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     key={condition}
                     type="button"
                     onClick={() => setEdgeCondition(condition)}
-                    className={`rounded-lg border px-2 py-1.5 text-[11px] font-semibold ${
+                    className={`rounded-lg border px-2 py-1.5 text-[11px] font-semibold transition-colors ${
                       current
-                        ? "border-indigo-500 bg-indigo-50 text-indigo-700"
-                        : "border-slate-300 text-slate-700 hover:border-indigo-300 hover:bg-indigo-50"
+                        ? "border-sky-500 bg-sky-50 text-sky-700"
+                        : "border-slate-300 text-slate-700 hover:border-sky-300 hover:bg-sky-50"
                     }`}
                   >
                     {label}
@@ -1468,9 +1468,9 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       )}
 
       {showAdd && (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/25 p-4">
-          <div className="w-[420px] max-w-full rounded-xl border border-slate-200 bg-white p-4 shadow-xl">
-            <h2 className="text-sm font-semibold text-slate-800">Add a step</h2>
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4">
+          <div className="w-[420px] max-w-full rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+            <h2 className="text-sm font-bold text-slate-900">Add a step</h2>
             <p className="mt-1 text-[11px] text-slate-500">
               Pick what this step runs; its settings appear in the inspector.
             </p>
@@ -1480,7 +1480,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                   key={template.type}
                   type="button"
                   onClick={() => addStep(template.type)}
-                  className="rounded-lg border border-slate-300 px-2 py-2 text-left text-[11px] font-semibold text-slate-700 hover:border-indigo-300 hover:bg-indigo-50"
+                  className="rounded-lg border border-slate-200 px-2 py-2 text-left text-[11px] font-semibold text-slate-700 hover:border-sky-300 hover:bg-sky-50 transition-colors"
                 >
                   {template.name}
                   <span className="mt-0.5 block font-mono text-[9px] font-normal uppercase text-slate-400">
@@ -1489,11 +1489,11 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 </button>
               ))}
             </div>
-            <div className="mt-3 flex justify-end">
+            <div className="mt-4 flex justify-end">
               <button
                 type="button"
                 onClick={() => setShowAdd(false)}
-                className="rounded-lg border border-slate-300 px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 transition-colors"
               >
                 Cancel
               </button>
@@ -1503,13 +1503,13 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       )}
 
       {showNew && (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/25 p-4">
-          <div className="w-[440px] max-w-full rounded-xl border border-slate-200 bg-white p-4 shadow-xl">
-            <h2 className="text-sm font-semibold text-slate-800">New pipeline</h2>
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4">
+          <div className="w-[440px] max-w-full rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+            <h2 className="text-sm font-bold text-slate-900">New pipeline</h2>
             <p className="mt-1 text-[11px] text-slate-500">
               Start paused with an empty graph — you add steps on the canvas next.
             </p>
-            <div className="mt-3 space-y-2">
+            <div className="mt-3 space-y-2.5">
               <label className="block">
                 <span className="mb-1 block text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
                   Name
@@ -1521,7 +1521,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                   onKeyDown={(event) => {
                     if (event.key === "Enter") void createPipeline();
                   }}
-                  className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:border-indigo-500 focus:outline-hidden"
+                  className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:outline-hidden transition-all"
                   placeholder="Daily orders"
                 />
               </label>
@@ -1533,7 +1533,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                   <input
                     value={newCron}
                     onChange={(event) => setNewCron(event.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                    className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 font-mono text-xs focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:outline-hidden transition-all"
                   />
                 </label>
                 <label className="block">
@@ -1543,7 +1543,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                   <input
                     value={newTimezone}
                     onChange={(event) => setNewTimezone(event.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 font-mono text-xs focus:border-indigo-500 focus:outline-hidden"
+                    className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 font-mono text-xs focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:outline-hidden transition-all"
                   />
                 </label>
               </div>
@@ -1553,7 +1553,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     key={preset.expr}
                     type="button"
                     onClick={() => setNewCron(preset.expr)}
-                    className="rounded-full border border-slate-300 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-slate-50"
+                    className="rounded-full border border-slate-300 px-2 py-0.5 text-[10px] font-semibold text-slate-600 hover:bg-slate-50 transition-colors"
                   >
                     {preset.label}
                   </button>
@@ -1567,10 +1567,10 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                   <button
                     type="button"
                     onClick={() => setNewTemplate(null)}
-                    className={`rounded-lg border px-2 py-1.5 text-left text-[11px] font-semibold ${
+                    className={`rounded-lg border px-2 py-1.5 text-left text-[11px] font-semibold transition-colors ${
                       newTemplate === null
-                        ? "border-indigo-500 bg-indigo-50 text-indigo-700"
-                        : "border-slate-300 text-slate-600 hover:bg-slate-50"
+                        ? "border-sky-500 bg-sky-50 text-sky-700"
+                        : "border-slate-200 text-slate-600 hover:bg-slate-50"
                     }`}
                   >
                     Empty graph
@@ -1583,10 +1583,10 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                       key={template.key}
                       type="button"
                       onClick={() => setNewTemplate(template.key)}
-                      className={`rounded-lg border px-2 py-1.5 text-left text-[11px] font-semibold ${
+                      className={`rounded-lg border px-2 py-1.5 text-left text-[11px] font-semibold transition-colors ${
                         newTemplate === template.key
-                          ? "border-indigo-500 bg-indigo-50 text-indigo-700"
-                          : "border-slate-300 text-slate-600 hover:bg-slate-50"
+                          ? "border-sky-500 bg-sky-50 text-sky-700"
+                          : "border-slate-200 text-slate-600 hover:bg-slate-50"
                       }`}
                     >
                       {template.label}
@@ -1602,7 +1602,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
               <button
                 type="button"
                 onClick={() => setShowNew(false)}
-                className="rounded-lg border border-slate-300 px-2.5 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 transition-colors"
               >
                 Cancel
               </button>
@@ -1610,7 +1610,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 type="button"
                 onClick={() => void createPipeline()}
                 disabled={creating}
-                className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+                className="flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors disabled:opacity-50"
               >
                 {creating && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                 Create pipeline

@@ -223,7 +223,7 @@ obelisk.save(df_aggregated, "marts.aggregated_events")`,
   return (
     <div className="space-y-8 animate-in fade-in duration-200">
       {/* Hero Banner */}
-      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 text-white p-6 md:p-8 border border-slate-800 shadow-xl">
+      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white p-6 md:p-8 border border-slate-800 shadow-xl">
         <div className="absolute top-0 right-0 w-96 h-96 bg-sky-500/10 rounded-full blur-3xl pointer-events-none" />
         <div className="relative z-10 max-w-3xl space-y-3">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-sky-500/10 border border-sky-400/20 text-sky-300 text-xs font-mono">
@@ -320,7 +320,7 @@ obelisk.save(df_aggregated, "marts.aggregated_events")`,
       {(activeCategory === 'all' || activeCategory === 'guide') && (
         <div className="space-y-6 pt-4">
           <div className="flex items-center gap-2 border-b border-slate-200 pb-3">
-            <BookOpen className="w-5 h-5 text-indigo-600" />
+            <BookOpen className="w-5 h-5 text-sky-600" />
             <h3 className="text-base font-bold text-slate-900 font-mono uppercase tracking-wider">
               How to Use the Obelisk Platform: End-to-End Workflow
             </h3>
@@ -328,17 +328,17 @@ obelisk.save(df_aggregated, "marts.aggregated_events")`,
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
             {/* Step 1: Ingestion */}
-            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs space-y-3 hover:border-indigo-300 transition-all flex flex-col justify-between">
+            <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs space-y-3 hover:border-sky-300 transition-all flex flex-col justify-between">
               <div className="space-y-2">
-                <div className="w-8 h-8 rounded-lg bg-indigo-50 border border-indigo-100 text-indigo-700 flex items-center justify-center font-mono font-bold text-xs">
+                <div className="w-8 h-8 rounded-lg bg-sky-50 border border-sky-100 text-sky-700 flex items-center justify-center font-mono font-bold text-xs">
                   01
                 </div>
                 <h4 className="text-sm font-bold text-slate-900 font-mono">1-Click Ingest to Lakehouse</h4>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  In <strong>Data Catalog</strong>, expand any connected PostgreSQL, MySQL, MongoDB, or REST source. Click <strong>[ Ingest ]</strong> on any table to stream it straight into DuckLake as <code className="font-mono text-indigo-700 bg-indigo-50 px-1 py-0.5 rounded">lakehouse.&lt;folder&gt;.&lt;table&gt;</code>, in bounded chunks rather than a full-table staging copy.
+                  In <strong>Data Catalog</strong>, expand any connected PostgreSQL, MySQL, MongoDB, or REST source. Click <strong>[ Ingest ]</strong> on any table to stream it straight into DuckLake as <code className="font-mono text-sky-700 bg-sky-50 px-1 py-0.5 rounded">lakehouse.&lt;folder&gt;.&lt;table&gt;</code>, in bounded chunks rather than a full-table staging copy.
                 </p>
               </div>
-              <div className="pt-2 text-[11px] font-mono text-indigo-600 font-semibold flex items-center gap-1">
+              <div className="pt-2 text-[11px] font-mono text-sky-600 font-semibold flex items-center gap-1">
                 <span>Supports snapshot &amp; incremental watermarks</span>
               </div>
             </div>

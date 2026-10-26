@@ -94,11 +94,11 @@ const STATUS_STYLES: Record<
     icon: 'bg-rose-50 text-rose-600',
   },
   running: {
-    ring: '#4f46e5',
-    chip: 'bg-indigo-50 text-indigo-700',
+    ring: '#0284c7',
+    chip: 'bg-sky-50 text-sky-700',
     text: 'Running',
-    accent: 'bg-indigo-500',
-    icon: 'bg-indigo-50 text-indigo-600',
+    accent: 'bg-sky-500',
+    icon: 'bg-sky-50 text-sky-600',
   },
   pending: {
     ring: '#cbd5e1',
@@ -161,7 +161,7 @@ const StepNode: React.FC<NodeProps<StepNodeData>> = ({ data }) => {
   const border = problem
     ? "border-rose-400 ring-2 ring-rose-100"
     : selected
-      ? "border-indigo-400 ring-2 ring-indigo-100"
+      ? "border-sky-500 ring-2 ring-sky-100"
       : "border-slate-200 hover:border-slate-300";
 
   return (
@@ -183,7 +183,7 @@ const StepNode: React.FC<NodeProps<StepNodeData>> = ({ data }) => {
       <div className="flex items-center gap-2 px-3.5 py-2.5 pl-4">
         <span
           className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${
-            style?.icon ?? "bg-indigo-50 text-indigo-600"
+            style?.icon ?? "bg-sky-50 text-sky-600"
           }`}
         >
           <Icon className="h-3.5 w-3.5" />
@@ -234,7 +234,7 @@ const StepNode: React.FC<NodeProps<StepNodeData>> = ({ data }) => {
       <Handle
         type="source"
         position={Position.Right}
-        className="!h-2.5 !w-2.5 !border-2 !border-white !bg-indigo-500 opacity-0 transition-opacity group-hover:opacity-100"
+        className="!h-2.5 !w-2.5 !border-2 !border-white !bg-sky-500 opacity-0 transition-opacity group-hover:opacity-100"
       />
     </div>
   );
@@ -537,7 +537,7 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
       {!steps.length && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
           <div className="pointer-events-auto flex w-[320px] flex-col items-center gap-2 rounded-2xl border-2 border-dashed border-slate-300 bg-white/70 px-6 py-8 text-center">
-            <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">
+            <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-600">
               <Activity className="h-5 w-5" />
             </span>
             <p className="text-sm font-semibold text-slate-700">This graph is empty</p>
@@ -549,7 +549,7 @@ const CanvasInner: React.FC<PipelineCanvasProps> = ({
               <button
                 type="button"
                 onClick={onAddStep}
-                className="mt-1 flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700"
+                className="mt-1 flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors"
               >
                 <Plus className="h-3.5 w-3.5" /> Add the first step
               </button>

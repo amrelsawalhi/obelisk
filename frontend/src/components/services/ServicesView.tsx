@@ -159,7 +159,7 @@ export const ServicesView: React.FC = () => {
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-bold text-slate-900">{entry.display_name}</span>
                     <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">{entry.category}</span>
-                    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${entry.run_mode === 'process' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>
+                    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${entry.run_mode === 'process' ? 'bg-sky-50 text-sky-700 border-sky-200' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>
                       {entry.run_mode === 'process' ? 'Process' : 'Container'}
                     </span>
                   </div>

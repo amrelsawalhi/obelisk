@@ -202,7 +202,7 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
               <div className="flex items-center gap-2 flex-wrap">
                 <h2 className="text-base font-bold text-slate-900 leading-none">{service.display_name}</h2>
                 <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">{service.category}</span>
-                <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${isProcess ? 'bg-indigo-50 text-indigo-700 border-indigo-200' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>
+                <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${isProcess ? 'bg-sky-50 text-sky-700 border-sky-200' : 'bg-slate-100 text-slate-500 border-slate-200'}`}>
                   {isProcess ? 'Process' : 'Container'}
                 </span>
               </div>

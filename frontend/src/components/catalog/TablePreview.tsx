@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import type { CatalogTable, TablePreviewResponse } from '../../lib/types';
+import { DataGrid } from '../query/DataGrid';
 
 interface TablePreviewProps {
   sourceId: string;
@@ -73,9 +74,7 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
       <div className="h-16 border-b border-slate-200 px-6 flex items-center justify-between shrink-0 bg-slate-50/50">
         <div className="flex items-center gap-3">
           <div
-            className={`w-9 h-9 rounded-lg flex items-center justify-center ${
-              isLakehouse ? 'bg-indigo-50 text-indigo-700' : 'bg-sky-50 text-sky-700'
-            }`}
+            className="w-9 h-9 rounded-lg flex items-center justify-center bg-sky-50 text-sky-700"
           >
             {isLakehouse ? <Layers className="w-5 h-5" /> : <Database className="w-5 h-5" />}
           </div>
@@ -107,10 +106,14 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
                 const query = `-- Obelisk Query Studio (DuckDB Analytical Engine)\nSELECT * FROM ${canonicalFqn} LIMIT 50;\n`;
                 onOpenInQuery(query);
               }}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold shadow-2xs transition-colors ${
+                isLakehouse
+                  ? 'bg-sky-600 hover:bg-sky-700 text-white'
+                  : 'bg-white hover:bg-slate-50 text-slate-700 border border-slate-300'
+              }`}
               title="Open and query table in Monaco Query Studio"
             >
-              <Terminal className="w-3.5 h-3.5" />
+              <Terminal className={`w-3.5 h-3.5 ${isLakehouse ? 'text-white' : 'text-sky-600'}`} />
               <span>Query Table</span>
             </button>
           )}
@@ -120,10 +123,10 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
               onClick={() => {
                 onOpenInNotebook(table, canonicalFqn);
               }}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-lg text-xs font-semibold shadow-2xs transition-colors"
               title="Analyze in reactive Marimo notebook with obelisk Python SDK"
             >
-              <BookOpen className="w-3.5 h-3.5" />
+              <BookOpen className="w-3.5 h-3.5 text-amber-500" />
               <span>Analyze in Notebook</span>
             </button>
           )}
@@ -131,18 +134,18 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
           {!isLakehouse && (
             <button
               onClick={onOpenIngest}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white rounded-lg text-xs font-semibold shadow-2xs transition-colors"
             >
-              <ArrowDownToLine className="w-4 h-4" />
+              <ArrowDownToLine className="w-3.5 h-3.5" />
               <span>Ingest to Lakehouse</span>
             </button>
           )}
           <button
             onClick={fetchPreview}
             title="Reload Preview"
-            className="p-1.5 border border-slate-200 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition-colors"
+            className="p-1.5 border border-slate-300 rounded-lg text-slate-600 hover:text-slate-900 bg-white hover:bg-slate-50 shadow-2xs transition-colors"
           >
-            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
           </button>
         </div>
       </div>
@@ -201,62 +204,9 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
                 </span>
               </div>
 
-              {/* Table DataGrid */}
-              <div className="border border-slate-200 rounded-lg overflow-x-auto bg-white shadow-2xs">
-                <table className="w-full text-left text-xs border-collapse">
-                  <thead>
-                    <tr className="bg-slate-100/80 border-b border-slate-200 text-slate-700 font-mono">
-                      <th className="py-2.5 px-3 w-12 text-slate-400 text-[11px] font-normal border-r border-slate-200">
-                        #
-                      </th>
-                      {preview.columns.map((col) => (
-                        <th
-                          key={col}
-                          className="py-2.5 px-3 font-semibold text-slate-800 whitespace-nowrap border-r border-slate-200 last:border-r-0"
-                        >
-                          {col}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 font-mono text-[11px]">
-                    {preview.rows.length === 0 ? (
-                      <tr>
-                        <td
-                          colSpan={preview.columns.length + 1}
-                          className="py-8 text-center text-slate-400"
-                        >
-                          Table is empty (0 rows).
-                        </td>
-                      </tr>
-                    ) : (
-                      preview.rows.map((row, idx) => (
-                        <tr key={idx} className="hover:bg-sky-50/40 transition-colors">
-                          <td className="py-2 px-3 text-slate-400 border-r border-slate-200 select-none">
-                            {idx + 1}
-                          </td>
-                          {preview.columns.map((col) => {
-                            const val = row[col];
-                            return (
-                              <td
-                                key={col}
-                                className="py-2 px-3 text-slate-700 whitespace-nowrap border-r border-slate-200 last:border-r-0 max-w-xs truncate"
-                              >
-                                {val === null || val === undefined ? (
-                                  <span className="text-slate-300 italic">null</span>
-                                ) : typeof val === 'object' ? (
-                                  JSON.stringify(val)
-                                ) : (
-                                  String(val)
-                                )}
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
+              {/* Virtualized DataGrid */}
+              <div className="h-[calc(100vh-270px)] min-h-[350px]">
+                <DataGrid columns={preview.columns} rows={preview.rows} />
               </div>
             </div>
           )

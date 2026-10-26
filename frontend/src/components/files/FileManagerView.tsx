@@ -347,19 +347,22 @@ export const FileManagerView: React.FC = () => {
                 <div
                   key={file.path}
                   onClick={() => setActivePath(file.path)}
-                  className={`group flex items-center gap-2 px-3 py-1.5 text-xs font-medium cursor-pointer border-r border-slate-200 transition-colors ${
+                  className={`group h-8 px-2.5 rounded-t-md flex items-center gap-1.5 text-xs font-mono cursor-pointer transition-all border-t-2 select-none ${
                     isActive
-                      ? 'bg-white text-slate-900 border-t-2 border-t-sky-600 shadow-xs'
-                      : 'text-slate-600 hover:bg-slate-200/60 hover:text-slate-900'
+                      ? 'bg-white border-t-sky-600 text-slate-900 font-semibold shadow-2xs border-x border-slate-200 -mb-[1px] z-10'
+                      : 'border-t-transparent bg-slate-200/50 hover:bg-slate-200/90 text-slate-500 hover:text-slate-800'
                   }`}
+                  title={file.path}
                 >
-                  <span className="truncate max-w-[140px]">{file.name}</span>
+                  <Code2 className="w-3.5 h-3.5 text-sky-600 shrink-0" />
+                  <span className="truncate max-w-[140px] text-[11px]">{file.name}</span>
                   {file.isDirty ? (
-                    <span className="w-2 h-2 rounded-full bg-amber-500 shrink-0" title="Unsaved changes" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" title="Unsaved changes" />
                   ) : null}
                   <button
                     onClick={(e) => handleCloseTab(file.path, e)}
-                    className="p-0.5 rounded-full hover:bg-slate-200 text-slate-400 hover:text-slate-700"
+                    className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-slate-200 text-slate-400 hover:text-slate-700 transition-opacity ml-1"
+                    title="Close"
                   >
                     <X className="w-3 h-3" />
                   </button>

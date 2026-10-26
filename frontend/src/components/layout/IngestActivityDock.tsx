@@ -71,10 +71,10 @@ export const IngestActivityDock: React.FC = () => {
       <div className="fixed bottom-5 right-5 z-50 flex items-center gap-3 bg-slate-900/95 text-white px-4 py-2.5 rounded-full shadow-2xl border border-slate-700/80 backdrop-blur-md animate-in slide-in-from-bottom-3 duration-200">
         <div
           onClick={restoreDrawer}
-          className="flex items-center gap-2.5 cursor-pointer hover:text-indigo-300 transition-colors"
+          className="flex items-center gap-2.5 cursor-pointer hover:text-sky-300 transition-colors"
         >
           {runningCount > 0 ? (
-            <RefreshCw className="w-4 h-4 text-indigo-400 animate-spin" />
+            <RefreshCw className="w-4 h-4 text-sky-400 animate-spin" />
           ) : completedCount === totalJobs ? (
             <CheckCircle2 className="w-4 h-4 text-emerald-400" />
           ) : (
@@ -85,7 +85,7 @@ export const IngestActivityDock: React.FC = () => {
             {totalJobs === 1 ? (
               <>
                 <span className="truncate max-w-[200px] font-mono">{currentJob.title}</span>
-                <span className="bg-indigo-900/80 text-indigo-300 px-1.5 py-0.5 rounded text-[10px] font-bold font-mono">
+                <span className="bg-sky-900/80 text-sky-300 px-1.5 py-0.5 rounded text-[10px] font-bold font-mono">
                   {currentJob.percent}%
                 </span>
               </>
@@ -94,7 +94,7 @@ export const IngestActivityDock: React.FC = () => {
                 <span className="font-sans font-bold">
                   {runningCount > 0 ? `${runningCount} Ingesting` : 'Ingestions'}
                 </span>
-                <span className="bg-indigo-900/80 text-indigo-300 px-1.5 py-0.5 rounded text-[10px] font-bold font-mono">
+                <span className="bg-sky-900/80 text-sky-300 px-1.5 py-0.5 rounded text-[10px] font-bold font-mono">
                   {avgPercent}% avg
                 </span>
                 <span className="text-[10px] text-slate-400 font-mono hidden sm:inline">
@@ -140,7 +140,7 @@ export const IngestActivityDock: React.FC = () => {
       {/* Main Drawer Header */}
       <div className="px-4 py-3 bg-slate-900 text-white flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2.5">
-          <div className="p-1.5 bg-slate-800 text-indigo-400 rounded-lg">
+          <div className="p-1.5 bg-slate-800 text-sky-400 rounded-lg">
             <Layers className="w-4 h-4" />
           </div>
           <div>
@@ -149,7 +149,7 @@ export const IngestActivityDock: React.FC = () => {
               <span
                 className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-bold uppercase ${
                   runningCount > 0
-                    ? 'bg-indigo-900/80 text-indigo-300'
+                    ? 'bg-sky-900/80 text-sky-300'
                     : 'bg-emerald-900/80 text-emerald-300'
                 }`}
               >
@@ -208,12 +208,12 @@ export const IngestActivityDock: React.FC = () => {
               onClick={() => selectJob(job.id)}
               className={`group flex items-center gap-2 px-3 py-1.5 rounded-t-lg cursor-pointer transition-all border-b-2 text-xs select-none shrink-0 ${
                 isSelected
-                  ? 'bg-slate-800/90 text-white border-indigo-500 font-semibold shadow-sm'
+                  ? 'bg-slate-800/90 text-white border-sky-500 font-semibold shadow-sm'
                   : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900 border-transparent font-normal'
               }`}
             >
               {isJobRunning ? (
-                <RefreshCw className="w-3 h-3 text-indigo-400 animate-spin shrink-0" />
+                <RefreshCw className="w-3 h-3 text-sky-400 animate-spin shrink-0" />
               ) : isJobDone ? (
                 <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
               ) : isJobFailed ? (
@@ -250,22 +250,22 @@ export const IngestActivityDock: React.FC = () => {
         <div>
           <div className="flex items-center justify-between text-xs font-semibold text-slate-700 mb-1">
             <span className="flex items-center gap-1.5 truncate max-w-[380px]">
-              {isRunning && <RefreshCw className="w-3 h-3 text-indigo-600 animate-spin shrink-0" />}
+              {isRunning && <RefreshCw className="w-3 h-3 text-sky-600 animate-spin shrink-0" />}
               <span className="truncate">{currentJob.current_phase || (isRunning ? 'Processing...' : 'Completed')}</span>
             </span>
-            <span className="font-mono text-indigo-600 font-bold shrink-0">
+            <span className="font-mono text-sky-600 font-bold shrink-0">
               {indeterminate ? '—' : `${currentJob.percent}%`}
             </span>
           </div>
 
           <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
             {indeterminate ? (
-              <div className="h-full w-full bg-gradient-to-r from-indigo-400 via-indigo-600 to-indigo-400 animate-pulse" />
+              <div className="h-full w-full bg-gradient-to-r from-sky-400 via-sky-600 to-sky-400 animate-pulse" />
             ) : (
               <div
                 className={`h-full transition-all duration-300 ${
                   isRunning
-                    ? 'bg-gradient-to-r from-indigo-500 to-indigo-600'
+                    ? 'bg-gradient-to-r from-sky-500 to-sky-600'
                     : isSuccess
                     ? 'bg-emerald-500'
                     : isCancelled
@@ -293,7 +293,7 @@ export const IngestActivityDock: React.FC = () => {
             <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">
               Rows Extracted
             </div>
-            <div className="text-sm font-bold text-indigo-600 font-mono mt-0.5">
+            <div className="text-sm font-bold text-sky-600 font-mono mt-0.5">
               {(
                 (currentJob.total_rows || 0) + (currentJob.staged_rows || 0)
               ).toLocaleString()}
@@ -307,7 +307,7 @@ export const IngestActivityDock: React.FC = () => {
             <div
               className={`text-sm font-bold capitalize mt-0.5 ${
                 isRunning
-                  ? 'text-indigo-600'
+                  ? 'text-sky-600'
                   : isSuccess
                   ? 'text-emerald-600'
                   : isCancelled
@@ -325,12 +325,12 @@ export const IngestActivityDock: React.FC = () => {
       <div className="p-3 bg-white flex flex-col flex-1 min-h-[160px] max-h-[260px]">
         <div className="flex items-center justify-between text-xs font-semibold text-slate-600 mb-1.5 shrink-0">
           <span className="flex items-center gap-1.5 font-mono text-[11px]">
-            <Database className="w-3.5 h-3.5 text-indigo-600" />
+            <Database className="w-3.5 h-3.5 text-sky-600" />
             <span>Execution Terminal ({activeLogs.length} lines)</span>
           </span>
           <button
             onClick={() => setShowLogs(!showLogs)}
-            className="text-[10px] text-indigo-600 hover:underline"
+            className="text-[10px] text-sky-600 hover:underline"
           >
             {showLogs ? 'Hide' : 'Show'}
           </button>
@@ -360,7 +360,7 @@ export const IngestActivityDock: React.FC = () => {
                         : isCheck
                         ? 'text-emerald-400 font-semibold'
                         : isStart
-                        ? 'text-indigo-300'
+                        ? 'text-sky-300'
                         : 'text-slate-300'
                     }`}
                   >
@@ -377,8 +377,8 @@ export const IngestActivityDock: React.FC = () => {
       <div className="px-4 py-2.5 bg-slate-50 border-t border-slate-200 flex items-center justify-between shrink-0">
         <div className="text-[10px] text-slate-500 font-mono">
           {isRunning ? (
-            <span className="flex items-center gap-1 text-indigo-600 font-semibold">
-              <span className="w-1.5 h-1.5 rounded-full bg-indigo-600 animate-pulse" />
+            <span className="flex items-center gap-1 text-sky-600 font-semibold">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-600 animate-pulse" />
               Worker active in background
             </span>
           ) : (

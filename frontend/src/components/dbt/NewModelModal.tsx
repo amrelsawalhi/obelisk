@@ -79,8 +79,8 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-      <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-md overflow-hidden select-none">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+      <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-md overflow-hidden select-none">
         {/* Header */}
         <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50/50">
           <div className="flex items-center gap-2">
@@ -150,13 +150,13 @@ export const NewModelModal: React.FC<NewModelModalProps> = ({
                 onClick={() => setFolder('marts')}
                 className={`p-3 rounded-lg border text-left transition-all ${
                   folder === 'marts'
-                    ? 'border-indigo-500 bg-indigo-50/60 ring-2 ring-indigo-500/20'
+                    ? 'border-amber-500 bg-amber-50/60 ring-2 ring-amber-500/20'
                     : 'border-slate-200 hover:border-slate-300 bg-white'
                 }`}
               >
                 <div className="font-semibold text-xs text-slate-900 flex items-center justify-between">
                   <span>Marts</span>
-                  {folder === 'marts' && <Check className="w-3.5 h-3.5 text-indigo-600" />}
+                  {folder === 'marts' && <Check className="w-3.5 h-3.5 text-amber-600" />}
                 </div>
                 <div className="text-[10px] text-slate-500 mt-1">models/marts/</div>
               </button>

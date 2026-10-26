@@ -11,6 +11,7 @@ import { BatchIngestModal } from './BatchIngestModal';
 import { AddConnectionModal } from './AddConnectionModal';
 import { ConfirmDialog } from '../common/ConfirmDialog';
 import type { ConfirmRequest } from '../common/ConfirmDialog';
+import { EmptyState } from '../common/ui/EmptyState';
 import { toast } from '../../lib/toast';
 
 interface SelectedTable {
@@ -178,22 +179,18 @@ export const CatalogView: React.FC = () => {
           onOpenInNotebook={handleOpenInNotebook}
         />
       ) : (
-        <div className="flex-1 flex flex-col items-center justify-center p-8 bg-slate-50/50 text-center">
-          <Database className="w-12 h-12 text-slate-300 mb-3" />
-          <h3 className="text-sm font-bold text-slate-700">Select a Table to Inspect</h3>
-          <p className="text-xs text-slate-400 max-w-sm mt-1">
-            Select any table in the Lakehouse or connect to an external source to inspect schemas and preview live rows.
-          </p>
-          <button
-            onClick={() => {
+        <div className="flex-1 flex flex-col items-center justify-center p-8 bg-slate-50/50">
+          <EmptyState
+            icon={<Database className="w-6 h-6 text-slate-400" />}
+            title="Select a Table to Inspect"
+            description="Select any table in the Lakehouse or connect to an external source to inspect schemas and preview live rows."
+            actionLabel="Add Source Connection"
+            actionIcon={<Plus className="w-3.5 h-3.5" />}
+            onAction={() => {
               setEditingConnection(null);
               setIsAddConnectionOpen(true);
             }}
-            className="mt-4 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold shadow-2xs transition-all"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span>Add Source Connection</span>
-          </button>
+          />
         </div>
       )}
 

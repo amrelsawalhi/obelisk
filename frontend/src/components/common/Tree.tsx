@@ -27,7 +27,7 @@ const ACCENT: Record<TreeAccent, { selected: string; bar: string }> = {
 
 /** Icon colours for the catalog hierarchy. Folder amber mirrors VS Code. */
 export const TREE_ICON = {
-  lakehouse: 'text-indigo-600',
+  lakehouse: 'text-sky-600',
   database: 'text-sky-600',
   folder: 'text-amber-500',
   schema: 'text-sky-600',
@@ -76,7 +76,7 @@ export const TreeRow: React.FC<TreeRowProps> = ({
   expandable = false,
   expanded = false,
   selected = false,
-  accent = 'indigo',
+  accent = 'sky',
   variant = 'row',
   actionsVisible = false,
   onClick,

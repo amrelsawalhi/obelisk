@@ -294,8 +294,12 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
     setEditingTabId(null);
   };
 
-  const toggleGroup = (key: string) => {
-    setCollapsedGroups((prev) => ({ ...prev, [key]: !prev[key] }));
+  const toggleGroup = (key: string, isCurrentlyExpanded?: boolean) => {
+    setCollapsedGroups((prev) => {
+      const nextCollapsed =
+        isCurrentlyExpanded !== undefined ? isCurrentlyExpanded : !prev[key];
+      return { ...prev, [key]: nextCollapsed };
+    });
   };
 
   const fetchHistory = async () => {
@@ -550,8 +554,12 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
     updateActiveTabSql(`${activeTab.sql.trimEnd()} ${colName}`);
   };
 
-  const toggleTableExpand = (key: string) => {
-    setExpandedTables((prev) => ({ ...prev, [key]: !prev[key] }));
+  const toggleTableExpand = (key: string, isCurrentlyExpanded?: boolean) => {
+    setExpandedTables((prev) => {
+      const nextExpanded =
+        isCurrentlyExpanded !== undefined ? !isCurrentlyExpanded : !prev[key];
+      return { ...prev, [key]: nextExpanded };
+    });
   };
 
   const handleExport = async (format: 'parquet' | 'csv') => {

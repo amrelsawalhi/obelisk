@@ -107,8 +107,8 @@ export const DeployModal: React.FC<DeployModalProps> = ({
   const webUiUrl = `http://localhost:${hostPort}`;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4 animate-in fade-in duration-150">
-      <div className="w-full max-w-xl bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[92vh] animate-in zoom-in-95 duration-150">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+      <div className="w-full max-w-xl bg-white rounded-xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[92vh] animate-in zoom-in-95 duration-150">
         
         {/* Header */}
         <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50/80 shrink-0">
@@ -449,7 +449,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({
               className={`px-4 py-1.5 rounded-lg text-xs font-semibold transition-colors ${
                 isCompleted
                   ? 'bg-slate-900 hover:bg-slate-800 text-white shadow-2xs'
-                  : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 disabled:opacity-40'
+                  : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 shadow-2xs disabled:opacity-40'
               }`}
             >
               {isCompleted ? 'Done' : 'Close'}

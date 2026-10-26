@@ -75,7 +75,7 @@ export const DashboardsView: React.FC = () => {
             <button
               onClick={handleDeployLocal}
               disabled={deploying}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors disabled:opacity-50"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white rounded-lg text-xs font-semibold shadow-2xs transition-colors disabled:opacity-50"
             >
               {deploying ? (
                 <>
@@ -107,7 +107,7 @@ export const DashboardsView: React.FC = () => {
           <button
             onClick={fetchStatus}
             title="Refresh status"
-            className="p-1.5 border border-slate-200 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition-colors"
+            className="p-1.5 border border-slate-300 rounded-lg text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 shadow-2xs transition-colors"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
           </button>
@@ -131,7 +131,7 @@ export const DashboardsView: React.FC = () => {
           />
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4">
-            <div className="w-16 h-16 rounded-2xl bg-white border border-slate-200 flex items-center justify-center shadow-xs text-slate-400">
+            <div className="w-16 h-16 rounded-xl bg-white border border-slate-200 flex items-center justify-center shadow-2xs text-slate-400">
               <BarChart3 className="w-8 h-8 text-sky-600" />
             </div>
             <div>

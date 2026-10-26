@@ -223,12 +223,16 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
                   onClick={() => handleTypeChange(item.id as SupportedSourceType)}
                   className={`py-2 px-1 text-xs font-medium rounded-lg border text-center transition-all ${
                     sourceType === item.id
-                      ? 'border-sky-500 bg-sky-50 text-sky-900 font-semibold ring-1 ring-sky-500'
+                      ? 'border-sky-500 bg-sky-50 text-sky-900 font-semibold ring-1 ring-sky-500 shadow-2xs'
                       : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
                   }`}
                 >
-                  <div className="text-base">{item.icon}</div>
-                  <div className="text-[11px] truncate mt-0.5">{item.label}</div>
+                  <div className={`w-7 h-7 mx-auto rounded-md flex items-center justify-center text-sm ${
+                    sourceType === item.id ? 'bg-sky-100/80' : 'bg-slate-100'
+                  }`}>
+                    {item.icon}
+                  </div>
+                  <div className="text-[11px] font-medium truncate mt-1.5">{item.label}</div>
                 </button>
               ))}
             </div>
@@ -372,7 +376,7 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
                   onClick={() => setReadOnly(false)}
                   className={`px-2.5 py-1 text-[11px] font-semibold transition-colors border-l border-slate-300 ${
                     !readOnly
-                      ? 'bg-indigo-600 text-white'
+                      ? 'bg-sky-600 text-white shadow-2xs'
                       : 'bg-white text-slate-600 hover:bg-slate-100'
                   }`}
                 >

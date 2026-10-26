@@ -455,7 +455,7 @@ export const SettingsView: React.FC = () => {
       {activeSubTab === 'variables' && (
         <div className="space-y-6">
           {/* Informational Banner */}
-          <div className="bg-gradient-to-r from-sky-50 to-indigo-50/60 border border-sky-100 rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="bg-gradient-to-r from-sky-50/80 to-slate-50 border border-sky-100 rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div className="space-y-1">
               <div className="flex items-center gap-2">
                 <span className="flex h-2 w-2 rounded-full bg-sky-600" />
@@ -710,7 +710,7 @@ export const SettingsView: React.FC = () => {
                             </span>
                           ) : (
                             <span
-                              className="ml-1 px-2 py-0.5 rounded text-[10px] uppercase font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200"
+                              className="ml-1 px-2 py-0.5 rounded text-[10px] uppercase font-semibold bg-sky-50 text-sky-700 border border-sky-200"
                               title="Obelisk may publish dbt models or a saved DataFrame into this database."
                             >
                               Writable
@@ -1322,14 +1322,14 @@ export const SettingsView: React.FC = () => {
                     setIsAddVarOpen(false);
                     setEditingVar(null);
                   }}
-                  className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700"
+                  className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-xs font-semibold text-slate-700 shadow-2xs transition-colors"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={savingVar || varValueLoading || !newVarKey.trim() || !newVarValue.trim()}
-                  className="px-4 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold shadow-xs disabled:opacity-50 transition-all"
+                  className="px-4 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold shadow-2xs disabled:opacity-50 transition-colors"
                 >
                   {savingVar ? 'Saving...' : editingVar ? 'Save Changes' : 'Save Variable'}
                 </button>

@@ -117,7 +117,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
       {/* Grid: 1. Live Hardware & Telemetry + 2. Platform Assets & Orchestration Health */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* SECTION 1: Hardware & ResourceAdvisor Status */}
-        <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs flex flex-col justify-between space-y-4">
+        <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-2xs flex flex-col justify-between space-y-4">
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
             <div className="flex items-center gap-2">
               <Cpu className="w-4 h-4 text-sky-600" />
@@ -196,11 +196,11 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         </div>
 
         {/* SECTION 2: Platform Assets & Orchestration Health (2 Columns on large screens) */}
-        <div className="lg:col-span-2 bg-white rounded-2xl border border-slate-200 p-5 shadow-xs flex flex-col justify-between space-y-4">
+        <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200 p-5 shadow-2xs flex flex-col justify-between space-y-4">
           {/* Card Header */}
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
             <div className="flex items-center gap-2">
-              <Activity className="w-4 h-4 text-indigo-600" />
+              <Activity className="w-4 h-4 text-sky-600" />
               <div>
                 <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider font-mono">
                   Platform Assets & Orchestration Health
@@ -210,14 +210,14 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             <div className="flex items-center gap-2">
               <button
                 onClick={() => onNavigate('pipelines')}
-                className="flex items-center gap-1.5 px-3 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 rounded-lg text-xs font-semibold transition-colors"
+                className="flex items-center gap-1.5 px-3 py-1 bg-sky-600 hover:bg-sky-700 text-white rounded-lg text-xs font-semibold shadow-2xs transition-colors"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>Schedule Job</span>
               </button>
               <button
                 onClick={() => onNavigate('pipelines')}
-                className="text-xs text-sky-600 hover:text-sky-700 font-medium flex items-center gap-1"
+                className="text-xs text-slate-600 hover:text-sky-700 font-medium flex items-center gap-1 transition-colors"
               >
                 <span>Pipelines</span>
                 <ArrowUpRight className="w-3.5 h-3.5" />
@@ -230,11 +230,11 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             {/* 1. External Data Sources */}
             <div
               onClick={() => onNavigate('catalog')}
-              className="p-3.5 rounded-xl border border-sky-200/80 bg-sky-50/40 hover:bg-sky-50/80 transition-all cursor-pointer group flex flex-col justify-between"
+              className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/60 hover:bg-slate-100/80 hover:border-slate-300 transition-all cursor-pointer group flex flex-col justify-between shadow-2xs"
             >
               <div>
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-mono uppercase font-bold text-sky-800">
+                  <span className="text-[10px] font-mono uppercase font-bold text-slate-600">
                     Data Sources
                   </span>
                   <Database className="w-3.5 h-3.5 text-sky-600 group-hover:scale-110 transition-transform" />
@@ -243,7 +243,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                   {externalConnsCount}
                 </div>
               </div>
-              <div className="mt-2 pt-2 border-t border-sky-100 text-[11px] text-slate-500 font-mono truncate">
+              <div className="mt-2 pt-2 border-t border-slate-200/60 text-[11px] text-slate-500 font-mono truncate">
                 {externalConnsCount > 0 ? (
                   <span className="flex items-center gap-1 text-emerald-700 font-medium">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
@@ -258,11 +258,11 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             {/* 2. Pipelines */}
             <div
               onClick={() => onNavigate('pipelines')}
-              className="p-3.5 rounded-xl border border-indigo-200/80 bg-indigo-50/40 hover:bg-indigo-50/80 transition-all cursor-pointer group flex flex-col justify-between"
+              className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/60 hover:bg-slate-100/80 hover:border-slate-300 transition-all cursor-pointer group flex flex-col justify-between shadow-2xs"
             >
               <div>
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-mono uppercase font-bold text-indigo-800">
+                  <span className="text-[10px] font-mono uppercase font-bold text-slate-600">
                     Pipelines
                   </span>
                   <Clock className="w-3.5 h-3.5 text-indigo-600 group-hover:scale-110 transition-transform" />
@@ -271,7 +271,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                   {totalPipelineCount}
                 </div>
               </div>
-              <div className="mt-2 pt-2 border-t border-indigo-100 text-[11px] text-slate-500 font-mono truncate">
+              <div className="mt-2 pt-2 border-t border-slate-200/60 text-[11px] text-slate-500 font-mono truncate">
                 {totalPipelineCount === 0 ? 'No pipelines yet' : `${activePipelineCount} enabled`}
               </div>
             </div>
@@ -279,20 +279,20 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             {/* 3. dbt Transformation Models */}
             <div
               onClick={() => onNavigate('dbt')}
-              className="p-3.5 rounded-xl border border-violet-200/80 bg-violet-50/40 hover:bg-violet-50/80 transition-all cursor-pointer group flex flex-col justify-between"
+              className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/60 hover:bg-slate-100/80 hover:border-slate-300 transition-all cursor-pointer group flex flex-col justify-between shadow-2xs"
             >
               <div>
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-mono uppercase font-bold text-violet-800">
+                  <span className="text-[10px] font-mono uppercase font-bold text-slate-600">
                     dbt Models
                   </span>
-                  <Layers className="w-3.5 h-3.5 text-violet-600 group-hover:scale-110 transition-transform" />
+                  <Layers className="w-3.5 h-3.5 text-purple-600 group-hover:scale-110 transition-transform" />
                 </div>
                 <div className="text-2xl font-bold font-mono text-slate-900 mt-1">
                   {totalDbtModels}
                 </div>
               </div>
-              <div className="mt-2 pt-2 border-t border-violet-100 text-[11px] text-slate-500 font-mono truncate">
+              <div className="mt-2 pt-2 border-t border-slate-200/60 text-[11px] text-slate-500 font-mono truncate">
                 {stagingModels.length} Staging • {martModels.length} Marts
               </div>
             </div>
@@ -300,11 +300,11 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             {/* 4. Interactive Notebooks */}
             <div
               onClick={() => onNavigate('notebooks')}
-              className="p-3.5 rounded-xl border border-amber-200/80 bg-amber-50/40 hover:bg-amber-50/80 transition-all cursor-pointer group flex flex-col justify-between"
+              className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/60 hover:bg-slate-100/80 hover:border-slate-300 transition-all cursor-pointer group flex flex-col justify-between shadow-2xs"
             >
               <div>
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-mono uppercase font-bold text-amber-800">
+                  <span className="text-[10px] font-mono uppercase font-bold text-slate-600">
                     Notebooks
                   </span>
                   <BookOpen className="w-3.5 h-3.5 text-amber-600 group-hover:scale-110 transition-transform" />
@@ -313,7 +313,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                   {notebooksCount}
                 </div>
               </div>
-              <div className="mt-2 pt-2 border-t border-amber-100 text-[11px] text-slate-500 font-mono truncate">
+              <div className="mt-2 pt-2 border-t border-slate-200/60 text-[11px] text-slate-500 font-mono truncate">
                 {isMarimoRunning ? (
                   <span className="text-emerald-700 font-medium">Marimo Server Live</span>
                 ) : (
@@ -349,7 +349,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                   )}
                   <button
                     onClick={() => onNavigate('pipelines')}
-                    className="ml-1 inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-indigo-600 underline"
+                    className="ml-1 inline-flex items-center gap-1 text-[11px] font-medium text-slate-600 hover:text-sky-600 underline transition-colors"
                   >
                     <Terminal className="w-3 h-3" />
                     <span>Open run</span>
@@ -383,7 +383,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
       </div>
 
       {/* SECTION 3: Active Services Status Grid (6 Managed Services) */}
-      <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-4">
+      <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-2xs space-y-4">
         <div className="flex items-center justify-between border-b border-slate-100 pb-3">
           <div>
             <h3 className="text-sm font-bold text-slate-900">

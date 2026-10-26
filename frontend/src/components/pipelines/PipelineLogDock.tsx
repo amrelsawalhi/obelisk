@@ -163,7 +163,7 @@ export const PipelineLogDock: React.FC<PipelineLogDockProps> = ({
           </span>
         )}
         <div className="ml-auto flex items-center gap-0.5">
-          {loading && <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-500" />}
+          {loading && <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-500" />}
           <span className="mr-1 font-mono text-[10px] text-slate-300">
             {current?.started_at ? fmtWhen(current.started_at) : ""}
           </span>
@@ -188,7 +188,7 @@ export const PipelineLogDock: React.FC<PipelineLogDockProps> = ({
           <button
             type="button"
             onClick={() => setWrap((value) => !value)}
-            className={`rounded px-1 py-0.5 font-mono text-[10px] ${wrap ? "text-indigo-600" : "text-slate-400"} hover:bg-slate-100`}
+            className={`rounded px-1.5 py-0.5 font-mono text-[10px] font-medium transition-colors ${wrap ? "bg-sky-50 text-sky-700" : "text-slate-400 hover:bg-slate-100"}`}
             title="Toggle line wrapping"
           >
             wrap
@@ -196,7 +196,7 @@ export const PipelineLogDock: React.FC<PipelineLogDockProps> = ({
           <button
             type="button"
             onClick={() => setFollow((value) => !value)}
-            className={`rounded px-1 py-0.5 font-mono text-[10px] ${follow ? "text-indigo-600" : "text-slate-400"} hover:bg-slate-100`}
+            className={`rounded px-1.5 py-0.5 font-mono text-[10px] font-medium transition-colors ${follow ? "bg-sky-50 text-sky-700" : "text-slate-400 hover:bg-slate-100"}`}
             title="Follow new output"
           >
             tail

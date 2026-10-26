@@ -31,8 +31,8 @@ export interface SchemaExplorerPanelProps {
   nodes: CatalogNode[];
   collapsedGroups: Record<string, boolean>;
   expandedTables: Record<string, boolean>;
-  onToggleGroup: (key: string) => void;
-  onToggleTable: (key: string) => void;
+  onToggleGroup: (key: string, isCurrentlyExpanded?: boolean) => void;
+  onToggleTable: (key: string, isCurrentlyExpanded?: boolean) => void;
   onRefresh: () => void;
   onSelectTable: (table: CatalogTable, info: TableSelectionInfo) => void;
   onInsertColumn: (column: string) => void;
@@ -87,7 +87,7 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
           depth={depth}
           expandable={hasColumns}
           expanded={isExpanded}
-          onToggle={() => onToggleTable(rowKey)}
+          onToggle={() => onToggleTable(rowKey, isExpanded)}
           onClick={() => onSelectTable(table, info)}
           icon={
             <FileSpreadsheet
@@ -129,14 +129,15 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
     const renderDirectory = (dir: DirectoryTreeNode, depth: number): React.ReactNode => {
       const dirKey = `lakehouse_dir:${dir.path}`;
       const isDirCollapsed = !!collapsedGroups[dirKey];
+      const isDirExpanded = !isDirCollapsed;
 
       return (
         <React.Fragment key={dirKey}>
           <TreeRow
             depth={depth}
             expandable
-            expanded={!isDirCollapsed}
-            onClick={() => onToggleGroup(dirKey)}
+            expanded={isDirExpanded}
+            onClick={() => onToggleGroup(dirKey, isDirExpanded)}
             icon={
               isDirCollapsed ? (
                 <Folder className={`h-3.5 w-3.5 ${TREE_ICON.folder}`} />
@@ -176,7 +177,7 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
           variant="section"
           expandable
           expanded={!isCollapsed}
-          onClick={() => onToggleGroup(groupKey)}
+          onClick={() => onToggleGroup(groupKey, !isCollapsed)}
           icon={<Layers className={`h-4 w-4 ${TREE_ICON.lakehouse}`} />}
           label={node.name}
           badge={totalCount}
@@ -231,7 +232,7 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
           variant="section"
           expandable
           expanded={!isCollapsed}
-          onClick={() => onToggleGroup(groupKey)}
+          onClick={() => onToggleGroup(groupKey, !isCollapsed)}
           icon={<Database className={`h-4 w-4 ${TREE_ICON.database}`} />}
           label={node.name}
           badge={node.tables?.length || 0}
@@ -245,6 +246,7 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
           schemaNames.map((schemaName) => {
             const schemaKey = `db_schema:${node.id}:${schemaName}`;
             const isSchemaCollapsed = !!collapsedGroups[schemaKey];
+            const isSchemaExpanded = !isSchemaCollapsed;
             const tablesInSchema = schemaGroups[schemaName];
 
             return (
@@ -252,8 +254,8 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
                 <TreeRow
                   depth={0}
                   expandable
-                  expanded={!isSchemaCollapsed}
-                  onClick={() => onToggleGroup(schemaKey)}
+                  expanded={isSchemaExpanded}
+                  onClick={() => onToggleGroup(schemaKey, isSchemaExpanded)}
                   icon={<Table2 className={`h-3.5 w-3.5 ${TREE_ICON.schema}`} />}
                   label={schemaName}
                   labelClassName="font-mono text-[11px] font-semibold"
