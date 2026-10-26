@@ -27,6 +27,13 @@ def upgrade() -> None:
         "'[\"sql\", \"pushdown\", \"live\", \"preview\", \"federated\"]' "
         f"WHERE lower(source_type) IN {_ATTACHABLE} AND driver = 'attach'"
     )
+    # ``read_only`` was written ``0`` for a pulled source; an attached one is read-only in
+    # SQL by construction (the platform has no write path into MySQL or Mongo), so keeping
+    # the old value would put a WRITABLE pill on a source that cannot be written.
+    op.execute(
+        "UPDATE connections SET read_only = 1 "
+        f"WHERE lower(source_type) IN {_ATTACHABLE} AND driver = 'attach'"
+    )
 
 
 def downgrade() -> None:
@@ -36,5 +43,9 @@ def downgrade() -> None:
     )
     op.execute(
         "UPDATE connections SET capabilities_json = '[\"sql\", \"pull\", \"preview\"]' "
+        f"WHERE lower(source_type) IN {_ATTACHABLE} AND driver = 'sdk'"
+    )
+    op.execute(
+        "UPDATE connections SET read_only = 0 "
         f"WHERE lower(source_type) IN {_ATTACHABLE} AND driver = 'sdk'"
     )
