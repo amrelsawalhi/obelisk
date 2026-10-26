@@ -130,26 +130,48 @@ export const DashboardsView: React.FC = () => {
             className="w-full h-full border-0 bg-white"
           />
         ) : (
-          <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-4">
-            <div className="w-16 h-16 rounded-xl bg-white border border-slate-200 flex items-center justify-center shadow-2xs text-slate-400">
-              <BarChart3 className="w-8 h-8 text-sky-600" />
-            </div>
-            <div>
-              <h3 className="text-sm font-bold text-slate-800">
-                Apache Superset BI Engine is Offline
+          <div className="flex-1 flex flex-col items-center justify-center p-8 bg-slate-50/50">
+            <div className="max-w-md w-full bg-white p-8 rounded-2xl border border-slate-200/90 shadow-xs flex flex-col items-center text-center">
+              <div className="w-14 h-14 rounded-2xl bg-sky-50 border border-sky-100 flex items-center justify-center text-sky-600 mb-4 shadow-2xs">
+                <BarChart3 className="w-7 h-7" />
+              </div>
+
+              <h3 className="text-base font-bold text-slate-900 tracking-tight">
+                Business Intelligence & Visual Dashboards
               </h3>
-              <p className="text-xs text-slate-500 max-w-md mt-1">
-                Obelisk integrates Apache Superset for indexed SQL visual dashboards querying your Gold dimensional marts in PostgreSQL and ClickHouse.
+
+              <p className="text-xs text-slate-500 mt-2 leading-relaxed">
+                Obelisk integrates Apache Superset for interactive chart exploration, cross-filtering, and automated dashboards over your Lakehouse and PostgreSQL marts.
               </p>
-            </div>
-            <div className="flex items-center gap-3">
+
+              {/* Service Specs Badges */}
+              <div className="w-full grid grid-cols-2 gap-2 my-5 pt-4 border-t border-slate-100 text-[11px] font-mono text-left">
+                <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200/60">
+                  <span className="text-slate-400 block text-[10px] uppercase font-sans font-semibold">Engine</span>
+                  <span className="text-slate-800 font-medium truncate block">apache/superset:4.1.1</span>
+                </div>
+                <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200/60">
+                  <span className="text-slate-400 block text-[10px] uppercase font-sans font-semibold">Port & Gateway</span>
+                  <span className="text-slate-800 font-medium">:8088 • /superset</span>
+                </div>
+              </div>
+
               <button
                 onClick={handleDeployLocal}
                 disabled={deploying}
-                className="flex items-center gap-2 px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors"
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-sky-600 hover:bg-sky-700 active:bg-sky-800 text-white rounded-xl text-xs font-semibold shadow-xs transition-colors disabled:opacity-50"
               >
-                <Play className="w-3.5 h-3.5 fill-current" />
-                <span>1-Click Deploy Locally (2 GB RAM)</span>
+                {deploying ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>Provisioning Superset Container...</span>
+                  </>
+                ) : (
+                  <>
+                    <Play className="w-4 h-4 fill-current" />
+                    <span>1-Click Deploy Locally (2 GB RAM)</span>
+                  </>
+                )}
               </button>
             </div>
           </div>
