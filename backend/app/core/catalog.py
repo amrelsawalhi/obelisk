@@ -50,6 +50,77 @@ class InvalidTablePath(ValueError):
     """Raised when a table path cannot be represented as a three-slot address."""
 
 
+# A name is pasted into SQL, into a URL and into the catalog's text columns, so the rule
+# is enforced once, here, and every door uses it. None of these characters can end a
+# quoted identifier or start a new statement.
+MAX_SEGMENT_LENGTH = 63
+
+
+def validate_segment(name: object, *, what: str = "name") -> str:
+    """One folder or table name: letters, digits, ``_`` and ``-``, not starting with ``-``.
+
+    Rejects anything that would stop being a name once quoted: quotes, semicolons,
+    spaces, dots, ``..``, and anything non-ASCII. The 63-character cap is Postgres'
+    identifier limit, so a name that passes here also survives the round trip through
+    an external warehouse.
+    """
+    value = name.strip() if isinstance(name, str) else ""
+    if not value:
+        raise InvalidTablePath(f"A {what} is required.")
+    if len(value) > MAX_SEGMENT_LENGTH:
+        raise InvalidTablePath(
+            f"{what.capitalize()} {value[:20]!r}… is {len(value)} characters; "
+            f"the limit is {MAX_SEGMENT_LENGTH}."
+        )
+    if not _SEGMENT_RE.match(value):
+        raise InvalidTablePath(
+            f"{what.capitalize()} {value!r} may only contain letters, digits, '_' and '-', "
+            "and must start with a letter or digit."
+        )
+    return value
+
+
+def validate_column(name: object, *, what: str = "column name") -> str:
+    """A column name used in generated SQL: ``[A-Za-z_][A-Za-z0-9_]*``.
+
+    No dots and no dashes: a column is never a path, and ``"-"`` in one would have to be
+    quoted in every statement that mentions it.
+    """
+    value = name.strip() if isinstance(name, str) else ""
+    if not value:
+        raise InvalidTablePath(f"A {what} is required.")
+    if len(value) > MAX_SEGMENT_LENGTH:
+        raise InvalidTablePath(
+            f"{what.capitalize()} {value[:20]!r}… is {len(value)} characters; "
+            f"the limit is {MAX_SEGMENT_LENGTH}."
+        )
+    if not _SIMPLE_IDENT_RE.match(value):
+        raise InvalidTablePath(
+            f"{what.capitalize()} {value!r} may only contain letters, digits and '_', "
+            "and may not start with a digit."
+        )
+    return value
+
+
+def validate_folder(path: object, *, what: str = "folder") -> str:
+    """A folder path: validated segments joined by ``/``, returned normalised.
+
+    ``a\\b`` and ``a/b`` are the same folder; ``.`` and ``..`` are refused rather than
+    silently rewritten, because the address a caller asked for is the address they get.
+    """
+    raw = path.strip().replace("\\", "/") if isinstance(path, str) else ""
+    parts = [part for part in raw.split("/") if part]
+    if not parts:
+        raise InvalidTablePath(f"A {what} path is required.")
+    for part in parts:
+        if part in (".", ".."):
+            raise InvalidTablePath(
+                f"{what.capitalize()} path {raw!r} may not contain '.' or '..' segments."
+            )
+        validate_segment(part, what=f"{what} name")
+    return "/".join(parts)
+
+
 class LakehouseUnavailable(RuntimeError):
     """The lakehouse catalog cannot be reached, so no table can be read or written."""
 

@@ -10,6 +10,8 @@ from sqlalchemy import select
 from app.database import get_db
 from app.models.connection import Connection
 from app.core.vault import decrypt
+from app.core.catalog import InvalidTablePath, validate_column
+from app.engines.ingest_engine import IngestEngine
 from app.engines.ingest_job_manager import ingest_job_manager
 from app.engines.ingest_runner import trigger_ingest
 
@@ -55,6 +57,28 @@ class BatchIngestResponse(BaseModel):
     errors: List[Dict[str, str]]
     logs: List[str]
 
+def _reject_bad_target(req, tables: Optional[List[str]] = None) -> None:
+    """Refuse a target name before any work starts, so the reason is a 422.
+
+    The engine validates the same way when it runs — this only moves the answer forward,
+    out of a background job and into the request. A rejected name is never a 500.
+    """
+    entities = tables if tables is not None else [getattr(req, "entity", None)]
+    try:
+        for entity in entities:
+            IngestEngine._address(
+                getattr(req, "target_folder", None),
+                entity or "",
+                getattr(req, "target_name", None),
+            )
+        if getattr(req, "watermark_column", None):
+            validate_column(req.watermark_column, what="watermark column")
+        if getattr(req, "primary_key", None):
+            validate_column(req.primary_key, what="primary key")
+    except InvalidTablePath as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.post("/trigger", response_model=IngestTriggerResponse)
 async def trigger_ingestion(
     req: IngestTriggerRequest,
@@ -64,6 +88,8 @@ async def trigger_ingestion(
     Streams data from the source into the Bronze lakehouse layer.
     Executes in background threadpool to maintain FastAPI async loop responsiveness.
     """
+    _reject_bad_target(req)
+
     stmt = select(Connection).where(Connection.id == req.connection_id)
     result = await db.execute(stmt)
     conn = result.scalar_one_or_none()
@@ -122,6 +148,8 @@ async def trigger_batch_ingestion(
     Executes batch ingestion across multiple tables/collections in a schema or database.
     """
     from app.engines.ingest_engine import ingest_engine
+
+    _reject_bad_target(req, req.tables)
 
     if not req.tables:
         raise HTTPException(
@@ -201,6 +229,7 @@ async def trigger_ingest_async(
     Launches a single-table Lakehouse ingestion job in the background and returns immediately.
     The client can stream live progress and logs via SSE (/jobs/{job_id}/stream).
     """
+    _reject_bad_target(req)
 
     stmt = select(Connection).where(Connection.id == req.connection_id)
     result = await db.execute(stmt)
@@ -265,6 +294,7 @@ async def trigger_batch_ingest_async(
     Launches a multi-table batch Lakehouse ingestion job in the background and returns immediately.
     The client can stream live progress and logs via SSE (/jobs/{job_id}/stream).
     """
+    _reject_bad_target(req, req.tables)
 
     if not req.tables:
         raise HTTPException(

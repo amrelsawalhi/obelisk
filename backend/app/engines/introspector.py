@@ -11,6 +11,7 @@ import oracledb
 import httpx
 
 from app.core.host_resolver import resolve_connection_host
+from app.core.dsn import sql_ident
 
 
 def _preview_payload(
@@ -220,7 +221,10 @@ class Introspector:
         )
         try:
             with conn.cursor() as cur:
-                cur.execute(f'SELECT * FROM "{schema}"."{actual_table}" LIMIT %s;', (limit,))
+                cur.execute(
+                    f"SELECT * FROM {sql_ident(schema)}.{sql_ident(actual_table)} LIMIT %s;",
+                    (limit,),
+                )
                 columns = [desc[0] for desc in cur.description] if cur.description else []
                 raw_rows = cur.fetchall()
                 # Format to JSON-safe dictionary rows
@@ -558,7 +562,9 @@ class Introspector:
         conn = oracledb.connect(user=username, password=password, dsn=dsn, tcp_connect_timeout=3.0)
         try:
             cur = conn.cursor()
-            cur.execute(f'SELECT * FROM "{table}" FETCH FIRST :limit ROWS ONLY', [limit])
+            cur.execute(
+                f"SELECT * FROM {sql_ident(table)} FETCH FIRST :limit ROWS ONLY", [limit]
+            )
             columns = [desc[0] for desc in cur.description] if cur.description else []
             rows = []
             for raw in cur.fetchall():

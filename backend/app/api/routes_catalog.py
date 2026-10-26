@@ -1,6 +1,5 @@
 import asyncio
 import time
-import re
 import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -25,6 +24,12 @@ from app.core.sources import (
     resolve_source,
 )
 from app.services.catalog import catalog_service
+from app.core.catalog import (
+    InvalidTablePath,
+    quote_ident,
+    validate_folder,
+    validate_segment,
+)
 
 
 # -- lakehouse identity -------------------------------------------------------
@@ -62,7 +67,10 @@ def _rename_table_sync(schema: str, old_name: str, new_name: str) -> str:
             return "missing"
         if _lakehouse_table_exists(conn, schema, new_name):
             return "exists"
-        conn.execute(f'ALTER TABLE lakehouse."{schema}"."{old_name}" RENAME TO "{new_name}"')
+        conn.execute(
+            f"ALTER TABLE lakehouse.{quote_ident(schema)}.{quote_ident(old_name)} "
+            f"RENAME TO {quote_ident(new_name)}"
+        )
         return "ok"
     finally:
         conn.close()
@@ -73,7 +81,7 @@ def _delete_table_sync(schema: str, name: str) -> str:
     try:
         if not _lakehouse_table_exists(conn, schema, name):
             return "missing"
-        conn.execute(f'DROP TABLE lakehouse."{schema}"."{name}"')
+        conn.execute(f"DROP TABLE lakehouse.{quote_ident(schema)}.{quote_ident(name)}")
         return "ok"
     finally:
         conn.close()
@@ -81,25 +89,21 @@ def _delete_table_sync(schema: str, name: str) -> str:
 
 def _move_table_sync(src_schema: str, dst_schema: str, name: str) -> str:
     conn = duckdb_engine.get_connection()
+    src = f"lakehouse.{quote_ident(src_schema)}.{quote_ident(name)}"
+    dst = f"lakehouse.{quote_ident(dst_schema)}"
     try:
         if not _lakehouse_table_exists(conn, src_schema, name):
             return "missing"
-        conn.execute(f'CREATE SCHEMA IF NOT EXISTS lakehouse."{dst_schema}"')
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {dst}")
         if _lakehouse_table_exists(conn, dst_schema, name):
             return "exists"
         try:
-            conn.execute(
-                f'ALTER TABLE lakehouse."{src_schema}"."{name}" '
-                f'SET SCHEMA lakehouse."{dst_schema}"'
-            )
+            conn.execute(f"ALTER TABLE {src} SET SCHEMA {dst}")
         except Exception:
             # DuckLake may not support SET SCHEMA yet; a copy-then-drop is the honest
             # fallback and still ends with the data in exactly one place.
-            conn.execute(
-                f'CREATE TABLE lakehouse."{dst_schema}"."{name}" AS '
-                f'SELECT * FROM lakehouse."{src_schema}"."{name}"'
-            )
-            conn.execute(f'DROP TABLE lakehouse."{src_schema}"."{name}"')
+            conn.execute(f"CREATE TABLE {dst}.{quote_ident(name)} AS SELECT * FROM {src}")
+            conn.execute(f"DROP TABLE {src}")
         return "ok"
     finally:
         conn.close()
@@ -577,17 +581,25 @@ class MoveLakehouseTableRequest(BaseModel):
     target_folder: str = Field(..., description="Target destination folder")
     table_name: str = Field(..., description="Table name without .parquet extension")
 
-def _validate_segment(name: str) -> bool:
-    return bool(name and re.match(r"^[a-zA-Z0-9_\-]+$", name))
+def _bad_request(exc: InvalidTablePath) -> HTTPException:
+    """A rejected name is the caller's mistake, so it is a 400 with the reason."""
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+def _require_segment(name: str, what: str) -> str:
+    """A table or folder name from a request, validated before it reaches any SQL."""
+    try:
+        return validate_segment(name, what=what)
+    except InvalidTablePath as exc:
+        raise _bad_request(exc) from exc
+
 
 def _clean_lakehouse_path(raw_path: str) -> str:
-    parts = [p.strip() for p in raw_path.replace("\\", "/").split("/") if p.strip()]
-    if not parts or any(p in (".", "..") or not _validate_segment(p) for p in parts):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid path. Folder names must be alphanumeric and may only contain dashes or underscores."
-        )
-    return "/".join(parts)
+    """A folder path from a request, normalised. ``..`` is refused, never rewritten."""
+    try:
+        return validate_folder(raw_path)
+    except InvalidTablePath as exc:
+        raise _bad_request(exc) from exc
 
 
 def _ensure_lakehouse_directory(target_dir: Path) -> None:
@@ -630,12 +642,7 @@ async def rename_lakehouse_directory(
 ):
     """Renames a directory or subfolder and updates all associated metadata assets."""
     rel_path = _clean_lakehouse_path(req.path)
-    new_name = req.new_name.strip()
-    if not _validate_segment(new_name):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New folder name must be alphanumeric and may only contain dashes or underscores."
-        )
+    new_name = _require_segment(req.new_name, "folder name")
 
     target_dir = settings.lakehouse_root_path / rel_path
     if not target_dir.exists() or not target_dir.is_dir():
@@ -701,13 +708,8 @@ async def rename_lakehouse_table(
 ):
     """Renames a lakehouse table and refreshes the catalog."""
     clean_folder = _clean_lakehouse_path(req.folder)
-    old_name = req.old_name.strip()
-    new_name = req.new_name.strip()
-    if not _validate_segment(new_name):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New table name must be alphanumeric and may only contain dashes or underscores."
-        )
+    old_name = _require_segment(req.old_name, "table name")
+    new_name = _require_segment(req.new_name, "table name")
 
     schema = _lakehouse_schema(clean_folder)
     outcome = await asyncio.to_thread(_rename_table_sync, schema, old_name, new_name)
@@ -735,7 +737,7 @@ async def delete_lakehouse_table(
 ):
     """Drops a lakehouse table and refreshes the catalog."""
     clean_folder = _clean_lakehouse_path(folder)
-    clean_name = name.strip()
+    clean_name = _require_segment(name, "table name")
     schema = _lakehouse_schema(clean_folder)
 
     await asyncio.to_thread(_delete_table_sync, schema, clean_name)
@@ -754,7 +756,7 @@ async def move_lakehouse_table(
     """Moves a lakehouse table between folders and refreshes the catalog."""
     src_folder = _clean_lakehouse_path(req.source_folder)
     dst_folder = _clean_lakehouse_path(req.target_folder)
-    table_name = req.table_name.strip()
+    table_name = _require_segment(req.table_name, "table name")
     src_schema = _lakehouse_schema(src_folder)
     dst_schema = _lakehouse_schema(dst_folder)
 

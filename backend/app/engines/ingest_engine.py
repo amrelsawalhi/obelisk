@@ -23,8 +23,8 @@ import pyarrow as pa
 import pymysql
 from pymongo import MongoClient
 
-from app.core.catalog import SOURCE, quote_ident
-from app.core.dsn import build_pg_dsn, sql_string, validate_alias
+from app.core.catalog import SOURCE, quote_ident, validate_column, validate_segment
+from app.core.dsn import build_pg_dsn, sql_ident, sql_string, validate_alias
 from app.core.host_resolver import resolve_connection_host
 from app.engines.duckdb_engine import duckdb_engine
 
@@ -65,6 +65,11 @@ def _arrow_batch(columns: Iterable[str], rows: Iterable[Iterable[Any]]) -> pa.Ta
     return pa.Table.from_pydict(data)
 
 
+def _bt(value: object) -> str:
+    """A MySQL identifier: backticks, with any embedded backtick doubled."""
+    return "`" + str(value).replace("`", "``") + "`"
+
+
 class IngestEngine:
     """Stages rows from a source, then writes them to the lakehouse in one statement."""
 
@@ -78,16 +83,26 @@ class IngestEngine:
 
         A folder is a schema and a table is a table, so ``raw/orders`` stays
         ``lakehouse.raw.orders`` for SQL, the SDK and the docs alike.
+
+        Both halves are validated here rather than in the caller, because this is the one
+        place an ingest turns a request into an identifier — and that name ends up inside
+        ``CREATE``/``MERGE`` statements. A name that is not plain text is refused with the
+        reason, never quietly rewritten.
         """
-        requested = target_folder.strip("/\\").replace("..", "") if target_folder else ""
-        schema = "/".join(part for part in requested.split("/") if part) or "main"
+        requested = (target_folder or "").strip().strip("/\\").replace("\\", "/")
+        parts = [
+            validate_segment(part, what="folder name")
+            for part in requested.split("/")
+            if part
+        ]
+        schema = ".".join(parts) or "main"
         if target_name and target_name.strip():
-            stem = target_name.strip()
+            stem = validate_segment(target_name, what="table name")
         elif "." in entity:
-            stem = entity.split(".", 1)[-1]
+            stem = validate_segment(entity.split(".", 1)[-1], what="table name")
         else:
-            stem = entity
-        return schema.replace("/", "."), stem.replace("/", "_").replace("\\", "_")
+            stem = validate_segment(entity, what="table name")
+        return schema, stem
 
     @staticmethod
     def _target_sql(schema: str, table: str) -> str:
@@ -114,7 +129,9 @@ class IngestEngine:
     def _max_watermark(conn, target: str, column: str):
         """The highest watermark already stored, asked of the table itself."""
         try:
-            value = conn.execute(f'SELECT max("{column}") FROM {target}').fetchone()
+            value = conn.execute(
+                f"SELECT max({quote_ident(column)}) FROM {target}"
+            ).fetchone()
         except Exception:
             return None
         if not value or value[0] is None:
@@ -230,27 +247,29 @@ class IngestEngine:
 
         if write_strategy == "upsert":
             columns = [c for c in self._columns(conn, target) if c != "_obelisk_rank"]
+            key = quote_ident(primary_key)
             assignments = ", ".join(
-                f'"{c}" = s."{c}"' for c in columns if c != primary_key
+                f"{quote_ident(c)} = s.{quote_ident(c)}" for c in columns if c != primary_key
             )
-            insert_cols = ", ".join(f'"{c}"' for c in columns)
-            source_cols = ", ".join(f's."{c}"' for c in columns)
+            insert_cols = ", ".join(quote_ident(c) for c in columns)
+            source_cols = ", ".join(f"s.{quote_ident(c)}" for c in columns)
             # Deduplicating the batch is not enough: the *existing* row has a watermark
             # too, and a staged row with no watermark must never beat it. That is the
             # failure the old Arrow path shipped (audit F-02), so the condition is in the
             # statement where it cannot be forgotten.
             guard = ""
             if watermark_column:
+                wm = quote_ident(watermark_column)
                 guard = (
-                    f'AND (t."{watermark_column}" IS NULL '
-                    f'OR (s."{watermark_column}" IS NOT NULL '
-                    f'AND s."{watermark_column}" >= t."{watermark_column}")) '
+                    f"AND (t.{wm} IS NULL "
+                    f"OR (s.{wm} IS NOT NULL "
+                    f"AND s.{wm} >= t.{wm})) "
                 )
             conn.execute(
                 f"""
                 MERGE INTO {target} AS t
                 USING ({self._deduped(primary_key, watermark_column)}) AS s
-                ON t."{primary_key}" = s."{primary_key}"
+                ON t.{key} = s.{key}
                 WHEN MATCHED {guard}THEN UPDATE SET {assignments}
                 WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({source_cols})
                 """
@@ -266,11 +285,11 @@ class IngestEngine:
         ``NULLS LAST`` matters: a row whose watermark is missing must never outrank a row
         that has one — that is exactly how the old Arrow path lost updates (audit F-02).
         """
-        order = f'"{watermark_column}" DESC NULLS LAST' if watermark_column else "1"
+        order = f"{quote_ident(watermark_column)} DESC NULLS LAST" if watermark_column else "1"
         return f"""
             SELECT * EXCLUDE (_obelisk_rank) FROM (
                 SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY "{primary_key}" ORDER BY {order}
+                    PARTITION BY {quote_ident(primary_key)} ORDER BY {order}
                 ) AS _obelisk_rank
                 FROM staging
             ) WHERE _obelisk_rank = 1
@@ -303,6 +322,13 @@ class IngestEngine:
         """
         schema, table_stem = self._address(target_folder, entity, target_name)
         target = self._target_sql(schema, table_stem)
+
+        # Both are column identifiers this code writes into the MERGE and the source
+        # filter, so they follow the column rule rather than the table rule (no dots).
+        if watermark_column:
+            watermark_column = validate_column(watermark_column, what="watermark column")
+        if primary_key:
+            primary_key = validate_column(primary_key, what="primary key")
 
         conn = duckdb_engine.get_connection()
         try:
@@ -388,11 +414,11 @@ class IngestEngine:
                 schema_name, table_name = "public", entity
             where = ""
             if mode == "incremental" and watermark_column and watermark_value is not None:
-                where = f'WHERE "{watermark_column}" > {_literal(watermark_value)}'
+                where = f"WHERE {sql_ident(watermark_column)} > {_literal(watermark_value)}"
             limit_clause = f" LIMIT {int(limit)}" if limit and limit > 0 else ""
             conn.execute(
                 f'CREATE OR REPLACE TEMP TABLE staging AS SELECT * FROM '
-                f'{alias}."{schema_name}"."{table_name}" {where}{limit_clause}'
+                f'{alias}.{sql_ident(schema_name)}.{sql_ident(table_name)} {where}{limit_clause}'
             )
             staged = self._row_count(conn, "staging")
             # DuckDB stages Postgres in one statement, so there is nothing to report while
@@ -421,17 +447,17 @@ class IngestEngine:
         try:
             if "." in entity:
                 db_name, table_name = entity.split(".", 1)
-                table_ref = f"`{db_name}`.`{table_name}`"
+                table_ref = f"{_bt(db_name)}.{_bt(table_name)}"
             else:
-                table_ref = f"`{entity}`"
+                table_ref = _bt(entity)
 
             limit_clause = f" LIMIT {int(limit)}" if limit and limit > 0 else ""
             with connection.cursor() as cur:
                 if mode == "incremental" and watermark_column and watermark_value is not None:
                     cur.execute(
                         f"SELECT * FROM {table_ref} "
-                        f"WHERE `{watermark_column}` > %s "
-                        f"ORDER BY `{watermark_column}` ASC{limit_clause}",
+                        f"WHERE {_bt(watermark_column)} > %s "
+                        f"ORDER BY {_bt(watermark_column)} ASC{limit_clause}",
                         (watermark_value,),
                     )
                 else:
@@ -531,16 +557,16 @@ class IngestEngine:
         try:
             if "." in entity:
                 schema_name, table_name = entity.split(".", 1)
-                table_ref = f'"{schema_name}"."{table_name}"'
+                table_ref = f"{sql_ident(schema_name)}.{sql_ident(table_name)}"
             else:
-                table_ref = f'"{entity}"'
+                table_ref = sql_ident(entity)
 
             limit_clause = f" FETCH FIRST {int(limit)} ROWS ONLY" if limit and limit > 0 else ""
             cur = connection.cursor()
             if mode == "incremental" and watermark_column and watermark_value is not None:
                 cur.execute(
-                    f'SELECT * FROM {table_ref} WHERE "{watermark_column}" > :val '
-                    f'ORDER BY "{watermark_column}" ASC{limit_clause}',
+                    f"SELECT * FROM {table_ref} WHERE {sql_ident(watermark_column)} > :val "
+                    f"ORDER BY {sql_ident(watermark_column)} ASC{limit_clause}",
                     [watermark_value],
                 )
             else:
