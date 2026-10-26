@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 import time
 import shutil
 from datetime import datetime, timedelta, timezone
@@ -1491,12 +1492,37 @@ def _active_file_totals(conn) -> Dict[str, int]:
     return {"data_files": int(row[0]), "data_bytes": int(row[1] or 0)}
 
 
+def _sqlite_journal_mode(path: Path) -> str:
+    """The journal mode the control-plane DB actually runs in.
+
+    Asked read-only, because the Settings tab should show what SQLite answers rather
+    than what the code intended to configure: "WAL is on" and "WAL was requested" are
+    different statements, and the difference is the concurrency the operator thinks
+    they have.
+    """
+    if not path.is_file():
+        return "missing"
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+    except sqlite3.Error:
+        return "unknown"
+    finally:
+        if conn is not None:
+            conn.close()
+    return str(row[0]).upper() if row else "unknown"
+
+
 def _lakehouse_diagnostics_sync() -> Dict[str, Any]:
     """Everything the Storage & Diagnostics tabs show, in one connection."""
     root = settings.lakehouse_root_path
     conn = lakehouse_connection()
     try:
         counts = _catalog_counts(conn)
+        latest_snapshot = conn.execute(
+            f"SELECT max(snapshot_id) FROM ducklake_snapshots('{SOURCE}')"
+        ).fetchall()[0][0]
         orphans = len(load_tables(conn))
     finally:
         conn.close()
@@ -1505,12 +1531,15 @@ def _lakehouse_diagnostics_sync() -> Dict[str, Any]:
         "lakehouse_root": str(root),
         "catalog_sqlite_bytes": _file_bytes(Path(settings.lakehouse_catalog_path)),
         "obelisk_db_bytes": _file_bytes(Path(settings.sqlite_db_path)),
+        "obelisk_db_journal_mode": _sqlite_journal_mode(Path(settings.sqlite_db_path)),
         "duckdb_tmp_bytes": _directory_bytes(settings.duckdb_temp_path),
         "duckdb_tmp_limit": settings.DUCKDB_TEMP_SIZE_LIMIT,
         "duckdb_memory_limit_per_slot": advisor.get_duckdb_memory_limit(
             settings.DUCKDB_MAX_CONCURRENT_HEAVY
         ),
+        "duckdb_max_query_rows": settings.DUCKDB_MAX_QUERY_ROWS,
         "snapshot_count": counts["snapshots"],
+        "current_snapshot_id": int(latest_snapshot) if latest_snapshot is not None else None,
         "active_table_count": counts["active_tables"],
         "active_data_files": counts["data_files"],
         "total_data_bytes": counts["data_bytes"],

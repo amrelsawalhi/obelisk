@@ -32,6 +32,20 @@ async def test_diagnostics_reports_what_the_lakehouse_costs():
     assert body["duckdb_tmp_limit"] == "50GB" or body["duckdb_tmp_limit"]
     assert body["duckdb_memory_limit_per_slot"].endswith("GB")
     assert body["snapshot_count"] >= 1, "a lakehouse that was written to has a snapshot"
+    assert isinstance(body["current_snapshot_id"], int), (
+        "the tab pins a snapshot id, not just a count"
+    )
+    assert body["current_snapshot_id"] >= 0, (
+        "DuckLake numbers its first snapshot 0, so a written lakehouse reports one"
+    )
+    assert body["obelisk_db_journal_mode"] in {
+        "WAL",
+        "DELETE",
+        "TRUNCATE",
+        "PERSIST",
+        "MEMORY",
+        "OFF",
+    }, "the tab shows the journal mode SQLite actually runs in"
     for key in (
         "catalog_sqlite_bytes",
         "obelisk_db_bytes",
