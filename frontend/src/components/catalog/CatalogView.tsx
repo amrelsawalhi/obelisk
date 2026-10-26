@@ -9,6 +9,9 @@ import { IngestModal } from './IngestModal';
 import { useIngestTracker } from '../../context/IngestContext';
 import { BatchIngestModal } from './BatchIngestModal';
 import { AddConnectionModal } from './AddConnectionModal';
+import { ConfirmDialog } from '../common/ConfirmDialog';
+import type { ConfirmRequest } from '../common/ConfirmDialog';
+import { toast } from '../../lib/toast';
 
 interface SelectedTable {
   sourceId: string;
@@ -35,6 +38,7 @@ export const CatalogView: React.FC = () => {
   const [batchIngestTarget, setBatchIngestTarget] = useState<BatchTarget | null>(null);
   const [isAddConnectionOpen, setIsAddConnectionOpen] = useState(false);
   const [editingConnection, setEditingConnection] = useState<Connection | null>(null);
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
 
   const fetchCatalog = async (force = false) => {
     try {
@@ -108,15 +112,23 @@ export const CatalogView: React.FC = () => {
     }
   };
 
-  const handleDeleteConnection = async (connId: string) => {
-    if (window.confirm('Are you sure you want to delete this connection?')) {
-      try {
-        await api.deleteConnection(connId);
-        fetchCatalog();
-      } catch (e) {
-        console.error('Failed to delete connection', e);
-      }
-    }
+  const handleDeleteConnection = (connId: string) => {
+    const target = catalogNodes.find((n) => n.id === connId);
+    setConfirmRequest({
+      title: `Delete ${target?.name ?? 'this connection'}?`,
+      body: 'Its credentials are removed from the vault; ingest jobs and dbt models that read it stop working.',
+      confirmLabel: 'Delete connection',
+      destructive: true,
+      onConfirm: async () => {
+        try {
+          await api.deleteConnection(connId);
+          await fetchCatalog(true);
+          toast.success(`Deleted ${target?.name ?? 'connection'}.`);
+        } catch (e) {
+          toast.error(e instanceof Error ? e.message : 'Failed to delete connection');
+        }
+      },
+    });
   };
 
   const selectedTableKey = selectedTableInfo
@@ -229,6 +241,8 @@ export const CatalogView: React.FC = () => {
           fetchCatalog();
         }}
       />
+
+      <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />
     </>
   );
 };

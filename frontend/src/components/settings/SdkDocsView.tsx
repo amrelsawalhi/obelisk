@@ -104,20 +104,20 @@ print(f"Running in {env_mode} with batch size {batch_chunk}")`,
       snippetTitle: 'DATA ACCESS: LOAD LAKEHOUSE & EXTERNAL TABLES',
       code: `import obelisk
 
-# 1. Access by Canonical 3-tier FQN: lakehouse.<folder>.<table>
-tbl_venues = obelisk.table("lakehouse.bronze.venues")
+# 1. Access by Canonical 3-tier FQN: lakehouse.<schema>.<table>
+tbl_orders = obelisk.table("lakehouse.raw.orders")
 
 # 2. Access external connected database: <catalog>.<schema>.<table>
 tbl_remote = obelisk.table("supabase.public.audit_log_entries")
 
 # 3. Access flat or bare 1-tier table (auto-discovered across lakehouse root & subfolders):
-tbl_orders = obelisk.table("orders")
+tbl_flat = obelisk.table("orders")
 
 # Zero-Copy Engine Conversions:
-df_polars = tbl_venues.to_polars()   # Lightning-fast Polars DataFrame
-df_arrow  = tbl_venues.to_arrow()    # Apache Arrow Table (zero-copy memory)
-df_pandas = tbl_venues.to_df()       # Standard Pandas DataFrame
-duck_rel  = tbl_venues.to_duckdb()   # DuckDB PyRelation for chaining queries
+df_polars = tbl_orders.to_polars()   # Lightning-fast Polars DataFrame
+df_arrow  = tbl_orders.to_arrow()    # Apache Arrow Table (zero-copy memory)
+df_pandas = tbl_orders.to_df()       # Standard Pandas DataFrame
+duck_rel  = tbl_orders.to_duckdb()   # DuckDB PyRelation for chaining queries
 
 print(f"Loaded {len(df_polars):,} rows across {len(df_polars.columns)} columns.")`,
     },
@@ -127,7 +127,7 @@ print(f"Loaded {len(df_polars):,} rows across {len(df_polars.columns)} columns."
       category: 'query',
       icon: Zap,
       badge: 'DuckDB In-Process Engine',
-      desc: 'Executes analytical SQL directly against local Snappy Parquet files and external database sources. DuckDB handles joins, filtering, and aggregations at native NVMe memory speed.',
+      desc: 'Executes analytical SQL through DuckDB against the DuckLake catalog and any attached database source. Joins, filters and aggregations run in-process; results stream to disk instead of Python memory.',
       snippetTitle: 'FEDERATED SQL: CROSS-SOURCE ANALYSIS IN NOTEBOOKS',
       code: `import obelisk
 
@@ -139,7 +139,7 @@ SELECT
     o.amount,
     u.full_name,
     u.email
-FROM lakehouse.bronze.orders o
+FROM lakehouse.raw.orders o
 JOIN supabase.public.users u ON o.customer_id = u.id
 WHERE o.amount > 250.0
 ORDER BY o.amount DESC
@@ -150,34 +150,37 @@ LIMIT 50;
 df_result = obelisk.query(sql)
 
 # Or return Apache Arrow table for streaming pipelines
-arrow_result = obelisk.query_arrow("SELECT * FROM lakehouse.bronze.fact_news_articles LIMIT 500")
+arrow_result = obelisk.query_arrow("SELECT * FROM lakehouse.marts.daily_revenue LIMIT 500")
 
 display(df_result)`,
     },
     {
       id: 'save',
-      title: 'obelisk.save(df, target, sync_postgres=True)',
+      title: 'obelisk.save(df, target) & obelisk.materialize_sql(sql, target)',
       category: 'save',
       icon: Layers,
-      badge: 'Atomic Lakehouse Writer',
-      desc: 'Atomically serializes Polars, Pandas, Arrow, or PySpark DataFrames into Snappy-compressed Parquet. Synchronizes metadata in data/obelisk.db and optionally syncs to PostgreSQL.',
-      snippetTitle: 'PERSISTENCE: ATOMIC PARQUET WRITING & CATALOG SYNC',
+      badge: 'DuckLake Writer',
+      desc: 'Writes Polars, Pandas, Arrow or PySpark DataFrames into DuckLake as a table (<schema>.<table>), creating the schema and catalog entry in one statement. DuckLake is the single source of truth: nothing is mirrored into PostgreSQL. Use materialize_sql when the result is too large to become a Python object first.',
+      snippetTitle: 'PERSISTENCE: DUCKLAKE WRITES THAT STAY OUT OF PYTHON RAM',
       code: `import obelisk
 import polars as pl
 
 # 1. Transform or aggregate your analytical dataset:
-df_summary = obelisk.table("orders").to_polars().group_by("region").agg([
+df_summary = obelisk.table("lakehouse.raw.orders").to_polars().group_by("region").agg([
     pl.col("amount").sum().alias("total_revenue"),
     pl.col("order_id").count().alias("order_count")
 ])
 
-# 2. Persist to a custom lakehouse folder:
-# Saves atomically to: data/lakehouse/analytics/daily_revenue.parquet
-res = obelisk.save(df_summary, "analytics.daily_revenue")
+# 2. Persist it as lakehouse.marts.daily_revenue
+res = obelisk.save(df_summary, "marts.daily_revenue")
 
-# 3. Or save flat in the lakehouse root:
-# Saves atomically to: data/lakehouse/quick_export.parquet
-res_flat = obelisk.save(df_summary, "quick_export")
+# 3. Big results never enter Python: the engine writes them itself
+#    (this is the out-of-core replacement for save(query_arrow(sql), target))
+res = obelisk.materialize_sql("""
+    SELECT region, sum(amount) AS total_revenue
+    FROM lakehouse.raw.orders
+    GROUP BY region
+""", "marts.daily_revenue")
 
 print(f"Status: {res['status']} • Wrote {res['num_rows']} rows to {res['file_path']}")`,
     },
@@ -195,14 +198,15 @@ print(f"Status: {res['status']} • Wrote {res['num_rows']} rows to {res['file_p
 # Or connects automatically to remote Spark cluster if SPARK_REMOTE_URL is set:
 spark = obelisk.spark()
 
-# Read from Zero-Cost STORAGE_URI
-df_spark = spark.read.parquet("data/lakehouse/bronze/events.parquet")
+# Read a DuckLake table into Spark. The bridge materialises to pandas, so use it
+# for samples and feature extracts - DuckDB is the engine for full-table scans.
+df_spark = obelisk.table("lakehouse.raw.orders").to_spark(spark)
 
 # Distributed aggregation
 df_aggregated = df_spark.groupBy("event_type").count()
 
-# Persist output back into Obelisk Lakehouse
-obelisk.save(df_aggregated, "gold.aggregated_events")`,
+# Persist output back into DuckLake
+obelisk.save(df_aggregated, "marts.aggregated_events")`,
     },
   ];
 
@@ -331,7 +335,7 @@ obelisk.save(df_aggregated, "gold.aggregated_events")`,
                 </div>
                 <h4 className="text-sm font-bold text-slate-900 font-mono">1-Click Ingest to Lakehouse</h4>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  In <strong>Data Catalog</strong>, expand any connected PostgreSQL, MySQL, MongoDB, or Oracle source. Click <strong>[ Ingest ]</strong> on any table to stream Snappy Parquet directly into <code className="font-mono text-indigo-700 bg-indigo-50 px-1 py-0.5 rounded">data/lakehouse/</code>.
+                  In <strong>Data Catalog</strong>, expand any connected PostgreSQL, MySQL, MongoDB, or REST source. Click <strong>[ Ingest ]</strong> on any table to stream it straight into DuckLake as <code className="font-mono text-indigo-700 bg-indigo-50 px-1 py-0.5 rounded">lakehouse.&lt;folder&gt;.&lt;table&gt;</code>, in bounded chunks rather than a full-table staging copy.
                 </p>
               </div>
               <div className="pt-2 text-[11px] font-mono text-indigo-600 font-semibold flex items-center gap-1">
@@ -395,11 +399,17 @@ obelisk.save(df_aggregated, "gold.aggregated_events")`,
                 </div>
                 <h4 className="text-sm font-bold text-slate-900 font-mono">Pipelines &amp; Cron Engine</h4>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Define automated recurring ingestion and transformation schedules using standard 5-part cron expressions. Or discover Python DAGs in <code className="font-mono text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded">git_repo/dags/</code> with live streaming run logs.
+                  Build a DAG from <code className="font-mono text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded">Ingest</code>,{' '}
+                  <code className="font-mono text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded">dbt</code>,{' '}
+                  <code className="font-mono text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded">SQL</code>,{' '}
+                  <code className="font-mono text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded">Script</code> and{' '}
+                  <code className="font-mono text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded">Check</code> nodes,
+                  schedule it with standard 5-part cron, and let watermarks decide which rows each run reads. Every
+                  run streams its logs; a cancelled step kills the whole process tree.
                 </p>
               </div>
               <div className="pt-2 text-[11px] font-mono text-emerald-600 font-semibold flex items-center gap-1">
-                <span>Integrated Dagster daemon &amp; Cron runner</span>
+                <span>Built-in DAG engine &amp; cron scheduler</span>
               </div>
             </div>
 

@@ -12,7 +12,9 @@ import {
   SquareTerminal,
   Boxes,
 } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import { ObeliskIcon } from '../common/ObeliskIcon';
+import { useDevToolsEnabled } from '../../lib/devTools';
 
 export type NavigationTab =
   | 'home'
@@ -32,21 +34,55 @@ interface SidebarProps {
   onSelectTab: (tab: NavigationTab) => void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
-  const navItems = [
-    { id: 'home' as NavigationTab, label: 'Home', icon: Home },
-    { id: 'catalog' as NavigationTab, label: 'Data Catalog', icon: Database },
-    { id: 'query' as NavigationTab, label: 'Query Studio', icon: Code2 },
-    { id: 'dbt' as NavigationTab, label: 'dbt Studio', icon: Boxes },
-    { id: 'notebooks' as NavigationTab, label: 'Notebooks', icon: BookOpen },
-    { id: 'pipelines' as NavigationTab, label: 'Pipelines', icon: GitFork },
-    { id: 'dashboards' as NavigationTab, label: 'Dashboards', icon: BarChart3 },
-    { id: 'files' as NavigationTab, label: 'Files', icon: FolderCode },
-    { id: 'terminal' as NavigationTab, label: 'Terminal', icon: SquareTerminal },
-    { id: 'services' as NavigationTab, label: 'Service Catalog', icon: Server },
-    { id: 'settings' as NavigationTab, label: 'Settings', icon: Settings },
-  ];
+interface NavItem {
+  id: NavigationTab;
+  label: string;
+  icon: LucideIcon;
+}
 
+interface NavSection {
+  label: string;
+  items: NavItem[];
+}
+
+export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
+  // Eleven flat rows made every screen equally loud. Three sections say what kind of
+  // work each one is for, and the two raw tools over git_repo/ are a preference
+  // rather than a peer of dbt Studio (see `lib/devTools.ts`).
+  const [devToolsEnabled] = useDevToolsEnabled();
+
+  const sections: NavSection[] = [
+    {
+      label: 'Explore & Analyze',
+      items: [
+        { id: 'home', label: 'Home', icon: Home },
+        { id: 'catalog', label: 'Data Catalog', icon: Database },
+        { id: 'query', label: 'Query Studio', icon: Code2 },
+        { id: 'notebooks', label: 'Notebooks', icon: BookOpen },
+        { id: 'dashboards', label: 'Dashboards', icon: BarChart3 },
+      ],
+    },
+    {
+      label: 'Build & Orchestrate',
+      items: [
+        { id: 'dbt', label: 'dbt Studio', icon: Boxes },
+        { id: 'pipelines', label: 'Pipelines', icon: GitFork },
+      ],
+    },
+    {
+      label: 'Platform',
+      items: [
+        { id: 'services', label: 'Service Catalog', icon: Server },
+        { id: 'settings', label: 'Settings', icon: Settings },
+        ...(devToolsEnabled
+          ? ([
+              { id: 'files', label: 'Files', icon: FolderCode },
+              { id: 'terminal', label: 'Terminal', icon: SquareTerminal },
+            ] as NavItem[])
+          : []),
+      ],
+    },
+  ];
 
   return (
     <aside className="w-64 border-r border-slate-200 bg-white flex flex-col select-none shrink-0">
@@ -65,30 +101,37 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
         </div>
       </div>
 
-      {/* Navigation Links */}
-      <nav className="flex-1 py-4 px-3 space-y-1">
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const isActive = activeTab === item.id;
-          return (
-            <button
-              key={item.id}
-              onClick={() => onSelectTab(item.id)}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all ${
-                isActive
-                  ? 'bg-sky-50 text-sky-700 font-semibold shadow-xs'
-                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
-              }`}
-            >
-              <Icon
-                className={`w-4 h-4 transition-colors ${
-                  isActive ? 'text-sky-600' : 'text-slate-400'
-                }`}
-              />
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
+      {/* Navigation Links, grouped by the kind of work they start */}
+      <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-5">
+        {sections.map((section) => (
+          <div key={section.label} className="space-y-1">
+            <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+              {section.label}
+            </div>
+            {section.items.map((item) => {
+              const Icon = item.icon;
+              const isActive = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => onSelectTab(item.id)}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                    isActive
+                      ? 'bg-sky-50 text-sky-700 font-semibold shadow-xs'
+                      : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                  }`}
+                >
+                  <Icon
+                    className={`w-4 h-4 transition-colors ${
+                      isActive ? 'text-sky-600' : 'text-slate-400'
+                    }`}
+                  />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        ))}
       </nav>
 
       {/* Footer System Status Indicator */}

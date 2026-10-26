@@ -19,6 +19,8 @@ import {
   AlertTriangle,
   Code2,
   Database,
+  Wrench,
+  SquareTerminal,
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import type {
@@ -26,8 +28,15 @@ import type {
   Connection,
   ConnectionTestResult,
   DbtWarehouseInfo,
+  LakehouseDiagnostics,
+  TelemetryData,
 } from '../../lib/types';
+import { formatBytes } from '../../lib/format';
+import { toast } from '../../lib/toast';
+import { useDevToolsEnabled } from '../../lib/devTools';
 import { AddConnectionModal } from '../catalog/AddConnectionModal';
+import { ConfirmDialog } from '../common/ConfirmDialog';
+import type { ConfirmRequest } from '../common/ConfirmDialog';
 import { SdkDocsView } from './SdkDocsView';
 
 type SettingsSubTab = 'variables' | 'vault' | 'storage' | 'diagnostics' | 'sdk';
@@ -49,6 +58,28 @@ export const SettingsView: React.FC = () => {
   const [newVarIsSecret, setNewVarIsSecret] = useState(false);
   const [newVarDesc, setNewVarDesc] = useState('');
   const [savingVar, setSavingVar] = useState(false);
+  // Non-null means the variable modal is editing that row instead of creating one.
+  const [editingVar, setEditingVar] = useState<VariableItem | null>(null);
+  const [varValueLoading, setVarValueLoading] = useState(false);
+
+  // Lakehouse storage facts. The Storage and Diagnostics tabs read the same payload,
+  // so they cannot disagree about what the lakehouse costs.
+  const [diagnostics, setDiagnostics] = useState<LakehouseDiagnostics | null>(null);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
+  const [maintaining, setMaintaining] = useState(false);
+  const [keepDays, setKeepDays] = useState(7);
+  const [deleteFiles, setDeleteFiles] = useState(true);
+  // Live container count and RAM come from the services telemetry probe, which is
+  // the same payload Home reads; null means the probe failed, and the cards say so.
+  const [telemetry, setTelemetry] = useState<TelemetryData | null>(null);
+
+  // Files and Terminal are opt-in (see `lib/devTools.ts`): the sidebar hides them
+  // until the operator asks for a raw view of git_repo/.
+  const [devToolsEnabled, setDevToolsEnabled] = useDevToolsEnabled();
+
+  // Destructive actions confirm in-app instead of in a browser dialog.
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
 
   // Connection Vault State
   const [connections, setConnections] = useState<Connection[]>([]);
@@ -102,6 +133,61 @@ export const SettingsView: React.FC = () => {
     }
   };
 
+  const loadDiagnostics = async () => {
+    setDiagnosticsLoading(true);
+    setDiagnosticsError(null);
+    try {
+      const [lakehouse, host] = await Promise.all([
+        api.getLakehouseDiagnostics(),
+        // The container numbers live in the services probe; a failure there must not
+        // hide the lakehouse facts, so it degrades to "not reported" per card.
+        api.getTelemetry().catch(() => null),
+      ]);
+      setDiagnostics(lakehouse);
+      setTelemetry(host);
+    } catch (e: unknown) {
+      setDiagnosticsError(
+        e instanceof Error ? e.message : 'Could not read the lakehouse diagnostics.',
+      );
+    } finally {
+      setDiagnosticsLoading(false);
+    }
+  };
+
+  // Only the two tabs that show these numbers pay for reading them.
+  useEffect(() => {
+    if (activeSubTab !== 'storage' && activeSubTab !== 'diagnostics') return;
+    void loadDiagnostics();
+  }, [activeSubTab]);
+
+  const runMaintenance = async () => {
+    setMaintaining(true);
+    try {
+      const result = await api.maintainLakehouse({
+        keep_days: keepDays,
+        delete_files: deleteFiles,
+      });
+      const reclaimed = Math.max(result.before.data_bytes - result.after.data_bytes, 0);
+      toast.success(
+        `Compacted ${result.tables_compacted} table(s), expired ${result.snapshots_expired} snapshot(s)` +
+          (result.delete_files ? `, reclaimed ${formatBytes(reclaimed) ?? '0 B'}.` : '.'),
+      );
+      if (result.orphaned_load_tables_dropped > 0 || result.empty_directories_removed > 0) {
+        toast.info(
+          `Dropped ${result.orphaned_load_tables_dropped} orphaned load table(s) and swept ` +
+            `${result.empty_directories_removed} empty director(ies).`,
+        );
+      }
+      await loadDiagnostics();
+    } catch (e: unknown) {
+      toast.error(
+        e instanceof Error ? e.message : 'Maintenance failed. Check the backend log for the DuckLake error.',
+      );
+    } finally {
+      setMaintaining(false);
+    }
+  };
+
   useEffect(() => {
     loadData();
   }, []);
@@ -151,38 +237,82 @@ export const SettingsView: React.FC = () => {
     }
   };
 
-  const handleDeleteVariable = async (item: VariableItem) => {
-    if (!window.confirm(`Are you sure you want to delete variable '${item.key}'?`)) {
-      return;
-    }
+  const openCreateVariable = () => {
+    setEditingVar(null);
+    setNewVarKey('');
+    setNewVarValue('');
+    setNewVarIsSecret(false);
+    setNewVarDesc('');
+    setIsAddVarOpen(true);
+  };
+
+  const openEditVariable = async (item: VariableItem) => {
+    setEditingVar(item);
+    setNewVarKey(item.key);
+    setNewVarDesc(item.description ?? '');
+    setNewVarIsSecret(item.is_secret);
+    setNewVarValue('');
+    setIsAddVarOpen(true);
+    // The list hands back a mask for secrets, so the current value has to be asked
+    // for; otherwise "edit" would quietly mean "replace with whatever I type next".
+    setVarValueLoading(true);
     try {
-      await api.deleteVariable(item.id);
-      await loadData(true);
+      const res = await api.revealVariable(item.key);
+      setNewVarValue(res.value);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Failed to delete variable';
-      setError(msg);
+      toast.error(
+        e instanceof Error
+          ? e.message
+          : `Could not read the current value of ${item.key}. Type it to replace it.`,
+      );
+    } finally {
+      setVarValueLoading(false);
     }
+  };
+
+  const handleDeleteVariable = (item: VariableItem) => {
+    setConfirmRequest({
+      title: `Delete ${item.key}?`,
+      body: 'Notebooks, dbt models and ingest jobs that read it fail on their next run.',
+      confirmLabel: 'Delete variable',
+      destructive: true,
+      onConfirm: async () => {
+        try {
+          await api.deleteVariable(item.id);
+          await loadData(true);
+          toast.success(`Deleted ${item.key}.`);
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : 'Failed to delete variable';
+          setError(msg);
+        }
+      },
+    });
   };
 
   const handleSaveVariable = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newVarKey.trim() || !newVarValue.trim()) return;
+    const key = newVarKey.trim().toUpperCase();
+    if (!key || !newVarValue.trim()) return;
 
     setSavingVar(true);
     setError(null);
     try {
+      // POST upserts on the key, so saving an edit rewrites the row in place instead
+      // of adding a second variable under a name nobody noticed was different.
       await api.createVariable({
-        key: newVarKey.trim().toUpperCase(),
+        key,
         value: newVarValue,
         is_secret: newVarIsSecret,
         description: newVarDesc.trim(),
       });
       setIsAddVarOpen(false);
+      setEditingVar(null);
       setNewVarKey('');
       setNewVarValue('');
       setNewVarIsSecret(false);
       setNewVarDesc('');
       await loadData(true);
+      toast.success(editingVar ? `Updated ${key}.` : `Saved ${key}.`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Failed to save variable';
       setError(msg);
@@ -208,18 +338,27 @@ export const SettingsView: React.FC = () => {
     }
   };
 
-  const handleDeleteConnection = async (connId: string) => {
-    if (!window.confirm('Are you sure you want to delete this connection?')) return;
-    setDeletingConnId(connId);
-    try {
-      await api.deleteConnection(connId);
-      await loadData(true);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Failed to delete connection';
-      setError(msg);
-    } finally {
-      setDeletingConnId(null);
-    }
+  const handleDeleteConnection = (connId: string) => {
+    const target = connections.find((c) => c.id === connId);
+    setConfirmRequest({
+      title: `Delete ${target?.name ?? 'this connection'}?`,
+      body: 'The credentials are removed from the vault. Pipelines and dbt models that publish to it stop working.',
+      confirmLabel: 'Delete connection',
+      destructive: true,
+      onConfirm: async () => {
+        setDeletingConnId(connId);
+        try {
+          await api.deleteConnection(connId);
+          await loadData(true);
+          toast.success(`Deleted ${target?.name ?? 'connection'}.`);
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : 'Failed to delete connection';
+          setError(msg);
+        } finally {
+          setDeletingConnId(null);
+        }
+      },
+    });
   };
 
   if (loading && variables.length === 0 && connections.length === 0) {
@@ -330,7 +469,7 @@ export const SettingsView: React.FC = () => {
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <button
-                onClick={() => setIsAddVarOpen(true)}
+                onClick={openCreateVariable}
                 className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold shadow-xs transition-all"
               >
                 <Plus className="w-4 h-4" />
@@ -435,6 +574,13 @@ export const SettingsView: React.FC = () => {
                               ) : (
                                 <Copy className="w-3.5 h-3.5" />
                               )}
+                            </button>
+                            <button
+                              onClick={() => void openEditVariable(v)}
+                              className="p-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 hover:text-sky-700 shadow-2xs transition-colors"
+                              title="Edit Value & Description"
+                            >
+                              <Edit2 className="w-3.5 h-3.5" />
                             </button>
                             <button
                               onClick={() => handleDeleteVariable(v)}
@@ -652,48 +798,186 @@ export const SettingsView: React.FC = () => {
       {activeSubTab === 'storage' && (
         <div className="space-y-6">
           <section className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs space-y-4">
-            <div className="flex items-center gap-2">
-              <HardDrive className="w-4 h-4 text-purple-600" />
-              <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider font-mono">
-                Zero-Cost Storage URI Abstraction (STORAGE_URI)
-              </h3>
-            </div>
-            <p className="text-xs text-slate-600 leading-relaxed">
-              Obelisk abstracts the underlying physical storage layer into standard URI semantics. Whether running on a local NVMe drive or an enterprise object store (AWS S3, MinIO, Azure Blob), zero application code or SQL queries need modification.
-            </p>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
-              <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
-                <div className="text-[11px] font-mono text-slate-500 uppercase">Active STORAGE_URI</div>
-                <div className="text-sm font-mono font-bold text-slate-900 bg-white p-2.5 rounded border border-slate-200 break-all">
-                  file:///data/lakehouse
-                </div>
-                <div className="text-[11px] text-slate-500">
-                  Target Snappy Parquet destination for raw ingestion streaming.
-                </div>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <HardDrive className="w-4 h-4 text-purple-600" />
+                <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider font-mono">
+                  DuckLake Storage & Catalog
+                </h3>
               </div>
-
-              <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
-                <div className="text-[11px] font-mono text-slate-500 uppercase">Parquet Compression</div>
-                <div className="text-sm font-mono font-bold text-slate-900 bg-white p-2.5 rounded border border-slate-200">
-                  Snappy (Fast analytical scans)
-                </div>
-                <div className="text-[11px] text-slate-500">
-                  High-speed decompression optimized for DuckDB vector scans.
-                </div>
-              </div>
+              <button
+                onClick={() => void loadDiagnostics()}
+                disabled={diagnosticsLoading}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 shadow-2xs transition-all disabled:opacity-60"
+              >
+                <RefreshCw
+                  className={`w-3.5 h-3.5 ${diagnosticsLoading ? 'animate-spin text-sky-600' : 'text-slate-500'}`}
+                />
+                <span>Refresh</span>
+              </button>
             </div>
+
+            {diagnosticsError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2.5 text-xs text-red-700">
+                <AlertTriangle className="w-4 h-4 text-red-500 shrink-0" />
+                <span>{diagnosticsError}</span>
+              </div>
+            )}
+
+            {!diagnostics && diagnosticsLoading && (
+              <div className="text-xs text-slate-500 font-mono flex items-center gap-2">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-600" />
+                Reading the catalog…
+              </div>
+            )}
+
+            {diagnostics && (
+              <>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+                  <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
+                    <div className="text-[11px] font-mono text-slate-500 uppercase">
+                      Storage Root URI
+                    </div>
+                    <div className="text-sm font-mono font-bold text-slate-900 bg-white p-2.5 rounded border border-slate-200 break-all">
+                      {diagnostics.storage_uri}
+                    </div>
+                    <div className="text-[11px] text-slate-500 font-mono break-all">
+                      {diagnostics.lakehouse_root}
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
+                    <div className="text-[11px] font-mono text-slate-500 uppercase">
+                      Catalog Engine
+                    </div>
+                    <div className="text-sm font-mono font-bold text-slate-900 bg-white p-2.5 rounded border border-slate-200">
+                      DuckLake SQLite (.obelisk/catalog.sqlite)
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      {formatBytes(diagnostics.catalog_sqlite_bytes) ?? '0 B'} of metadata ·{' '}
+                      {diagnostics.snapshot_count.toLocaleString()} snapshots · latest #
+                      {diagnostics.current_snapshot_id ?? '—'}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="p-3.5 rounded-lg border border-slate-200 bg-white">
+                    <div className="text-[10px] font-mono uppercase font-bold text-slate-500">
+                      Active Tables
+                    </div>
+                    <div className="text-xl font-bold font-mono text-slate-900 mt-1">
+                      {diagnostics.active_table_count.toLocaleString()}
+                    </div>
+                  </div>
+                  <div className="p-3.5 rounded-lg border border-slate-200 bg-white">
+                    <div className="text-[10px] font-mono uppercase font-bold text-slate-500">
+                      Parquet Data Files
+                    </div>
+                    <div className="text-xl font-bold font-mono text-slate-900 mt-1">
+                      {diagnostics.active_data_files.toLocaleString()}
+                    </div>
+                  </div>
+                  <div className="p-3.5 rounded-lg border border-slate-200 bg-white">
+                    <div className="text-[10px] font-mono uppercase font-bold text-slate-500">
+                      Live Data Size
+                    </div>
+                    <div className="text-xl font-bold font-mono text-slate-900 mt-1">
+                      {formatBytes(diagnostics.total_data_bytes) ?? '0 B'}
+                    </div>
+                  </div>
+                </div>
+
+                {diagnostics.orphaned_load_tables > 0 && (
+                  <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-900 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <span>
+                      {diagnostics.orphaned_load_tables} load table(s) were left behind by a killed
+                      ingest. They hold bytes nothing reads; Run Maintenance below drops them.
+                    </span>
+                  </div>
+                )}
+              </>
+            )}
 
             <div className="p-4 rounded-lg bg-purple-50/60 border border-purple-100 text-xs text-purple-900 space-y-1.5">
               <div className="font-semibold flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-purple-600"></span>
-                Scale-Out Benefit:
+                Retention and backup on local NVMe
               </div>
               <p className="text-purple-800 leading-relaxed">
-                Today on NVMe: <code className="bg-purple-100 px-1 py-0.5 rounded font-mono">STORAGE_URI=file:///data/lakehouse</code> delivers up to 4,000 MB/s native disk throughput.
-                Tomorrow on S3/MinIO: simply update the environment variable to <code className="bg-purple-100 px-1 py-0.5 rounded font-mono">STORAGE_URI=s3://my-lakehouse</code>. Every notebook, dbt model, and pipeline executes identically without code changes.
+                DuckLake keeps a snapshot per write and never expires one on its own, so the catalog
+                grows until maintenance runs. The storage root is a local path — there is no
+                object-store backend — so a backup is a copy:{' '}
+                <code className="bg-purple-100 px-1 py-0.5 rounded font-mono break-all">
+                  python backend/scripts/lakehouse_maintenance.py backup --destination D:\backups
+                </code>{' '}
+                copies the lakehouse and snapshots the control-plane database. The same script takes{' '}
+                <code className="bg-purple-100 px-1 py-0.5 rounded font-mono">
+                  maintain --keep-days 14 --delete-files
+                </code>{' '}
+                for a scheduled run outside the UI.
               </p>
             </div>
+          </section>
+
+          {/* The reclaim path for everything the numbers above report */}
+          <section className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs space-y-4">
+            <div className="flex items-center gap-2">
+              <Wrench className="w-4 h-4 text-slate-600" />
+              <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider font-mono">
+                Compact & Expire Snapshots
+              </h3>
+            </div>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Every write adds a DuckLake snapshot and new Parquet files. Merging adjacent files and
+              expiring old snapshots is what turns thousands of small files back into scan-able
+              ones. Run it with no ingest or pipeline writing: an interrupted run is what leaves the
+              load tables this same run drops.
+            </p>
+
+            <div className="flex flex-wrap items-end gap-4 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+              <label className="flex flex-col gap-1">
+                <span className="text-[10px] font-mono uppercase font-bold text-slate-500">
+                  Keep snapshots (days)
+                </span>
+                <input
+                  type="number"
+                  min={1}
+                  max={365}
+                  value={keepDays}
+                  onChange={(e) =>
+                    setKeepDays(Math.min(365, Math.max(1, Number(e.target.value) || 1)))
+                  }
+                  className="w-24 text-xs font-mono bg-white border border-slate-300 rounded-md px-2 py-1 outline-hidden focus:border-sky-500"
+                />
+              </label>
+              <label className="flex items-center gap-2 text-[11px] text-slate-700 pb-1.5">
+                <input
+                  type="checkbox"
+                  checked={deleteFiles}
+                  onChange={(e) => setDeleteFiles(e.target.checked)}
+                  className="rounded border-slate-300 text-sky-600 focus:ring-sky-500/30"
+                />
+                <span>
+                  Also delete files nothing references{' '}
+                  <span className="text-rose-600 font-semibold">(irreversible)</span>
+                </span>
+              </label>
+              <button
+                onClick={() => void runMaintenance()}
+                disabled={maintaining}
+                className="ml-auto flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold shadow-xs transition-all disabled:opacity-60"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${maintaining ? 'animate-spin' : ''}`} />
+                <span>{maintaining ? 'Running maintenance…' : 'Run Maintenance'}</span>
+              </button>
+            </div>
+
+            <p className="text-[11px] text-slate-500">
+              Time travel reaches back {keepDays} day(s) once this has run. The response reports what
+              each step did — tables compacted, snapshots expired, files removed — in a toast.
+            </p>
           </section>
         </div>
       )}
@@ -702,61 +986,207 @@ export const SettingsView: React.FC = () => {
       {activeSubTab === 'diagnostics' && (
         <div className="space-y-6">
           <section className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs space-y-4">
-            <div className="flex items-center gap-2">
-              <Cpu className="w-4 h-4 text-amber-600" />
-              <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider font-mono">
-                System Diagnostics & Core Architecture
-              </h3>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Cpu className="w-4 h-4 text-amber-600" />
+                <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider font-mono">
+                  System Diagnostics & Core Architecture
+                </h3>
+              </div>
+              <button
+                onClick={() => void loadDiagnostics()}
+                disabled={diagnosticsLoading}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700 shadow-2xs transition-all disabled:opacity-60"
+              >
+                <RefreshCw
+                  className={`w-3.5 h-3.5 ${diagnosticsLoading ? 'animate-spin text-sky-600' : 'text-slate-500'}`}
+                />
+                <span>Refresh</span>
+              </button>
             </div>
+
+            {diagnosticsError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-center gap-2.5 text-xs text-red-700">
+                <AlertTriangle className="w-4 h-4 text-red-500 shrink-0" />
+                <span>{diagnosticsError}</span>
+              </div>
+            )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-2 font-mono">
                 <div className="flex items-center justify-between text-xs">
-                  <span className="font-bold text-slate-700">Internal Brain (SQLite)</span>
-                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                    WAL Mode Active
+                  <span className="font-bold text-slate-700">Control Plane DB</span>
+                  <span
+                    className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                      diagnostics?.obelisk_db_journal_mode === 'WAL'
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-amber-50 text-amber-700 border-amber-200'
+                    }`}
+                  >
+                    {diagnostics ? `${diagnostics.obelisk_db_journal_mode} journal` : 'reading…'}
                   </span>
                 </div>
+                <div className="text-lg font-bold text-slate-900">
+                  {formatBytes(diagnostics?.obelisk_db_bytes) ?? '—'}
+                </div>
                 <div className="text-[11px] text-slate-500 font-sans">
-                  Located at <code className="text-slate-800 font-mono">data/obelisk.db</code>. Handles asset metadata, pipeline definitions, execution runs, and variables with zero network latency.
+                  <code className="text-slate-800 font-mono">data/obelisk.db</code> holds assets,
+                  pipeline definitions, runs and variables. The journal mode above is what SQLite
+                  answers, not what the app asked for.
                 </div>
               </div>
 
               <div className="p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-2 font-mono">
                 <div className="flex items-center justify-between text-xs">
-                  <span className="font-bold text-slate-700">Cryptography Vault</span>
+                  <span className="font-bold text-slate-700">DuckDB Execution Engine</span>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200">
+                    In-Process
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-slate-600">
+                  <span>
+                    Memory / slot{' '}
+                    <b className="text-slate-900">
+                      {diagnostics?.duckdb_memory_limit_per_slot ?? '—'}
+                    </b>
+                  </span>
+                  <span>
+                    Row cap{' '}
+                    <b className="text-slate-900">
+                      {diagnostics?.duckdb_max_query_rows.toLocaleString() ?? '—'}
+                    </b>
+                  </span>
+                  <span>
+                    Temp spill{' '}
+                    <b className="text-slate-900">
+                      {formatBytes(diagnostics?.duckdb_tmp_bytes) ?? '—'}
+                    </b>
+                  </span>
+                  <span>
+                    Temp limit{' '}
+                    <b className="text-slate-900">{diagnostics?.duckdb_tmp_limit ?? '—'}</b>
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-500 font-sans">
+                  Sort and join spill goes to disk under{' '}
+                  <code className="text-slate-800 font-mono">duckdb_tmp</code>; the limit above is
+                  what stops it from filling the NVMe.
+                </div>
+              </div>
+
+              <div className="p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-2 font-mono">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-bold text-slate-700">DuckLake Metadata Catalog</span>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200">
+                    .obelisk/catalog.sqlite
+                  </span>
+                </div>
+                <div className="text-lg font-bold text-slate-900">
+                  {formatBytes(diagnostics?.catalog_sqlite_bytes) ?? '—'}
+                </div>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-slate-600">
+                  <span>
+                    Snapshot{' '}
+                    <b className="text-slate-900">#{diagnostics?.current_snapshot_id ?? '—'}</b>
+                  </span>
+                  <span>
+                    Snapshots kept{' '}
+                    <b className="text-slate-900">
+                      {diagnostics?.snapshot_count.toLocaleString() ?? '—'}
+                    </b>
+                  </span>
+                  <span>
+                    Active tables{' '}
+                    <b className="text-slate-900">
+                      {diagnostics?.active_table_count.toLocaleString() ?? '—'}
+                    </b>
+                  </span>
+                  <span>
+                    Orphaned loads{' '}
+                    <b
+                      className={
+                        (diagnostics?.orphaned_load_tables ?? 0) > 0
+                          ? 'text-amber-700'
+                          : 'text-slate-900'
+                      }
+                    >
+                      {diagnostics?.orphaned_load_tables.toLocaleString() ?? '—'}
+                    </b>
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-500 font-sans">
+                  The catalog is a SQLite file beside the Parquet it points at. Its snapshot id is
+                  the version every new connection reads.
+                </div>
+              </div>
+
+              <div className="p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-2 font-mono">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-bold text-slate-700">Containers & Secrets Vault</span>
                   <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
                     Fernet AES-128
                   </span>
                 </div>
-                <div className="text-[11px] text-slate-500 font-sans">
-                  Controlled by <code className="text-slate-800 font-mono">OBELISK_MASTER_KEY</code>. Passwords and secret variables are encrypted with 128-bit CBC AES + HMAC-SHA256 authenticated tokens.
-                </div>
-              </div>
-
-              <div className="p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-2 font-mono">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-bold text-slate-700">Docker Daemon</span>
-                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200">
-                    Localhost Socket
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-slate-600">
+                  <span>
+                    Running containers{' '}
+                    <b className="text-slate-900">
+                      {telemetry ? telemetry.active_containers_count : 'not reported'}
+                    </b>
+                  </span>
+                  <span>
+                    Allocated RAM{' '}
+                    <b className="text-slate-900">
+                      {telemetry ? `${telemetry.allocated_ram_gb.toFixed(1)} GB` : 'not reported'}
+                    </b>
+                  </span>
+                  <span>
+                    Source connections <b className="text-slate-900">{connections.length}</b>
+                  </span>
+                  <span>
+                    Encrypted secrets{' '}
+                    <b className="text-slate-900">
+                      {variables.filter((v) => v.is_secret).length}
+                    </b>
                   </span>
                 </div>
                 <div className="text-[11px] text-slate-500 font-sans">
-                  Socket path: <code className="text-slate-800 font-mono">/var/run/docker.sock</code>. Obelisk manages isolated containers strictly on localhost with hardware ceiling enforcement.
+                  Container numbers come from the services telemetry probe; credentials and secrets
+                  are Fernet tokens under <code className="text-slate-800 font-mono">OBELISK_MASTER_KEY</code>.
                 </div>
               </div>
+            </div>
 
-              <div className="p-4 rounded-lg border border-slate-200 bg-slate-50 space-y-2 font-mono">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-bold text-slate-700">Federation Engine</span>
-                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-50 text-sky-700 border border-sky-200">
-                    DuckDB In-Process
-                  </span>
+            {/* Files and Terminal are redundant with dbt Studio and Marimo unless asked for */}
+            <div className="flex items-start justify-between gap-4 p-4 rounded-lg border border-slate-200 bg-slate-50">
+              <div className="space-y-1">
+                <div className="text-xs font-bold text-slate-700 font-mono flex items-center gap-1.5">
+                  <SquareTerminal className="w-3.5 h-3.5 text-slate-500" />
+                  Developer Raw Tools
                 </div>
-                <div className="text-[11px] text-slate-500 font-sans">
-                  Zero-copy Arrow analytical execution across Snappy Parquet, PostgreSQL, and MySQL without ETL overhead.
+                <div className="text-[11px] text-slate-500 leading-relaxed">
+                  Adds <b>Files</b> (a raw tree over <code className="font-mono">git_repo/</code>) and{' '}
+                  <b>Terminal</b> to the sidebar. Off by default: dbt Studio and Marimo already open
+                  the same scripts with their schema in view, and two trees over one folder is how a
+                  model gets edited in the wrong place.
                 </div>
               </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={devToolsEnabled}
+                onClick={() => setDevToolsEnabled(!devToolsEnabled)}
+                className={`shrink-0 w-11 h-6 rounded-full transition-colors relative ${
+                  devToolsEnabled ? 'bg-sky-600' : 'bg-slate-300'
+                }`}
+                title={devToolsEnabled ? 'Hide Files and Terminal' : 'Show Files and Terminal'}
+              >
+                <span
+                  className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow-sm transition-all ${
+                    devToolsEnabled ? 'left-[22px]' : 'left-0.5'
+                  }`}
+                />
+              </button>
             </div>
           </section>
         </div>
@@ -773,11 +1203,14 @@ export const SettingsView: React.FC = () => {
               <div className="flex items-center gap-2">
                 <Key className="w-4 h-4 text-sky-600" />
                 <h3 className="text-sm font-bold text-slate-900 font-mono">
-                  Create Variable or Secret
+                  {editingVar ? 'Edit Variable or Secret' : 'Create Variable or Secret'}
                 </h3>
               </div>
               <button
-                onClick={() => setIsAddVarOpen(false)}
+                onClick={() => {
+                  setIsAddVarOpen(false);
+                  setEditingVar(null);
+                }}
                 className="text-slate-400 hover:text-slate-600 text-xs font-mono"
               >
                 ✕
@@ -792,13 +1225,18 @@ export const SettingsView: React.FC = () => {
                 <input
                   type="text"
                   required
+                  readOnly={Boolean(editingVar)}
                   placeholder="e.g. SLACK_WEBHOOK_URL"
                   value={newVarKey}
                   onChange={(e) => setNewVarKey(e.target.value.toUpperCase().replace(/\s+/g, '_'))}
-                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500"
+                  className={`w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500 ${
+                    editingVar ? 'bg-slate-50 text-slate-500 cursor-not-allowed' : ''
+                  }`}
                 />
                 <span className="text-[10px] text-slate-400 font-mono mt-0.5 block">
-                  Alphanumeric identifier, uppercase with underscores
+                  {editingVar
+                    ? 'The key is the row identity — delete and recreate it to rename.'
+                    : 'Alphanumeric identifier, uppercase with underscores'}
                 </span>
               </div>
 
@@ -840,15 +1278,28 @@ export const SettingsView: React.FC = () => {
                 <textarea
                   required
                   rows={3}
+                  disabled={varValueLoading}
                   placeholder={
-                    newVarIsSecret
-                      ? 'Enter confidential secret (encrypted at rest)...'
-                      : 'Enter string or numeric value...'
+                    varValueLoading
+                      ? 'Reading the current value…'
+                      : newVarIsSecret
+                        ? 'Enter confidential secret (encrypted at rest)...'
+                        : 'Enter string or numeric value...'
                   }
                   value={newVarValue}
                   onChange={(e) => setNewVarValue(e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500"
+                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500 disabled:bg-slate-50"
                 />
+                {varValueLoading && (
+                  <span className="text-[10px] text-sky-700 font-mono mt-0.5 flex items-center gap-1">
+                    <RefreshCw className="w-3 h-3 animate-spin" /> Reading the current value…
+                  </span>
+                )}
+                {editingVar && !varValueLoading && (
+                  <span className="text-[10px] text-slate-400 font-mono mt-0.5 block">
+                    Saving replaces the stored value of {editingVar.key}.
+                  </span>
+                )}
               </div>
 
               <div>
@@ -867,17 +1318,20 @@ export const SettingsView: React.FC = () => {
               <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setIsAddVarOpen(false)}
+                  onClick={() => {
+                    setIsAddVarOpen(false);
+                    setEditingVar(null);
+                  }}
                   className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-slate-700"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  disabled={savingVar || !newVarKey.trim() || !newVarValue.trim()}
+                  disabled={savingVar || varValueLoading || !newVarKey.trim() || !newVarValue.trim()}
                   className="px-4 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold shadow-xs disabled:opacity-50 transition-all"
                 >
-                  {savingVar ? 'Saving...' : 'Save Variable'}
+                  {savingVar ? 'Saving...' : editingVar ? 'Save Changes' : 'Save Variable'}
                 </button>
               </div>
             </form>
@@ -899,6 +1353,9 @@ export const SettingsView: React.FC = () => {
           loadData(true);
         }}
       />
+
+      {/* Every destructive action in Settings goes through one dialog */}
+      <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />
     </div>
   );
 };

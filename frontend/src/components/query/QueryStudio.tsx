@@ -24,6 +24,7 @@ import {
   Sparkles,
   Map,
   CheckCircle2,
+  AlertTriangle,
 } from 'lucide-react';
 import { api, apiClient } from '../../lib/api';
 import type { QueryExecuteResponse, QueryHistoryItem, CatalogNode, CatalogTable, QueryTarget } from '../../lib/types';
@@ -313,15 +314,20 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
       const nodes = await api.getCatalogTree();
       setCatalogNodes(nodes);
 
-      // Auto-populate default SQL using the first available Lakehouse table if SQL is still fallback
+      // The default query used to hardcode 'bronze': a lakehouse without that folder
+      // opened on `SELECT * FROM bronze.` and an error. Take the first folder that
+      // actually holds tables and qualify it the way DuckLake resolves it.
       const lakehouseNode = nodes.find((n) => n.id === 'lakehouse' || n.type === 'lakehouse');
-      const bronzeTables =
-        lakehouseNode?.directories?.find((d) => d.name === 'bronze')?.tables ||
-        lakehouseNode?.tables ||
-        [];
-      if (!initialSql && bronzeTables.length > 0) {
-        const firstTable = bronzeTables[0];
-        const initialQuery = `-- Obelisk Query Studio (DuckDB In-Process Analytical Engine)\nSELECT * FROM bronze.${firstTable.name} LIMIT 50;\n`;
+      const firstDirWithTables = lakehouseNode?.directories?.find(
+        (d) => d.tables && d.tables.length > 0,
+      );
+      const firstTable = firstDirWithTables?.tables?.[0] ?? lakehouseNode?.tables?.[0];
+      if (!initialSql && firstTable) {
+        const folderPath = firstDirWithTables?.path || firstDirWithTables?.name || '';
+        const qualified = [folderPath.replace(/\//g, '.'), firstTable.name]
+          .filter(Boolean)
+          .join('.');
+        const initialQuery = `-- Obelisk Query Studio (DuckDB In-Process Analytical Engine)\nSELECT * FROM lakehouse.${qualified} LIMIT 50;\n`;
         setTabs((prev) =>
           prev.map((t, idx) =>
             idx === 0 && !t.result && t.sql === FALLBACK_DEFAULT_SQL
@@ -475,9 +481,10 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
       fqn = options.fqn;
       tabTitle = typeof tableOrName === 'string' ? tableOrName : tableOrName.name;
     } else if (options?.isLakehouse) {
-      const folder = (options.folderPath || 'bronze').replace(/\//g, '.');
+      // No layer fallback: a lakehouse row either names its folder or sits at the root.
+      const folder = (options.folderPath ?? '').replace(/\//g, '.');
       const cleanName = (typeof tableOrName === 'string' ? tableOrName : tableOrName.name).replace(/\.parquet$/i, '');
-      fqn = `lakehouse.${folder}.${cleanName}`;
+      fqn = ['lakehouse', folder, cleanName].filter(Boolean).join('.');
       tabTitle = cleanName;
     } else if (options?.sourceName) {
       const sourceAlias = options.sourceName.toLowerCase().replace(/[^a-z0-9_]/g, '_');
@@ -727,28 +734,17 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
         node.directories?.forEach((dir) => {
           dir.tables?.forEach((table) => {
             const cleanName = table.name.replace(/\.parquet$/i, '');
-            const folder = dir.path || dir.name || 'bronze';
-            const fullTableName = folder === 'bronze' ? cleanName : `${folder}.${cleanName}`;
+            const folder = dir.path || dir.name || '';
+            const qualifiedName = [folder.replace(/\//g, '.'), cleanName].filter(Boolean).join('.');
 
             tableSuggestions.push({
-              label: fullTableName,
+              label: qualifiedName,
               kind: monaco.languages.CompletionItemKind.Class,
-              insertText: fullTableName,
-              detail: `Lakehouse Table (${folder})`,
+              insertText: qualifiedName,
+              detail: `Lakehouse Table${folder ? ` (${folder})` : ''}`,
               documentation: `Path: ${table.path || table.name}\nSize: ${table.size_bytes ? `${Math.round(table.size_bytes / 1024)} KB` : 'N/A'}\nColumns: ${table.columns?.length || 0}`,
-              sortText: `0_${fullTableName}`,
+              sortText: `0_${qualifiedName}`,
             });
-
-            if (folder === 'bronze') {
-              tableSuggestions.push({
-                label: `bronze.${cleanName}`,
-                kind: monaco.languages.CompletionItemKind.Class,
-                insertText: `bronze.${cleanName}`,
-                detail: 'Lakehouse Bronze Table',
-                documentation: `Query with: SELECT * FROM bronze.${cleanName} LIMIT 50;`,
-                sortText: `0_bronze_${cleanName}`,
-              });
-            }
 
             table.columns?.forEach((col) => {
               columnSuggestions.push({
@@ -756,7 +752,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
                 kind: monaco.languages.CompletionItemKind.Field,
                 insertText: col.name,
                 detail: `${col.data_type} • ${cleanName}`,
-                documentation: `Column from Lakehouse table '${fullTableName}'`,
+                documentation: `Column from Lakehouse table '${qualifiedName}'`,
                 sortText: `1_${col.name}`,
               });
             });
@@ -1197,7 +1193,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
                                   )}
                                 </button>
                                 <span
-                                  onClick={() => handleTableClick(t, { isLakehouse: true, folderPath: 'bronze', fqn: t.fqn })}
+                                  onClick={() => handleTableClick(t, { isLakehouse: true, folderPath: '', fqn: t.fqn })}
                                   className="flex-1 font-mono text-[11px] font-medium text-slate-700 hover:text-indigo-600 truncate ml-1"
                                 >
                                   {t.name}
@@ -1559,6 +1555,21 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
                     <Clock className="w-3.5 h-3.5 text-slate-400" />
                     {activeTab.result.duration_ms} ms
                   </span>
+                  {activeTab.result.truncated && (
+                    <>
+                      <span className="text-slate-300">•</span>
+                      {/* The engine stops reading at its row cap; without this the grid
+                          looks like the whole table when it is a sample of it. */}
+                      <span
+                        className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200 font-semibold"
+                        title="The result hit the engine's row cap. Export streams the full dataset to disk."
+                      >
+                        <AlertTriangle className="w-3 h-3" />
+                        Showing first {activeTab.result.row_count.toLocaleString()} rows (result truncated —
+                        use Export for full dataset)
+                      </span>
+                    </>
+                  )}
                 </>
               )}
             </div>

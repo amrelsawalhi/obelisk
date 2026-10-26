@@ -13,6 +13,8 @@ import {
 import { api } from '../../lib/api';
 import { DeployModal } from './DeployModal';
 import { SERVICE_ICONS } from './serviceIcons';
+import { ConfirmDialog } from '../common/ConfirmDialog';
+import type { ConfirmRequest } from '../common/ConfirmDialog';
 import type {
   ServiceCatalogEntry,
   ServiceStatus,
@@ -58,6 +60,8 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
   const [customDatabase, setCustomDatabase] = useState('');
   const [operating, setOperating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Destroying a service deletes its volume, so it asks in-app where the warning is readable.
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [deployResult, setDeployResult] = useState<DeployLocalResponse | null>(null);
   const [deployProgress, setDeployProgress] = useState<DeployProgressResponse | null>(null);
@@ -146,24 +150,28 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
     }
   };
 
-  const handleDestroy = async () => {
-    const confirmed = window.confirm(
-      isProcess
-        ? `Destroy ${service.name}? This stops the engine processes and permanently deletes its home directory — all persisted data will be lost.`
-        : `Destroy ${service.name}? This permanently deletes the container AND its data volume — all persisted data will be lost.`
-    );
-    if (!confirmed) return;
-    setOperating(true);
-    setError(null);
-    try {
-      await api.destroyService(service.name);
-      setDeployResult(null);
-      onChanged();
-    } catch (e: unknown) {
-      setError(extractErrorMessage(e, `Failed to destroy ${service.name}`));
-    } finally {
-      setOperating(false);
-    }
+  const handleDestroy = () => {
+    setConfirmRequest({
+      title: `Destroy ${service.name}?`,
+      body: isProcess
+        ? 'This stops the engine processes and permanently deletes its home directory — all persisted data will be lost.'
+        : 'This permanently deletes the container AND its data volume — all persisted data will be lost.',
+      confirmLabel: 'Destroy service',
+      destructive: true,
+      onConfirm: async () => {
+        setOperating(true);
+        setError(null);
+        try {
+          await api.destroyService(service.name);
+          setDeployResult(null);
+          onChanged();
+        } catch (e: unknown) {
+          setError(extractErrorMessage(e, `Failed to destroy ${service.name}`));
+        } finally {
+          setOperating(false);
+        }
+      },
+    });
   };
 
   const handleShowLogs = async () => {
@@ -376,6 +384,8 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
           </div>
         </div>
       )}
+
+      <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />
     </>,
     document.body
   );

@@ -278,7 +278,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
 
             {/* 3. dbt Transformation Models */}
             <div
-              onClick={() => onNavigate('pipelines')}
+              onClick={() => onNavigate('dbt')}
               className="p-3.5 rounded-xl border border-violet-200/80 bg-violet-50/40 hover:bg-violet-50/80 transition-all cursor-pointer group flex flex-col justify-between"
             >
               <div>

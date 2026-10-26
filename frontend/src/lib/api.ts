@@ -42,12 +42,39 @@ import type {
   CreatePipelinePayload,
   GraphPayload,
   ExecutionStatus,
+  LakehouseDiagnostics,
+  LakehouseMaintenanceResult,
 } from './types';
+
+const CLIENT_ID_STORAGE_KEY = 'obelisk_client_id';
+
+/**
+ * The backend keeps open query tabs per client (`X-Obelisk-Client-Id`), so two
+ * browsers on the same team stop overwriting each other's tabs. The id is stable
+ * per browser profile because it lives in localStorage: reopening the tab finds
+ * the same SQL. A private window, or a store the browser refuses to write, falls
+ * back to the shared `default` scope rather than failing the request.
+ */
+const getClientId = (): string => {
+  try {
+    const stored = localStorage.getItem(CLIENT_ID_STORAGE_KEY);
+    if (stored) return stored;
+    const generated =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `client-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    localStorage.setItem(CLIENT_ID_STORAGE_KEY, generated);
+    return generated;
+  } catch {
+    return 'default';
+  }
+};
 
 export const apiClient = axios.create({
   baseURL: '/api',
   headers: {
     'Content-Type': 'application/json',
+    'X-Obelisk-Client-Id': getClientId(),
   },
   withCredentials: true,
 });
@@ -143,6 +170,23 @@ export const api = {
       source_folder: sourceFolder,
       target_folder: targetFolder,
       table_name: tableName,
+    });
+    return res.data;
+  },
+  // Lakehouse storage health. One payload feeds the Storage and Diagnostics tabs,
+  // so the two can never disagree about what the lakehouse costs.
+  getLakehouseDiagnostics: async (): Promise<LakehouseDiagnostics> => {
+    const res = await apiClient.get<LakehouseDiagnostics>('/catalog/lakehouse/diagnostics');
+    return res.data;
+  },
+  // Deleting unread bytes is irreversible, so the caller states it rather than
+  // inheriting a default it never read about.
+  maintainLakehouse: async (
+    options: { keep_days?: number; delete_files?: boolean } = {},
+  ): Promise<LakehouseMaintenanceResult> => {
+    const res = await apiClient.post<LakehouseMaintenanceResult>('/catalog/lakehouse/maintain', {
+      keep_days: options.keep_days ?? 7,
+      delete_files: options.delete_files ?? true,
     });
     return res.data;
   },

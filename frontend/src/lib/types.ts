@@ -342,6 +342,9 @@ export interface QueryExecuteResponse {
   row_count: number;
   duration_ms: number;
   status: string;
+  // True when the engine stopped at its row cap (DUCKDB_MAX_QUERY_ROWS); the grid
+  // then shows a sample of the result, not all of it.
+  truncated?: boolean;
   command_tag?: string | null;
   target_engine?: string;
   target_name?: string;
@@ -844,5 +847,49 @@ export interface CreatePipelinePayload {
   retry_delay_seconds: number;
   auto_rerun_interrupted: boolean;
   graph?: GraphPayload;
+}
+
+// ==========================================
+// Lakehouse Storage & Diagnostics (Settings)
+// ==========================================
+export interface LakehouseDiagnostics {
+  storage_uri: string;
+  lakehouse_root: string;
+  catalog_sqlite_bytes: number;
+  obelisk_db_bytes: number;
+  // What SQLite answers for `PRAGMA journal_mode`, not what the app asked for.
+  obelisk_db_journal_mode: string;
+  duckdb_tmp_bytes: number;
+  duckdb_tmp_limit: string;
+  duckdb_memory_limit_per_slot: string;
+  // The row cap a single query result is truncated at; Results says so when hit.
+  duckdb_max_query_rows: number;
+  snapshot_count: number;
+  current_snapshot_id: number | null;
+  active_table_count: number;
+  active_data_files: number;
+  total_data_bytes: number;
+  orphaned_load_tables: number;
+}
+
+/** The catalog's own counters, as reported before and after a maintenance run. */
+export interface LakehouseCatalogCounts {
+  snapshots: number;
+  active_tables: number;
+  data_files: number;
+  data_bytes: number;
+}
+
+export interface LakehouseMaintenanceResult {
+  status: string;
+  orphaned_load_tables_dropped: number;
+  tables_compacted: number;
+  snapshots_expired: number;
+  files_removed: number;
+  empty_directories_removed: number;
+  delete_files: boolean;
+  keep_days: number;
+  before: LakehouseCatalogCounts;
+  after: LakehouseCatalogCounts;
 }
 

@@ -13,6 +13,8 @@ import {
 import { api } from '../../lib/api';
 import type { FileNode, FileTreeResponse } from '../../lib/types';
 import { FileTree } from './FileTree';
+import { ConfirmDialog } from '../common/ConfirmDialog';
+import type { ConfirmRequest } from '../common/ConfirmDialog';
 
 interface OpenFile {
   path: string;
@@ -65,6 +67,7 @@ export const FileManagerView: React.FC = () => {
   // Status & feedback
   const [saving, setSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
 
   const showStatus = useCallback((type: 'success' | 'error', text: string, duration = 4000) => {
     setStatusMessage({ type, text });
@@ -138,15 +141,7 @@ export const FileManagerView: React.FC = () => {
 
 
   // Close tab
-  const handleCloseTab = (path: string, e?: React.MouseEvent) => {
-    if (e) e.stopPropagation();
-    const file = openFiles.find((f) => f.path === path);
-    if (file && file.isDirty) {
-      if (!window.confirm(`File "${file.name}" has unsaved changes. Discard changes?`)) {
-        return;
-      }
-    }
-
+  const closeTabNow = (path: string) => {
     const nextFiles = openFiles.filter((f) => f.path !== path);
     setOpenFiles(nextFiles);
 
@@ -157,6 +152,22 @@ export const FileManagerView: React.FC = () => {
         setActivePath(null);
       }
     }
+  };
+
+  const handleCloseTab = (path: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    const file = openFiles.find((f) => f.path === path);
+    if (file?.isDirty) {
+      setConfirmRequest({
+        title: `Discard changes to "${file.name}"?`,
+        body: 'The buffer has unsaved edits. Closing the tab throws them away.',
+        confirmLabel: 'Discard and close',
+        destructive: true,
+        onConfirm: () => closeTabNow(path),
+      });
+      return;
+    }
+    closeTabNow(path);
   };
 
   // Update content of active file
@@ -264,7 +275,7 @@ export const FileManagerView: React.FC = () => {
           });
         }
       } catch (err: any) {
-        alert(err?.response?.data?.detail || 'Error creating item');
+        showStatus('error', err?.response?.data?.detail || 'Error creating item');
       }
     } else if (type === 'rename' && targetNode && inputValue) {
       const parentDir = targetNode.path.includes('/')
@@ -287,18 +298,19 @@ export const FileManagerView: React.FC = () => {
         await fetchTree();
         setModalState({ type: null });
       } catch (err: any) {
-        alert(err?.response?.data?.detail || 'Error renaming item');
+        showStatus('error', err?.response?.data?.detail || 'Error renaming item');
       }
     } else if (type === 'delete' && targetNode) {
       try {
         await api.deleteFile(targetNode.path);
         // Clear status and close if open
         setStatusMessage(null);
-        handleCloseTab(targetNode.path);
+        // The file no longer exists, so close its tab without asking about unsaved edits.
+        closeTabNow(targetNode.path);
         await fetchTree();
         setModalState({ type: null });
       } catch (err: any) {
-        alert(err?.response?.data?.detail || 'Error deleting item');
+        showStatus('error', err?.response?.data?.detail || 'Error deleting item');
       }
     }
   };
@@ -523,6 +535,8 @@ export const FileManagerView: React.FC = () => {
           </div>
         </div>
       )}
+
+      <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />
     </div>
   );
 };

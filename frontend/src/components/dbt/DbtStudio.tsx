@@ -33,6 +33,9 @@ import { DbtLineageGraph } from './DbtLineageGraph';
 import { NewModelModal } from './NewModelModal';
 import { NewYamlModal } from './NewYamlModal';
 import { DataGrid } from '../query/DataGrid';
+import { ConfirmDialog } from '../common/ConfirmDialog';
+import type { ConfirmRequest } from '../common/ConfirmDialog';
+import { toast } from '../../lib/toast';
 
 interface OpenEditorTab {
   path: string;
@@ -99,6 +102,8 @@ export const DbtStudio: React.FC = () => {
   const [isRunningDbt, setIsRunningDbt] = useState(false);
   const [isRunningTest, setIsRunningTest] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  // One dialog for every destructive dbt action: closing a dirty tab, deleting a file.
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
 
   // Results State. Each panel records the model that produced it, so switching
   // models can never display the previous model's rows or graph while the new
@@ -212,14 +217,7 @@ export const DbtStudio: React.FC = () => {
   );
 
   // Close Tab
-  const handleCloseTab = (path: string, e?: React.MouseEvent) => {
-    e?.stopPropagation();
-    const tabToClose = openTabs.find((t) => t.path === path);
-    if (tabToClose?.isDirty) {
-      const confirmClose = window.confirm(`"${tabToClose.name}" has unsaved changes. Close anyway?`);
-      if (!confirmClose) return;
-    }
-
+  const closeTabNow = (path: string) => {
     const filtered = openTabs.filter((t) => t.path !== path);
     setOpenTabs(filtered);
 
@@ -230,6 +228,23 @@ export const DbtStudio: React.FC = () => {
         setActiveTabPath(null);
       }
     }
+  };
+
+  const handleCloseTab = (path: string, e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    const tabToClose = openTabs.find((t) => t.path === path);
+    if (tabToClose?.isDirty) {
+      // Blocking `window.confirm` froze the canvas timers; the dialog does not.
+      setConfirmRequest({
+        title: `Close "${tabToClose.name}"?`,
+        body: 'It has unsaved changes. Closing the tab discards them.',
+        confirmLabel: 'Close without saving',
+        destructive: true,
+        onConfirm: () => closeTabNow(path),
+      });
+      return;
+    }
+    closeTabNow(path);
   };
 
   // Editor Content Change
@@ -263,7 +278,7 @@ export const DbtStudio: React.FC = () => {
         handleCompile();
       }
     } catch (err: any) {
-      alert(`Failed to save file: ${err?.message}`);
+      toast.error(`Failed to save file: ${err?.message ?? 'unknown error'}`);
     } finally {
       setIsSaving(false);
     }
@@ -435,17 +450,25 @@ export const DbtStudio: React.FC = () => {
   }, [dockTab, isDockCollapsed, activeModelName, lineageModel, loadLineage]);
 
   // 9. Delete File from Tree
-  const handleDeleteFile = async (path: string) => {
+  const handleDeleteFile = (path: string) => {
     const fileName = path.split('/').pop() || path;
-    if (window.confirm(`Are you sure you want to delete "${fileName}"? This directly deletes it from disk.`)) {
-      try {
-        await api.deleteDbtFile(path);
-        handleCloseTab(path);
-        fetchTree();
-      } catch (err: any) {
-        alert(`Failed to delete file: ${err?.message}`);
-      }
-    }
+    setConfirmRequest({
+      title: `Delete "${fileName}"?`,
+      body: 'This deletes the file from git_repo/dbt_project on disk. Any model or pipeline that references it breaks on the next run.',
+      confirmLabel: 'Delete file',
+      destructive: true,
+      onConfirm: async () => {
+        try {
+          await api.deleteDbtFile(path);
+          // The file is gone, so close its tab without re-asking about unsaved edits.
+          closeTabNow(path);
+          fetchTree();
+          toast.success(`Deleted ${fileName}.`);
+        } catch (err: any) {
+          toast.error(`Failed to delete file: ${err?.message ?? 'unknown error'}`);
+        }
+      },
+    });
   };
 
   // Keyboard shortcuts read the latest handlers through a ref, so the listener
@@ -1014,6 +1037,8 @@ export const DbtStudio: React.FC = () => {
           handleOpenFile(filePath, fileName);
         }}
       />
+
+      <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />
     </div>
   );
 };

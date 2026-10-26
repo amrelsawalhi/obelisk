@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { tableSizeLabel } from '../../lib/format';
+import { toast } from '../../lib/toast';
 import {
   ChevronRight,
   ChevronDown,
@@ -184,7 +185,7 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
           : err instanceof Error
           ? err.message
           : 'Failed to create subfolder';
-      alert(msg);
+      toast.error(msg);
     } finally {
       setSubfolderLoading(false);
     }
@@ -206,7 +207,7 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
           : err instanceof Error
           ? err.message
           : 'Failed to rename directory';
-      alert(msg);
+      toast.error(msg);
     } finally {
       setRenameDirLoading(false);
     }
@@ -232,7 +233,7 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
           : err instanceof Error
           ? err.message
           : 'Failed to rename table';
-      alert(msg);
+      toast.error(msg);
     } finally {
       setRenameTableLoading(false);
     }
@@ -258,7 +259,7 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
           : err instanceof Error
           ? err.message
           : 'Failed to move table';
-      alert(msg);
+      toast.error(msg);
     } finally {
       setMoveTableLoading(false);
     }
@@ -283,7 +284,7 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
           : err instanceof Error
           ? err.message
           : 'Failed to delete';
-      alert(msg);
+      toast.error(msg);
     } finally {
       setDeleteLoading(false);
     }

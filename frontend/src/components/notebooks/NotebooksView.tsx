@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import type { Notebook, NotebookServerStatus } from '../../lib/types';
+import { ConfirmDialog } from '../common/ConfirmDialog';
+import type { ConfirmRequest } from '../common/ConfirmDialog';
 
 export interface NotebookTarget {
   name: string;
@@ -35,6 +37,7 @@ export const NotebooksView: React.FC<NotebooksViewProps> = ({ target, onClearTar
   const [error, setError] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [iframeReloadKey, setIframeReloadKey] = useState<number>(0);
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
 
   const fetchData = async () => {
     try {
@@ -200,20 +203,27 @@ if __name__ == "__main__":
     }
   };
 
-  const handleDeleteNotebook = async (name: string) => {
-    if (!window.confirm(`Are you sure you want to delete "${name}.py"?`)) return;
-    try {
-      setActionLoading(true);
-      await api.deleteNotebook(name);
-      if (activeNotebook === name) {
-        setActiveNotebook(null);
-      }
-      await fetchData();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Failed to delete notebook');
-    } finally {
-      setActionLoading(false);
-    }
+  const handleDeleteNotebook = (name: string) => {
+    setConfirmRequest({
+      title: `Delete "${name}.py"?`,
+      body: 'The notebook file is removed from git_repo/notebooks. Anything it produced in the lakehouse stays.',
+      confirmLabel: 'Delete notebook',
+      destructive: true,
+      onConfirm: async () => {
+        try {
+          setActionLoading(true);
+          await api.deleteNotebook(name);
+          if (activeNotebook === name) {
+            setActiveNotebook(null);
+          }
+          await fetchData();
+        } catch (e: unknown) {
+          setError(e instanceof Error ? e.message : 'Failed to delete notebook');
+        } finally {
+          setActionLoading(false);
+        }
+      },
+    });
   };
 
   return (
@@ -451,6 +461,8 @@ if __name__ == "__main__":
           </div>
         </div>
       )}
+
+      <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />
     </div>
   );
 };

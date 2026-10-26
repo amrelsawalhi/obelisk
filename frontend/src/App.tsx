@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import { Sidebar } from './components/layout/Sidebar';
 import { Header } from './components/layout/Header';
@@ -66,21 +66,51 @@ const RouteFallback: React.FC<{ label?: string }> = ({ label = 'Loading' }) => (
   </div>
 );
 
+/**
+ * Views that host an iframe: Superset and Marimo keep polling, animating and
+ * holding their own render tree behind `visibility: hidden`, so they are the most
+ * expensive thing to park - and the first thing to let go of when off screen.
+ */
+const FRAME_HOSTING_TABS: NavigationTab[] = ['dashboards', 'notebooks'];
+
+/** Parked views that hold unsaved work, so they are never evicted for a cheaper one. */
+const STATEFUL_WORKSPACES: NavigationTab[] = ['query', 'dbt', 'pipelines'];
+
+/** How many views may stay parked behind the active one. */
+const MAX_PARKED_VIEWS = 3;
+
 const AppLayout: React.FC = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const activeTab: NavigationTab = tabFromPath(location.pathname);
   const [isCommandOpen, setIsCommandOpen] = useState(false);
 
-  // A view mounts on first visit and then stays mounted, so switching tabs is a
+  // A view mounts on first visit and then stays parked, so switching tabs is a
   // visibility change instead of a teardown: unsaved SQL, open dbt tabs, the
-  // selected catalog object and dock sizes all survive. Only visited tabs are
-  // mounted, so the lazy route chunks still load on first use, not at startup.
-  const [mountedTabs, setMountedTabs] = useState<NavigationTab[]>([activeTab]);
+  // selected catalog object and dock sizes all survive. Parking is not free,
+  // though - a mounted studio is RAM the browser never gives back - so the set is
+  // bounded: the active view plus the three most recently visited others.
+  const [visitOrder, setVisitOrder] = useState<NavigationTab[]>([activeTab]);
 
   useEffect(() => {
-    setMountedTabs((prev) => (prev.includes(activeTab) ? prev : [...prev, activeTab]));
+    setVisitOrder((prev) =>
+      prev[prev.length - 1] === activeTab ? prev : [...prev.filter((tab) => tab !== activeTab), activeTab],
+    );
   }, [activeTab]);
+
+  const mountedTabs = useMemo(() => {
+    const candidates = visitOrder.filter(
+      (tab) => tab !== activeTab && !FRAME_HOSTING_TABS.includes(tab),
+    );
+    // Unsaved edits live in the three workspaces, so they claim the slots first;
+    // anything else parks in whatever is left, which is why a visited catalog
+    // keeps its selection instead of being dropped for an older studio.
+    const stateful = candidates.filter((tab) => STATEFUL_WORKSPACES.includes(tab)).slice(-MAX_PARKED_VIEWS);
+    const rest = candidates
+      .filter((tab) => !STATEFUL_WORKSPACES.includes(tab))
+      .slice(-Math.max(0, MAX_PARKED_VIEWS - stateful.length));
+    return [...rest, ...stateful, activeTab];
+  }, [visitOrder, activeTab]);
 
   // The old <Route path="*"> sent unknown URLs home; keep that behaviour now
   // that the router is not doing the rendering.
