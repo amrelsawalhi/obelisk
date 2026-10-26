@@ -97,6 +97,11 @@ class MarimoService:
             )
 
         if self.is_running():
+            # A server can outlive the backend that started it (restart, crash). Adopt it —
+            # but only when its command line is marimo, so ``stop()`` can end it safely and
+            # somebody else's listener is never claimed.
+            if self._process is None and not self._recorded_child_alive():
+                self._adopt_listener()
             return {
                 "status": "already_running",
                 "port": self.port,
@@ -197,6 +202,32 @@ class MarimoService:
             except Exception:
                 pass
             self._log_handle = None
+
+    def _adopt_listener(self) -> None:
+        """Records an already-running marimo left behind by a previous backend.
+
+        The PID comes from the listening socket, and it is only accepted when its command
+        line is marimo. Without this, a restart made the server unstoppable (``stop()`` has
+        no child) — which is what the old kill-by-port did, at the price of killing
+        anything else on the port.
+        """
+        try:
+            for conn in psutil.net_connections(kind="tcp"):
+                if not (conn.laddr and conn.laddr.port == self.port):
+                    continue
+                if conn.status != psutil.CONN_LISTEN or not conn.pid:
+                    continue
+                try:
+                    argv = [part.lower() for part in psutil.Process(conn.pid).cmdline()]
+                except Exception:
+                    return
+                names = {part.replace("\\", "/").rsplit("/", 1)[-1] for part in argv}
+                if names & {"marimo", "marimo.exe"} or "marimo" in argv:
+                    self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+                    self.pid_file.write_text(str(conn.pid), encoding="utf-8")
+                return
+        except Exception:
+            return
 
     def _read_pid_file(self) -> Optional[int]:
         try:

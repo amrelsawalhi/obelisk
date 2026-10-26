@@ -146,6 +146,34 @@ class TableWrapper:
         return f"<ObeliskTable: {self.full_identifier} [{status}] -> {self.full_identifier}>"
 
 
+class SourceNotQueryable(RuntimeError):
+    """Raised when an identifier names a source that cannot be queried live.
+
+    Only an *attached* source (PostgreSQL, through DuckDB's own scanner) can be read as
+    SQL. MySQL, MongoDB, Oracle and HTTP sources are pulled: their rows reach DuckDB only
+    after an ingest copies them into the lakehouse. Saying that here beats letting DuckDB
+    answer with ``schema "..." does not exist``.
+    """
+
+
+def _registered_connection(segment: str) -> Optional[tuple[str, str, str]]:
+    """``(name, source_type, driver)`` for a connection whose name matches ``segment``."""
+    db_path = settings.sqlite_db_path
+    if not Path(db_path).exists():
+        return None
+    try:
+        with sqlite3.connect(db_path, timeout=5.0) as con:
+            row = con.execute(
+                "SELECT name, source_type, driver FROM connections WHERE lower(name) = ?",
+                (segment.strip().lower(),),
+            ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return row[0], (row[1] or "").lower(), (row[2] or "").lower()
+
+
 def _resolve_external_identifier(identifier: str) -> str:
     """
     Checks registered connections in the SQLite vault to resolve an external table.
@@ -224,7 +252,46 @@ def table(identifier: str) -> TableWrapper:
                 full_identifier=entry.fqn,
             )
 
-    # 2. A bare name, or a folder/name whose folder was spelled with dots, is still
+    # 2. The identifier may name a source, which is a different question than a lakehouse
+    #    table: ``table("mongo_x.db.coll")`` says "read this source", and if that source has
+    #    no DuckDB scanner the answer is no. Checked before the bare-name shortcut, so a
+    #    unique lakehouse table with the same leaf can never be substituted for it.
+    parts = clean_id.split(".")
+    connection = _registered_connection(parts[0]) if len(parts) >= 2 else None
+    if connection:
+        conn_name, source_type, driver = connection
+        from app.core.sources import ATTACH, UnsupportedSource, infer_driver
+
+        try:
+            resolved_driver = driver or infer_driver(source_type)
+        except UnsupportedSource:
+            resolved_driver = ""
+        if resolved_driver != ATTACH:
+            same_name = next(
+                (entry for entry in result.tables if entry.name.lower() == parts[-1].lower()),
+                None,
+            )
+            hint = (
+                f" It is already in the lakehouse as {same_name.fqn} — read that instead."
+                if same_name
+                else f" Ingest '{parts[-1]}' first (Data Catalog → Ingest), then read the "
+                "lakehouse table it creates."
+            )
+            raise SourceNotQueryable(
+                f"'{clean_id}' names the {source_type or 'external'} source {conn_name!r}, which "
+                f"cannot be queried live: only attached databases (PostgreSQL) have a DuckDB "
+                f"scanner; {source_type or 'this'} rows are pulled.{hint}"
+            )
+        # Naming an attached source means *that* table, even if a lakehouse table happens to
+        # share the leaf name.
+        return TableWrapper(
+            name=parts[-1],
+            folder=".".join(parts[:-2]) if len(parts) >= 3 else "main",
+            file_path=None,
+            full_identifier=_resolve_external_identifier(clean_id),
+        )
+
+    # 3. A bare name, or a folder/name whose folder was spelled with dots, is still
     # unambiguous while only one table carries that name.
     leaf = wanted.rsplit("/", 1)[-1]
     matches = [entry for entry in result.tables if entry.name.lower() == leaf]
@@ -237,8 +304,7 @@ def table(identifier: str) -> TableWrapper:
             full_identifier=entry.fqn,
         )
 
-    # 3. Not a warehouse table: it may be an attached database's.
-    parts = clean_id.split(".")
+    # 4. Not a warehouse table and not a known source: let the Postgres resolver try.
     resolved = _resolve_external_identifier(clean_id)
     return TableWrapper(
         name=parts[-1],
