@@ -45,6 +45,8 @@ class MarimoService:
         # buffer fills up, which used to freeze the notebook server.
         self.log_path = Path(__file__).resolve().parents[3] / "data" / "logs" / "marimo.log"
         self._log_handle: Optional[Any] = None
+        # Our own child only: stop() must never terminate a process it did not start.
+        self.pid_file = Path(__file__).resolve().parents[3] / "data" / "marimo.pid"
 
     @property
     def url(self) -> str:
@@ -83,9 +85,16 @@ class MarimoService:
         """
         Starts the headless Marimo server in directory mode.
         Safe against duplicate launches and port collisions.
+
+        The port is fixed by configuration. ``start(port=8000)`` used to be accepted and
+        then remembered, so the next ``stop()`` terminated whatever listened on 8000 —
+        including the app itself. A caller that wants another port changes the setting.
         """
-        if port:
-            self.port = port
+        if port and int(port) != self.port:
+            raise ValueError(
+                f"Marimo is configured to run on port {self.port}; refusing to start it "
+                f"on {port}. Change the configured port instead of passing a different one."
+            )
 
         if self.is_running():
             return {
@@ -131,6 +140,13 @@ class MarimoService:
             stderr=subprocess.STDOUT,
             cwd=str(self.notebooks_dir),
         )
+        # Record the child so a restarted backend can still stop *this* process — and
+        # nothing else. The PID alone is not enough; ``stop`` re-checks the command line.
+        try:
+            self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pid_file.write_text(str(self._process.pid), encoding="utf-8")
+        except Exception:
+            pass
         self._started_at = time.time()
         self._status_cache = None
 
@@ -182,25 +198,58 @@ class MarimoService:
                 pass
             self._log_handle = None
 
+    def _read_pid_file(self) -> Optional[int]:
+        try:
+            return int(self.pid_file.read_text(encoding="utf-8").strip())
+        except Exception:
+            return None
+
+    def _clear_pid_file(self) -> None:
+        try:
+            self.pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _recorded_child_alive(self) -> bool:
+        """True only when the recorded PID is the marimo child we launched.
+
+        ``marimo`` has to be an argument of its own (``-m marimo`` or the launcher), not a
+        substring of a path: a directory that merely contains the word — this repository's
+        own tests do — must not make a stranger look like ours. A recycled PID is the
+        failure this replaces, so the check errs towards "not ours".
+        """
+        pid = self._read_pid_file()
+        if not pid:
+            return False
+        try:
+            argv = [part.lower() for part in psutil.Process(pid).cmdline()]
+        except Exception:
+            return False
+        for part in argv:
+            name = part.replace("\\", "/").rsplit("/", 1)[-1]
+            if name in ("marimo", "marimo.exe") or part == "marimo":
+                return True
+        return False
+
     def stop(self) -> Dict[str, Any]:
         """
-        Cleanly terminates the Marimo process tree on Windows and Linux,
-        guaranteeing zero orphaned processes holding the port.
+        Terminates the Marimo process tree this service started.
+
+        Only our own child is touched. The previous implementation looked the PID up *by
+        port* and killed whatever it found, so ``start(port=8000)`` followed by ``stop()``
+        took down the app — or any other program listening there. A PID recorded at launch
+        is re-verified against the child's command line, so a stale file after a restart
+        cannot target the wrong process either.
         """
-        if self._process is None and not self.is_running():
+        if self._process is None and not self._recorded_child_alive():
+            self._clear_pid_file()
             self._close_log_handle()
             return {"status": "not_running"}
 
-        pid = self._process.pid if self._process else None
-
-        if pid is None:
-            try:
-                for conn in psutil.net_connections(kind="tcp"):
-                    if conn.laddr and conn.laddr.port == self.port and conn.status == psutil.CONN_LISTEN:
-                        pid = conn.pid
-                        break
-            except Exception:
-                pass
+        if self._process is not None:
+            pid = self._process.pid
+        else:
+            pid = self._read_pid_file()
 
         if pid:
             try:
@@ -228,6 +277,7 @@ class MarimoService:
         self._process = None
         self._started_at = None
         self._status_cache = None
+        self._clear_pid_file()
         self._close_log_handle()
         return {"status": "stopped", "previous_pid": pid}
 

@@ -67,6 +67,9 @@ def start_server(req: Optional[StartServerRequest] = None):
     port = req.port if req else None
     try:
         return marimo_service.start(port=port)
+    except ValueError as e:
+        # A port other than the configured one is a bad request, not a server fault.
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start Marimo server: {str(e)}")
 
@@ -85,5 +88,7 @@ def restart_server(req: Optional[StartServerRequest] = None):
         marimo_service.stop()
         time.sleep(0.5)
         return marimo_service.start(port=port)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to restart Marimo server: {str(e)}")
