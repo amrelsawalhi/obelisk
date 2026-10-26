@@ -18,6 +18,8 @@ import {
   Table2,
   Plug,
   Loader2,
+  Home,
+  BarChart3,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { CatalogNode, CatalogTable, Connection, DbtTreeNode, Notebook } from '../../lib/types';
@@ -59,15 +61,17 @@ const KIND_HEADERS: Record<CommandItemKind, string> = {
 };
 
 const NAV_ACTIONS: { tab: NavigationTab; label: string; category: string; icon: LucideIcon }[] = [
-  { tab: 'catalog', label: 'Explore Lakehouse Catalog & Tables', category: 'Data Catalog', icon: Database },
-  { tab: 'query', label: 'Open Query Studio & Execute SQL in DuckDB', category: 'Query Studio', icon: Terminal },
-  { tab: 'dbt', label: 'Open dbt Studio (Transformations, Compile & Lineage)', category: 'dbt Studio', icon: Boxes },
-  { tab: 'notebooks', label: 'Launch Reactive Marimo Notebook Workspace', category: 'Notebooks', icon: BookOpen },
-  { tab: 'pipelines', label: 'Trigger End-to-End Medallion dbt Pipeline', category: 'Pipelines', icon: GitFork },
-  { tab: 'files', label: 'Open git_repo File Manager & Code Studio', category: 'Files', icon: FolderCode },
-  { tab: 'terminal', label: 'Launch Developer Web Terminal & Shell', category: 'Terminal', icon: SquareTerminal },
-  { tab: 'services', label: 'Provision Localhost Containers & Connect Services', category: 'Service Catalog', icon: Server },
-  { tab: 'settings', label: 'Manage Environment Variables, Secrets & Vault', category: 'Settings', icon: Settings },
+  { tab: 'home', label: 'Go to Workspace Overview', category: 'Navigation', icon: Home },
+  { tab: 'catalog', label: 'Open Data Catalog', category: 'Data Catalog', icon: Database },
+  { tab: 'query', label: 'Open Query Studio', category: 'Query Studio', icon: Terminal },
+  { tab: 'notebooks', label: 'Open Notebooks Workspace', category: 'Notebooks', icon: BookOpen },
+  { tab: 'dashboards', label: 'Open Dashboards & BI', category: 'Dashboards', icon: BarChart3 },
+  { tab: 'dbt', label: 'Open dbt Studio', category: 'dbt Studio', icon: Boxes },
+  { tab: 'pipelines', label: 'Open Pipelines Orchestrator', category: 'Pipelines', icon: GitFork },
+  { tab: 'services', label: 'Open Service Catalog', category: 'Service Catalog', icon: Server },
+  { tab: 'settings', label: 'Open Platform Settings & Vault', category: 'Settings', icon: Settings },
+  { tab: 'files', label: 'Open Repository File Manager', category: 'Files', icon: FolderCode },
+  { tab: 'terminal', label: 'Open Developer Terminal', category: 'Terminal', icon: SquareTerminal },
 ];
 
 function collectSqlFiles(node: DbtTreeNode | null | undefined, acc: DbtTreeNode[] = []): DbtTreeNode[] {
@@ -78,7 +82,7 @@ function collectSqlFiles(node: DbtTreeNode | null | undefined, acc: DbtTreeNode[
 }
 
 function makeTableItem(node: CatalogNode, table: CatalogTable, fqn: string, navigate: NavigateFunction): CommandItem {
-  const sql = `-- Query Table\nSELECT * FROM ${fqn} LIMIT 50;\n`;
+  const sql = `-- Obelisk Query Studio\nSELECT * FROM ${fqn} LIMIT 50;\n`;
   const sizeLabel = tableSizeLabel(table);
   const rows = sizeLabel ? ` • ${sizeLabel}` : '';
   return {

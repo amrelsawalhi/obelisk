@@ -29,8 +29,8 @@ import { DataGrid } from './DataGrid';
 import { SchemaExplorerPanel } from './SchemaExplorerPanel';
 import { formatSql } from '../../lib/sqlFormatter';
 
-const FALLBACK_DEFAULT_SQL = `-- Obelisk Query Studio (DuckDB In-Process Analytical Engine)
--- Fast federation across Bronze Parquet and connected PostgreSQL sources
+const FALLBACK_DEFAULT_SQL = `-- Obelisk Query Studio
+-- Enter SQL queries to explore tables and analyze lakehouse assets
 
 SELECT 
     'Orders & Revenue' AS analysis_type,
@@ -329,7 +329,7 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
         const qualified = [folderPath.replace(/\//g, '.'), firstTable.name]
           .filter(Boolean)
           .join('.');
-        const initialQuery = `-- Obelisk Query Studio (DuckDB In-Process Analytical Engine)\nSELECT * FROM lakehouse.${qualified} LIMIT 50;\n`;
+        const initialQuery = `-- Obelisk Query Studio\nSELECT * FROM lakehouse.${qualified} LIMIT 50;\n`;
         setTabs((prev) =>
           prev.map((t, idx) =>
             idx === 0 && !t.result && t.sql === FALLBACK_DEFAULT_SQL

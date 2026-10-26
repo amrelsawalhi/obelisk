@@ -103,7 +103,7 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
           {onOpenInQuery && (
             <button
               onClick={() => {
-                const query = `-- Obelisk Query Studio (DuckDB Analytical Engine)\nSELECT * FROM ${canonicalFqn} LIMIT 50;\n`;
+                const query = `-- Obelisk Query Studio\nSELECT * FROM ${canonicalFqn} LIMIT 50;\n`;
                 onOpenInQuery(query);
               }}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold shadow-2xs transition-colors ${
