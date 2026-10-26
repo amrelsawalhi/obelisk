@@ -10,7 +10,7 @@ import {
   BookOpen,
   Terminal,
   Plus,
-  Sparkles,
+  Activity,
 } from 'lucide-react';
 import { useTelemetry } from '../../lib/useTelemetry';
 import { usePolling } from '../../lib/viewActivity';
@@ -359,17 +359,18 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
           </div>
         </div>
 
-        {/* Engine & Hardware Telemetry (Clean, compact 1/3 card) */}
+        {/* Host Compute & System Resources Card */}
         <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex flex-col justify-between space-y-4">
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
             <div className="flex items-center gap-2">
-              <Sparkles className="w-4 h-4 text-sky-600" />
+              <Activity className="w-4 h-4 text-sky-600" />
               <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                DuckDB Lakehouse Core
+                Compute & System Resources
               </h3>
             </div>
-            <span className="text-[11px] font-mono text-emerald-700 font-semibold bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
-              Safe Max: {telemetry ? `${telemetry.max_safe_allocation_gb} GB` : '85%'}
+            <span className="text-[11px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200/80 px-2 py-0.5 rounded-full flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              Healthy
             </span>
           </div>
 
@@ -398,7 +399,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                   />
                 </div>
                 <p className="text-[10px] text-slate-400 mt-1">
-                  Automatic out-of-core spilling activated above safe threshold
+                  Safe memory allocation ceiling: {telemetry.max_safe_allocation_gb} GB
                 </p>
               </div>
 
@@ -428,7 +429,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             </div>
           ) : (
             <div className="py-8 text-center text-xs text-slate-400">
-              Loading engine telemetry...
+              Loading system telemetry...
             </div>
           )}
 
@@ -436,7 +437,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             onClick={() => onNavigate('settings')}
             className="w-full text-center text-xs font-semibold text-sky-600 hover:text-sky-700 pt-2 border-t border-slate-100 flex items-center justify-center gap-1 transition-colors"
           >
-            <span>View Hardware Sizing in Settings</span>
+            <span>View System Diagnostics & Sizing</span>
             <ArrowUpRight className="w-3.5 h-3.5" />
           </button>
         </div>

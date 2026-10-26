@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Search, HardDrive, Cpu, Activity, ChevronDown, Sparkles, ExternalLink } from 'lucide-react';
+import { Search, HardDrive, Cpu, Activity, ChevronDown, ExternalLink } from 'lucide-react';
 import { useTelemetry } from '../../lib/useTelemetry';
 import { MOD_KEY } from '../../lib/platform';
 import type { NavigationTab } from './Sidebar';
@@ -39,7 +39,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
     },
     query: {
       title: 'Query Studio',
-      subtitle: 'High-performance analytical SQL powered by DuckDB',
+      subtitle: 'High-performance analytical SQL workspace',
     },
     dbt: {
       title: 'dbt Studio',
@@ -143,8 +143,8 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
               {/* Popover Header */}
               <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
                 <div className="flex items-center gap-1.5">
-                  <Sparkles className="w-3.5 h-3.5 text-sky-600" />
-                  <span className="font-bold text-slate-800">DuckDB Core Engine</span>
+                  <Activity className="w-3.5 h-3.5 text-sky-600" />
+                  <span className="font-bold text-slate-800">Compute & Engine Telemetry</span>
                 </div>
                 <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded-full">
                   {isLive ? 'Live 2s' : 'Polling'}
