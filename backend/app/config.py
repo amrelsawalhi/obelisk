@@ -19,6 +19,13 @@ LOCAL_STORAGE_SCHEMES = frozenset({"", "file"})
 # bind mount at that path still wins.
 CONTAINER_LAKEHOUSE_PATH = "/data/lakehouse"
 
+# Shipped defaults, named once so "is this still the default?" is a comparison rather than
+# a string literal repeated in the guard, the login route and the docs.
+DEFAULT_MASTER_KEY = "dGhpcy1pcy1hLXNhbXBsZS0zMi1ieXRlLWtleS0xMjM0NTY="
+DEFAULT_ADMIN_USER = "admin"
+DEFAULT_ADMIN_PASSWORD = "obelisk2026"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -35,11 +42,15 @@ class Settings(BaseSettings):
     
     # Master encryption key for credentials vault (Fernet key)
     OBELISK_MASTER_KEY: str = Field(
-        default_factory=lambda: os.getenv(
-            "OBELISK_MASTER_KEY", 
-            "dGhpcy1pcy1hLXNhbXBsZS0zMi1ieXRlLWtleS0xMjM0NTY=" # fallback valid 32-byte b64 key
-        )
+        default_factory=lambda: os.getenv("OBELISK_MASTER_KEY", DEFAULT_MASTER_KEY)
     )
+
+    # Admin credentials for the session login. The field names match the environment
+    # variable names on purpose: `SettingsConfigDict(env_file=".env")` then populates
+    # them, so a value set only in `.env` is actually used. Reading `os.environ`
+    # directly meant `.env` was ignored and the shipped default silently won.
+    OBELISK_ADMIN_USER: str = DEFAULT_ADMIN_USER
+    OBELISK_ADMIN_PASSWORD: str = DEFAULT_ADMIN_PASSWORD
 
     # ---------------------------------------------------------------- auth
     # Enforcement is off until a real user store exists. The plumbing already asks

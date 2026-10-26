@@ -164,23 +164,54 @@ def test_the_guard_is_inert_while_auth_is_off():
 
 
 def test_auth_refuses_to_start_with_the_shipped_password():
-    import os
-
+    """Both shipped secrets are refused; setting one is not enough."""
     from app.core.security import assert_credentials_are_not_shipped_defaults
 
     previous_auth = settings.AUTH_ENABLED
-    previous_password = os.environ.pop("OBELISK_ADMIN_PASSWORD", None)
+    previous_password = settings.OBELISK_ADMIN_PASSWORD
+    previous_key = settings.OBELISK_MASTER_KEY
     settings.AUTH_ENABLED = True
     try:
-        # No override in the environment: turning enforcement on now would publish
-        # the default credentials in the same breath.
         with pytest.raises(RuntimeError):
             assert_credentials_are_not_shipped_defaults()
 
-        os.environ["OBELISK_ADMIN_PASSWORD"] = "a-real-password"
+        # A real password is not enough while the token-signing key is published: a known
+        # key lets anyone mint a session.
+        settings.OBELISK_ADMIN_PASSWORD = "a-real-password"
+        with pytest.raises(RuntimeError):
+            assert_credentials_are_not_shipped_defaults()
+
+        settings.OBELISK_MASTER_KEY = "c2Vjb25kLXZhbGlkLTMyLWJ5dGUta2V5LWZvci1vYmVsaXNr"
         assert_credentials_are_not_shipped_defaults()  # no raise
     finally:
         settings.AUTH_ENABLED = previous_auth
-        os.environ.pop("OBELISK_ADMIN_PASSWORD", None)
-        if previous_password is not None:
-            os.environ["OBELISK_ADMIN_PASSWORD"] = previous_password
+        settings.OBELISK_ADMIN_PASSWORD = previous_password
+        settings.OBELISK_MASTER_KEY = previous_key
+
+
+def test_the_login_reads_credentials_from_settings():
+    """A password that only exists in `.env` must still authenticate.
+
+    `os.environ` cannot see `.env` — Pydantic loads that file into *fields* — so the
+    login route reads settings. This pins the seam the bug lived in.
+    """
+    import asyncio
+
+    from app.api.routes_auth import LoginRequest, login
+
+    class _Response:
+        def set_cookie(self, *args, **kwargs):
+            pass
+
+    previous_user = settings.OBELISK_ADMIN_USER
+    previous_password = settings.OBELISK_ADMIN_PASSWORD
+    settings.OBELISK_ADMIN_USER = "ops"
+    settings.OBELISK_ADMIN_PASSWORD = "only-in-dotenv"
+    try:
+        result = asyncio.run(
+            login(LoginRequest(username="ops", password="only-in-dotenv"), _Response())
+        )
+        assert result.user.username == "ops"
+    finally:
+        settings.OBELISK_ADMIN_USER = previous_user
+        settings.OBELISK_ADMIN_PASSWORD = previous_password

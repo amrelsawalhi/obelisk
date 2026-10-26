@@ -1,7 +1,8 @@
 import pytest
 from httpx import AsyncClient, ASGITransport
 from app.main import app
-from app.api.routes_auth import COOKIE_NAME, ADMIN_USERNAME, ADMIN_PASSWORD
+from app.api.routes_auth import COOKIE_NAME
+from app.config import settings
 
 
 @pytest.mark.asyncio
@@ -10,13 +11,13 @@ async def test_auth_login_success_and_cookie():
         # Valid login
         res = await client.post(
             "/api/auth/login",
-            json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+            json={"username": settings.OBELISK_ADMIN_USER, "password": settings.OBELISK_ADMIN_PASSWORD},
         )
         assert res.status_code == 200
         data = res.json()
         assert "access_token" in data
         assert data["user"]["authenticated"] is True
-        assert data["user"]["username"] == ADMIN_USERNAME
+        assert data["user"]["username"] == settings.OBELISK_ADMIN_USER
 
         # Verify HttpOnly session cookie was set
         assert COOKIE_NAME in res.cookies
@@ -46,7 +47,7 @@ async def test_auth_me_session_verification():
         # 2. Login to get cookie
         login_res = await client.post(
             "/api/auth/login",
-            json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+            json={"username": settings.OBELISK_ADMIN_USER, "password": settings.OBELISK_ADMIN_PASSWORD},
         )
         token = login_res.json()["access_token"]
 
@@ -55,7 +56,7 @@ async def test_auth_me_session_verification():
         assert res_auth.status_code == 200
         data = res_auth.json()
         assert data["authenticated"] is True
-        assert data["username"] == ADMIN_USERNAME
+        assert data["username"] == settings.OBELISK_ADMIN_USER
 
         # 4. Authenticated check with Bearer header
         res_bearer = await client.get(

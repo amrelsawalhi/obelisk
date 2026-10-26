@@ -17,8 +17,9 @@ from app.core.security import (  # noqa: F401
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 
-ADMIN_USERNAME = os.environ.get("OBELISK_ADMIN_USER", "admin")
-ADMIN_PASSWORD = os.environ.get("OBELISK_ADMIN_PASSWORD", "obelisk2026")
+# Credentials are read from settings per request, so `.env` counts and a changed value
+# takes effect without a reimport. Module-level constants used to freeze `os.environ` at
+# import time, which silently ignored `.env` entirely.
 
 
 # Request / Response Schemas
@@ -61,7 +62,10 @@ async def login(req: LoginRequest, response: Response):
     """
     Authenticates user and issues signed JWT in HttpOnly cookie and JSON body.
     """
-    if req.username != ADMIN_USERNAME or req.password != ADMIN_PASSWORD:
+    if (
+        req.username != settings.OBELISK_ADMIN_USER
+        or req.password != settings.OBELISK_ADMIN_PASSWORD
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials. Access denied."

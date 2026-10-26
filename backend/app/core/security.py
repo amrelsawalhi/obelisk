@@ -32,6 +32,7 @@ from fastapi import HTTPException, WebSocket, status
 from starlette.requests import HTTPConnection
 
 from app.config import settings
+from app import config as config_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -156,25 +157,31 @@ def require_principal(connection: HTTPConnection) -> Dict[str, Any]:
         ) from exc
 
 
-DEFAULT_ADMIN_PASSWORD = "obelisk2026"
+DEFAULT_ADMIN_PASSWORD = config_defaults.DEFAULT_ADMIN_PASSWORD
 
 
 def assert_credentials_are_not_shipped_defaults() -> None:
-    """Refuse to enforce auth while the admin password is still the shipped one.
+    """Refuse to enforce auth while the shipped credentials are still in place.
 
-    Turning enforcement on with a published default is a locked front door with the
-    key taped to it. Fail at startup instead of serving.
+    Turning enforcement on with a published default is a locked front door with the key
+    taped to it. The master key matters as much as the password: it signs session tokens,
+    so a known key lets anyone mint one. Both are read from ``settings``, which means a
+    value set in ``.env`` counts — reading ``os.environ`` directly ignored it.
     """
     if not auth_enabled():
         return
-    import os
 
-    password = os.environ.get("OBELISK_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
-    if password == DEFAULT_ADMIN_PASSWORD:
+    problems: list[str] = []
+    if settings.OBELISK_ADMIN_PASSWORD == config_defaults.DEFAULT_ADMIN_PASSWORD:
+        problems.append("OBELISK_ADMIN_PASSWORD is still the shipped default")
+    if settings.OBELISK_MASTER_KEY == config_defaults.DEFAULT_MASTER_KEY:
+        problems.append("OBELISK_MASTER_KEY is still the shipped sample key")
+
+    if problems:
         raise RuntimeError(
-            "AUTH_ENABLED is on but OBELISK_ADMIN_PASSWORD is still the shipped "
-            "default. Set a real password (and OBELISK_ADMIN_USER) before exposing "
-            "this instance."
+            "AUTH_ENABLED is on but " + " and ".join(problems) + ". Set real values "
+            "(OBELISK_ADMIN_USER, OBELISK_ADMIN_PASSWORD, OBELISK_MASTER_KEY) in .env or "
+            "the environment before exposing this instance."
         )
 
 
