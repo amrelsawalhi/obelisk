@@ -187,7 +187,11 @@ const AppLayout: React.FC = () => {
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Global Header */}
-        <Header activeTab={activeTab} onOpenCommand={() => setIsCommandOpen(true)} />
+        <Header
+          activeTab={activeTab}
+          onOpenCommand={() => setIsCommandOpen(true)}
+          onNavigate={navigateToTab}
+        />
 
         {/* Mounted views. Inactive ones stay laid out but invisible: `visibility`
             keeps their real size, so Monaco and xterm come back without a
