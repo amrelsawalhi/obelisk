@@ -1,11 +1,16 @@
 import re
 import asyncio
+import uuid
+from pathlib import Path
 from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
+from app.config import settings
 from app.database import get_db
 from app.models.query import QueryHistory, OpenQueryTab
 from app.models.connection import Connection
@@ -51,6 +56,7 @@ class QueryExecuteResponse(BaseModel):
     command_tag: Optional[str] = None
     target_engine: Optional[str] = "duckdb"
     target_name: Optional[str] = "DuckDB"
+    truncated: bool = False
 
 class QueryExportRequest(BaseModel):
     sql: str = Field(..., description="SQL statement to export")
@@ -329,12 +335,16 @@ async def execute_sql(
     if attachments is None:
         attachments = await attachable_attachments(db, sql=req.sql)
 
+    # Holds the live DuckDB connection so a timeout can interrupt the C++ work instead of
+    # leaving the background thread burning CPU and RAM after the response is gone.
+    live_conn_holder: list = []
     try:
         res = await asyncio.wait_for(
             asyncio.to_thread(
                 duckdb_engine.execute_query,
                 sql=req.sql,
                 attachments=attachments,
+                on_connection=live_conn_holder.append,
             ),
             timeout=float(req.timeout_seconds),
         )
@@ -353,8 +363,14 @@ async def execute_sql(
             command_tag=None,
             target_engine="duckdb",
             target_name="DuckDB",
+            truncated=bool(res.get("truncated", False)),
         )
     except asyncio.TimeoutError:
+        if live_conn_holder:
+            try:
+                live_conn_holder[0].interrupt()
+            except Exception:
+                pass
         history_entry.status = "timeout"
         history_entry.error_message = f"Query timed out after {req.timeout_seconds} seconds"
         await db.commit()
@@ -371,13 +387,21 @@ async def execute_sql(
             detail=f"Query execution failed: {str(e)}",
         )
 
+async def _delete_scratch_file(path: Path) -> None:
+    """Removes an export scratch file once its response has been sent."""
+    await asyncio.to_thread(path.unlink, missing_ok=True)
+
+
 @router.post("/export")
 async def export_sql_results(
     req: QueryExportRequest,
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Executes a query and streams the binary output as Snappy Parquet or CSV.
+    Executes a query and streams the full result as Snappy Parquet or CSV.
+
+    The result is written by DuckDB straight to a scratch file and served from disk, so a
+    multi-GB export is never buffered in Python memory.
     """
     fmt = req.format.lower()
     if fmt not in ["parquet", "csv"]:
@@ -390,14 +414,17 @@ async def export_sql_results(
     if attachments is None:
         attachments = await attachable_attachments(db, sql=req.sql)
 
+    temp_file = settings.duckdb_temp_path / f"export_{uuid.uuid4().hex}.{fmt}"
     try:
-        data_bytes = await asyncio.to_thread(
-            duckdb_engine.export_query,
+        await asyncio.to_thread(
+            duckdb_engine.export_query_to_file,
             sql=req.sql,
+            dest_path=temp_file,
             output_format=fmt,
             attachments=attachments,
         )
     except Exception as e:
+        await asyncio.to_thread(temp_file.unlink, missing_ok=True)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Export failed: {str(e)}",
@@ -407,10 +434,11 @@ async def export_sql_results(
     media_type = "application/octet-stream" if fmt == "parquet" else "text/csv"
     filename = f"{base_name}.{fmt}"
 
-    return Response(
-        content=data_bytes,
+    return FileResponse(
+        path=temp_file,
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        filename=filename,
+        background=BackgroundTask(_delete_scratch_file, temp_file),
     )
 
 @router.get("/history")
@@ -434,6 +462,35 @@ async def get_query_history(db: AsyncSession = Depends(get_db)):
     ]
 
 
+# ------------------------------------------------------------- tab scoping
+# Query Studio tabs are per window, not per server: two windows (or two team
+# members) both call their tabs "tab-1", and a shared primary key meant the second
+# save silently replaced the first window's SQL. The stored key is therefore
+# "<client>:<tab>"; the API keeps speaking unprefixed ids so nothing above this
+# layer changes, and a client that sends no header lands in "default" exactly as
+# every client did before the split.
+_DEFAULT_CLIENT_ID = "default"
+_CLIENT_ID_MAX_LENGTH = 64
+
+
+def _client_scope(raw: Optional[str]) -> str:
+    """The client id a tab request belongs to, safe to use as a key prefix."""
+    cleaned = re.sub(r"[^A-Za-z0-9_.\-]", "", (raw or "").strip())[:_CLIENT_ID_MAX_LENGTH]
+    return cleaned or _DEFAULT_CLIENT_ID
+
+
+def _scoped_tab_id(client_id: str, tab_id: str) -> str:
+    """Stored primary key for a client's tab id, idempotent if already prefixed."""
+    prefix = f"{client_id}:"
+    return tab_id if tab_id.startswith(prefix) else f"{prefix}{tab_id}"
+
+
+def _tab_id_for_client(client_id: str, stored_id: str) -> str:
+    """The id the client knows a tab by, with this client's prefix removed."""
+    prefix = f"{client_id}:"
+    return stored_id[len(prefix):] if stored_id.startswith(prefix) else stored_id
+
+
 class OpenQueryTabResponse(BaseModel):
     id: str
     title: str
@@ -454,14 +511,22 @@ class SaveQueryTabRequest(BaseModel):
 
 
 @router.get("/tabs", response_model=List[OpenQueryTabResponse])
-async def list_open_tabs(db: AsyncSession = Depends(get_db)):
-    """Returns all open query tabs ordered by tab_order."""
-    stmt = select(OpenQueryTab).order_by(OpenQueryTab.tab_order.asc(), OpenQueryTab.created_at.asc())
+async def list_open_tabs(
+    x_obelisk_client_id: Optional[str] = Header(default=None, alias="X-Obelisk-Client-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns this client's open query tabs ordered by tab_order."""
+    client_id = _client_scope(x_obelisk_client_id)
+    stmt = (
+        select(OpenQueryTab)
+        .where(OpenQueryTab.client_id == client_id)
+        .order_by(OpenQueryTab.tab_order.asc(), OpenQueryTab.created_at.asc())
+    )
     result = await db.execute(stmt)
     tabs = result.scalars().all()
     return [
         OpenQueryTabResponse(
-            id=t.id,
+            id=_tab_id_for_client(client_id, t.id),
             title=t.title,
             sql=t.sql_text,
             target_id=t.target_id,
@@ -474,9 +539,15 @@ async def list_open_tabs(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/tabs", response_model=OpenQueryTabResponse)
-async def save_open_tab(req: SaveQueryTabRequest, db: AsyncSession = Depends(get_db)):
-    """Upserts an open query tab to the SQLite brain."""
-    stmt = select(OpenQueryTab).where(OpenQueryTab.id == req.id)
+async def save_open_tab(
+    req: SaveQueryTabRequest,
+    x_obelisk_client_id: Optional[str] = Header(default=None, alias="X-Obelisk-Client-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upserts an open query tab to the SQLite brain, scoped to the calling client."""
+    client_id = _client_scope(x_obelisk_client_id)
+    stored_id = _scoped_tab_id(client_id, req.id)
+    stmt = select(OpenQueryTab).where(OpenQueryTab.id == stored_id)
     result = await db.execute(stmt)
     tab = result.scalar_one_or_none()
     if tab:
@@ -488,7 +559,8 @@ async def save_open_tab(req: SaveQueryTabRequest, db: AsyncSession = Depends(get
             tab.tab_order = req.tab_order
     else:
         tab = OpenQueryTab(
-            id=req.id,
+            id=stored_id,
+            client_id=client_id,
             title=req.title,
             sql_text=req.sql,
             target_id=req.target_id or "duckdb",
@@ -499,7 +571,7 @@ async def save_open_tab(req: SaveQueryTabRequest, db: AsyncSession = Depends(get
     await db.commit()
     await db.refresh(tab)
     return OpenQueryTabResponse(
-        id=tab.id,
+        id=_tab_id_for_client(client_id, tab.id),
         title=tab.title,
         sql=tab.sql_text,
         target_id=tab.target_id,
@@ -510,9 +582,14 @@ async def save_open_tab(req: SaveQueryTabRequest, db: AsyncSession = Depends(get
 
 
 @router.delete("/tabs/{tab_id}")
-async def delete_open_tab(tab_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_open_tab(
+    tab_id: str,
+    x_obelisk_client_id: Optional[str] = Header(default=None, alias="X-Obelisk-Client-Id"),
+    db: AsyncSession = Depends(get_db),
+):
     """Removes a closed query tab from the SQLite brain to prevent bloat."""
-    stmt = select(OpenQueryTab).where(OpenQueryTab.id == tab_id)
+    client_id = _client_scope(x_obelisk_client_id)
+    stmt = select(OpenQueryTab).where(OpenQueryTab.id == _scoped_tab_id(client_id, tab_id))
     result = await db.execute(stmt)
     tab = result.scalar_one_or_none()
     if tab:

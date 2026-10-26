@@ -27,7 +27,7 @@ def sample_bronze_dataset():
         "customer": ["Alice", "Bob", "Charlie"],
         "amount": [150.50, 89.20, 240.00],
     })
-    obelisk.save(table_data, f"bronze.{table_name}", sync_postgres=False)
+    obelisk.save(table_data, f"bronze.{table_name}")
 
     yield table_name, None
 
@@ -85,7 +85,7 @@ async def test_obelisk_save_writes_a_file_the_catalog_can_see():
         "total_revenue": [12500.0, 9400.0, 18300.0, 7200.0],
     })
 
-    res = obelisk.save(df, f"gold.{gold_stem}", sync_postgres=False)
+    res = obelisk.save(df, f"gold.{gold_stem}")
     assert res["status"] == "success"
     assert res["folder"] == "gold"
     assert res["fqn"] == f"lakehouse.gold.{gold_stem}"

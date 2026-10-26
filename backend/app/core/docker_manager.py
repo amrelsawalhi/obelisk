@@ -353,6 +353,31 @@ class DockerManager:
         if last_err is not None:
             raise RuntimeError(f"Image build failed for {dockerfile}: {last_err}")
 
+    def _sibling_probe_target(
+        self, service_name: str, container_port: Optional[int]
+    ) -> Optional[str]:
+        """Container hostname on ``obelisk_net``, when probing it can work.
+
+        Only useful from inside a container: ``127.0.0.1`` there is the backend
+        itself, and a sibling service answers on its container port under its
+        container name. From a host install the name does not resolve, so returning
+        None keeps the host probe path exactly as it was.
+        """
+        if container_port is None:
+            return None
+        if not (os.path.exists("/.dockerenv") or os.environ.get("OBELISK_IN_CONTAINER") == "1"):
+            return None
+        try:
+            container = self.get_service_container(service_name)
+            if container is None or container.status != "running":
+                return None
+            networks = (container.attrs.get("NetworkSettings", {}) or {}).get("Networks", {}) or {}
+            if settings.OBELISK_NET not in networks:
+                return None
+        except Exception:
+            return None
+        return f"{self._get_container_name(service_name)}:{container_port}"
+
     def probe_readiness(
         self,
         service_name: str,
@@ -363,6 +388,11 @@ class DockerManager:
         """
         Runs the blueprint readiness probe and returns {"ready": bool, "detail": str}.
         A running container is NOT proof the service inside accepts work.
+
+        ``http`` and ``tcp`` probes try ``127.0.0.1`` first (correct when the backend
+        runs on the host, where the container publishes its port) and fall back to the
+        container name on ``obelisk_net`` (correct when the backend is itself a
+        container, where its own localhost has nothing on that port).
         """
         bp = get_blueprint(service_name)
         if bp is None or bp.readiness is None:
@@ -372,6 +402,11 @@ class DockerManager:
 
         probe = bp.readiness
         port = host_port or probe.host_port
+        container_port: Optional[int] = None
+        try:
+            container_port = int(str(bp.primary_container_port).split("/")[0])
+        except (TypeError, ValueError):
+            container_port = port
         try:
             if probe.kind == "pg_isready":
                 container = self.get_service_container(service_name)
@@ -384,13 +419,34 @@ class DockerManager:
 
             if probe.kind == "http":
                 import httpx
-                resp = httpx.get(f"http://127.0.0.1:{port}{probe.path}", timeout=3.0)
-                return {"ready": resp.status_code == probe.expected_status, "detail": f"HTTP {resp.status_code}"}
+                last_error: Optional[Exception] = None
+                for target in (f"127.0.0.1:{port}", self._sibling_probe_target(service_name, container_port)):
+                    if not target:
+                        continue
+                    try:
+                        resp = httpx.get(f"http://{target}{probe.path}", timeout=3.0)
+                    except Exception as e:
+                        last_error = e
+                        continue
+                    detail = f"HTTP {resp.status_code}"
+                    if not target.startswith("127.0.0.1"):
+                        detail += f" via {target.split(':')[0]}"
+                    return {"ready": resp.status_code == probe.expected_status, "detail": detail}
+                raise last_error or RuntimeError("no reachable probe target")
 
             if probe.kind == "tcp":
                 import socket
-                with socket.create_connection(("127.0.0.1", port), timeout=3.0):
-                    return {"ready": True, "detail": f"port {port} accepting connections"}
+                last_error = None
+                for target in (f"127.0.0.1:{port}", self._sibling_probe_target(service_name, container_port)):
+                    if not target:
+                        continue
+                    target_host, _, target_port = target.partition(":")
+                    try:
+                        with socket.create_connection((target_host, int(target_port)), timeout=3.0):
+                            return {"ready": True, "detail": f"port {target_port} accepting connections"}
+                    except Exception as e:
+                        last_error = e
+                raise last_error or RuntimeError("no reachable probe target")
         except Exception as e:
             return {"ready": False, "detail": str(e)}
 

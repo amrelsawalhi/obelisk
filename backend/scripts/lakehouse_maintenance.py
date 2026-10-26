@@ -2,9 +2,9 @@
 
 Two jobs, both safe to run by hand and meant to be scheduled:
 
-  maintain  merges small files, expires old snapshots, and (optionally) deletes the files
-            those snapshots left behind. Every step is reported and `--dry-run` says what
-            would change without changing it.
+  maintain  drops load tables no run is using, merges small files, expires old snapshots,
+            and (optionally) deletes the files those snapshots left behind. Every step is
+            reported and `--dry-run` says what would change without changing it.
   backup    copies the lakehouse folder (data *and* its catalog, which live together) and
             takes a consistent SQLite snapshot of the control plane.
 
@@ -23,12 +23,43 @@ if str(PROJECT_ROOT / "backend") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "backend"))
 
 from app.config import settings  # noqa: E402
-from app.core.catalog import SOURCE, lakehouse_connection  # noqa: E402
+from app.core.catalog import SOURCE, drop_load_tables, lakehouse_connection  # noqa: E402
+from app.core.storage import prune_empty_dirs  # noqa: E402
+
+
+def drop_orphaned_load_tables(conn, *, dry_run: bool = False) -> list[tuple[str, str]]:
+    """Drops every ``*__obelisk_load`` table the catalog still lists.
+
+    An ingest streams into that table beside its target and drops it when the run ends,
+    whichever way it ends, so a survivor is the remains of a run that was killed outright
+    (SIGKILL, an OOM kill, a lost machine). Its rows can never be swapped in or merged, and
+    until it goes it is bytes no scan reads and every backup copies. Dropping it before the
+    expire/cleanup steps also lets the Parquet it held be reclaimed by them.
+
+    Run this when no ingest is running: a live run's load table is invisible to a reader but
+    is exactly the table this would take away from under it. Returns what it dropped.
+    """
+    orphans = drop_load_tables(conn, dry_run=dry_run)
+    verb = "would drop" if dry_run else "dropped"
+    for schema, table in orphans:
+        print(f"  {verb} {schema}.{table}")
+    return orphans
 
 
 def _maintain(args: argparse.Namespace) -> int:
     conn = lakehouse_connection()
     try:
+        # 0. Load tables first: they are the only tables here that no run owns any more, and
+        #    dropping them before expiry means the files they held become reclaimable too.
+        if args.load_tables:
+            orphans = drop_orphaned_load_tables(conn, dry_run=args.dry_run)
+            print(
+                f"load_tables: {len(orphans)} orphaned load table(s) "
+                f"{'would be ' if args.dry_run else ''}dropped"
+            )
+        else:
+            print("load_tables: skipped (--no-load-tables)")
+
         # 1. Merge small files: this is what stops a table becoming thousands of fragments
         #    after a year of daily loads. Bounded, so one run cannot rewrite the lake.
         if args.merge:
@@ -63,6 +94,16 @@ def _maintain(args: argparse.Namespace) -> int:
         print(f"snapshots remaining: {remaining}")
     finally:
         conn.close()
+
+    # 5. Sweep the directories those drops and expiries emptied. DuckLake derives a table's
+    #    data directory from its schema and nothing removes it with the table, so a lake
+    #    that has dropped or renamed tables carries directories that hold no file and that
+    #    nothing in the catalog points at. An empty folder a user made is kept: it carries
+    #    a .gitkeep, which is how the API marks one.
+    pruned = prune_empty_dirs(settings.lakehouse_root_path, dry_run=args.dry_run)
+    print(
+        f"empty_directories: {pruned} {'would be ' if args.dry_run else ''}removed"
+    )
     return 0
 
 
@@ -101,9 +142,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    maintain = sub.add_parser("maintain", help="compact, expire snapshots, clean up files")
+    maintain = sub.add_parser("maintain", help="drop orphaned load tables, compact, expire, clean")
     maintain.add_argument("--keep-days", type=int, default=14, help="snapshots older than this expire")
     maintain.add_argument("--max-files", type=int, default=50, help="cap on files rewritten in one run")
+    maintain.add_argument(
+        "--load-tables",
+        action="store_true",
+        default=True,
+        help="drop load tables left by killed ingests (run this with no ingest running)",
+    )
+    maintain.add_argument("--no-load-tables", dest="load_tables", action="store_false")
     maintain.add_argument("--merge", action="store_true", default=True)
     maintain.add_argument("--no-merge", dest="merge", action="store_false")
     maintain.add_argument("--delete-files", action="store_true", help="also delete expired files")

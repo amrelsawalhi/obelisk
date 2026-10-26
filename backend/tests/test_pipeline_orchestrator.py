@@ -17,6 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
+import psutil
 import pytest
 from sqlalchemy import select
 
@@ -573,4 +574,138 @@ async def test_rerun_from_step_contains_only_the_subtree(demo_scripts):
         graph["steps"]["middle"],
         graph["steps"]["leaf"],
     }
+
+
+# --------------------------------------------------- killing the whole tree, not one pid
+
+
+@pytest.fixture
+def tree_script(tmp_path):
+    """A step script that spawns a grandchild and beats while it runs.
+
+    The grandchild is the work ``Popen.kill()`` used to leave behind: killing the
+    script alone let the grandchild keep writing after the run said "cancelled".
+    """
+    name = f"zz_test_tree_{uuid.uuid4().hex[:6]}"
+    beat = tmp_path / "beat.txt"
+    pid_file = tmp_path / "grandchild.pid"
+    grandchild_code = (
+        "import time\n"
+        "from pathlib import Path\n"
+        f"beat = Path({str(beat)!r})\n"
+        "for _ in range(1200):\n"
+        "    with beat.open('a', encoding='utf-8') as fh:\n"
+        "        fh.write('beat\\n')\n"
+        "    time.sleep(0.2)\n"
+    )
+    body = (
+        "import subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {grandchild_code!r}])\n"
+        f"Path({str(pid_file)!r}).write_text(str(child.pid), encoding='utf-8')\n"
+        "print('tree:started', flush=True)\n"
+        "while True:\n"
+        "    time.sleep(0.5)\n"
+        "    print('tree:tick', flush=True)\n"
+    )
+    script = SCRIPTS_DIR / f"{name}.py"
+    script.write_text(body, encoding="utf-8")
+    yield {"name": name, "beat": beat, "pid_file": pid_file}
+    script.unlink(missing_ok=True)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        proc = psutil.Process(pid)
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+
+
+async def _await_condition(predicate, timeout: float = 30.0, interval: float = 0.2) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
+async def _await_quiet(beat: Path, quiet_seconds: float = 2.0, timeout: float = 15.0) -> bool:
+    """Waits until the beat file stops growing, i.e. the grandchild stopped working."""
+    deadline = time.monotonic() + timeout
+    last_size = beat.stat().st_size if beat.exists() else 0
+    last_change = time.monotonic()
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.2)
+        size = beat.stat().st_size if beat.exists() else 0
+        if size != last_size:
+            last_size = size
+            last_change = time.monotonic()
+        elif time.monotonic() - last_change >= quiet_seconds:
+            return True
+    return False
+
+
+async def _await_run_status(run_id: str, wanted: tuple, timeout: float = 30.0) -> str | None:
+    deadline = time.monotonic() + timeout
+    status = None
+    while time.monotonic() < deadline:
+        await pipeline_engine.wake()
+        async with AsyncSessionLocal() as session:
+            run = await session.get(PipelineRun, run_id)
+            status = run.status if run else None
+            if status in wanted:
+                return status
+        await asyncio.sleep(0.2)
+    return status
+
+
+@pytest.mark.asyncio
+async def test_cancel_reaps_the_grandchild_the_step_spawned(tree_script):
+    """Cancelling stops the work: the step's grandchild must not outlive the run."""
+    graph = await _create_pipeline(
+        [{"name": "tree", "step_type": "script", "target": tree_script["name"]}]
+    )
+    run_id = await pipeline_engine.run_now(graph["pipeline_id"])
+
+    assert await _await_condition(
+        lambda: tree_script["pid_file"].exists() and tree_script["beat"].exists()
+        and tree_script["beat"].stat().st_size > 0
+    ), "the step never spawned its grandchild"
+    grandchild = int(tree_script["pid_file"].read_text(encoding="utf-8").strip())
+    assert _alive(grandchild)
+
+    assert await pipeline_engine.cancel_run(run_id)
+    assert await _await_run_status(run_id, ("cancelled", "failed", "interrupted")) == "cancelled"
+
+    assert await _await_condition(lambda: not _alive(grandchild), timeout=15), (
+        "the grandchild survived cancellation — the leak this work removes"
+    )
+    assert await _await_quiet(tree_script["beat"]), "the grandchild kept writing after cancel"
+
+
+@pytest.mark.asyncio
+async def test_timeout_reaps_the_grandchild_the_step_spawned(tree_script):
+    """A timed-out step fails, and its descendant processes are gone with it."""
+    graph = await _create_pipeline(
+        [
+            {
+                "name": "tree",
+                "step_type": "script",
+                "target": tree_script["name"],
+                "timeout_seconds": 5,
+            }
+        ]
+    )
+    result = await _run_and_wait(graph["pipeline_id"], timeout=60)
+
+    assert result["status"] == "failed"
+    assert "Timed out after 5s." in (result["steps"]["tree"]["error"] or "")
+    assert tree_script["pid_file"].exists(), "the step never spawned its grandchild"
+    grandchild = int(tree_script["pid_file"].read_text(encoding="utf-8").strip())
+    assert await _await_condition(lambda: not _alive(grandchild), timeout=15), (
+        "a timed-out step left its grandchild running"
+    )
+    assert await _await_quiet(tree_script["beat"]), "the grandchild kept writing after the timeout"
 

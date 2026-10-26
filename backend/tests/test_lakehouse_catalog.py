@@ -7,6 +7,7 @@ from httpx import AsyncClient, ASGITransport
 
 from app.main import app
 from app.config import settings
+from app.core.catalog import scan as scan_lakehouse
 from app.engines.duckdb_engine import duckdb_engine
 from app.engines.introspector import introspector
 
@@ -206,4 +207,222 @@ async def test_lakehouse_management_crud_and_metadata():
         })
         assert del_parent.status_code == 200
         assert not (lakehouse_root / parent_tier).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_folder_rename_moves_the_tables_in_the_catalog():
+    """DuckLake derives a table's files from its schema, so a rename has to move the tables.
+
+    Renaming the directory alone left every pointer aimed at a folder that no longer held the
+    files — the data was still there, and unreachable.
+    """
+    import shutil
+
+    from lakehouse_helpers import drop_schema, unique_name, write_table
+
+    lakehouse_root = settings.lakehouse_root_path
+    old = unique_name("zzren")
+    new = f"{old}moved"
+    (lakehouse_root / old).mkdir(parents=True, exist_ok=True)
+    try:
+        write_table(f"{old}/orders.parquet", pa.Table.from_pydict({"id": [1, 2]}))
+        write_table(f"{old}/sub/events.parquet", pa.Table.from_pydict({"id": [7]}))
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.put(
+                "/api/catalog/lakehouse/directories/rename",
+                json={"path": old, "new_name": new},
+            )
+
+        assert res.status_code == 200, res.text
+        assert res.json()["tables_moved"] == 2
+
+        after = {(table.name, table.folder) for table in scan_lakehouse().tables}
+        assert ("orders", new) in after, "the table moved with the folder"
+        assert ("events", f"{new}.sub") in after, "and so did the nested folder's"
+        assert not any(folder == old or folder.startswith(f"{old}.") for _, folder in after), (
+            "the old schema must not linger beside the new one"
+        )
+    finally:
+        drop_schema(old)
+        shutil.rmtree(lakehouse_root / old, ignore_errors=True)
+        shutil.rmtree(lakehouse_root / new, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_a_rename_refuses_to_overwrite_a_table_of_the_same_name():
+    """Nothing moves when the destination is taken: those rows are not the user's to lose."""
+    import shutil
+
+    from lakehouse_helpers import drop_schema, unique_name, write_table
+
+    from app.api.routes_catalog import _rename_directory_sync
+
+    lakehouse_root = settings.lakehouse_root_path
+    left = unique_name("zzcola")
+    right = unique_name("zzcolb")
+    (lakehouse_root / left).mkdir(parents=True, exist_ok=True)
+    try:
+        write_table(f"{left}/orders.parquet", pa.Table.from_pydict({"id": [1]}))
+        write_table(f"{right}/orders.parquet", pa.Table.from_pydict({"id": [2]}))
+
+        moved, skipped = _rename_directory_sync(left, right)
+
+        assert (moved, skipped) == (0, 1)
+        after = {(table.name, table.folder) for table in scan_lakehouse().tables}
+        assert ("orders", left) in after, "the source table is exactly where it was"
+        assert ("orders", right) in after
+    finally:
+        drop_schema(left)
+        drop_schema(right)
+        shutil.rmtree(lakehouse_root / left, ignore_errors=True)
+        shutil.rmtree(lakehouse_root / right, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_folder_with_tables_needs_confirmation():
+    """The count comes from the catalog: a walk of the folder cannot see DuckLake's tables."""
+    import shutil
+
+    from lakehouse_helpers import drop_schema, unique_name, write_table
+
+    lakehouse_root = settings.lakehouse_root_path
+    folder = unique_name("zzdel")
+    (lakehouse_root / folder).mkdir(parents=True, exist_ok=True)
+    try:
+        write_table(f"{folder}/orders.parquet", pa.Table.from_pydict({"id": [1, 2]}))
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            refused = await client.delete(
+                "/api/catalog/lakehouse/directories", params={"path": folder}
+            )
+            assert refused.status_code == 400
+            assert "1 table" in refused.json()["detail"]
+            assert ("orders", folder) in {
+                (table.name, table.folder) for table in scan_lakehouse().tables
+            }, "a refused delete changes nothing"
+
+            confirmed = await client.delete(
+                "/api/catalog/lakehouse/directories",
+                params={"path": folder, "cascade": True},
+            )
+
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json()["tables_dropped"] == 1
+        assert not (lakehouse_root / folder).exists(), "the folder is gone from disk"
+        assert ("orders", folder) not in {
+            (table.name, table.folder) for table in scan_lakehouse().tables
+        }
+    finally:
+        drop_schema(folder)
+        shutil.rmtree(lakehouse_root / folder, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_a_preview_answers_for_the_folder_it_was_asked_about():
+    """Two folders may hold a table of the same name; the preview must not pick the first."""
+    import shutil
+
+    from lakehouse_helpers import drop_schema, unique_name, write_table
+
+    lakehouse_root = settings.lakehouse_root_path
+    left = unique_name("zzpva")
+    right = unique_name("zzpvb")
+    (lakehouse_root / left).mkdir(parents=True, exist_ok=True)
+    (lakehouse_root / right).mkdir(parents=True, exist_ok=True)
+    try:
+        write_table(f"{left}/orders.parquet", pa.Table.from_pydict({"id": [1, 2, 3]}))
+        write_table(f"{right}/orders.parquet", pa.Table.from_pydict({"id": [9]}))
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            left_preview = await client.get(f"/api/catalog/preview/lakehouse:{left}/orders")
+            right_preview = await client.get(f"/api/catalog/preview/lakehouse:{right}/orders")
+
+        assert left_preview.status_code == 200, left_preview.text
+        assert right_preview.status_code == 200, right_preview.text
+        assert left_preview.json()["row_count"] == 3
+        assert right_preview.json()["row_count"] == 1, "the other folder's orders, not this one's"
+    finally:
+        drop_schema(left)
+        drop_schema(right)
+        shutil.rmtree(lakehouse_root / left, ignore_errors=True)
+        shutil.rmtree(lakehouse_root / right, ignore_errors=True)
+
+@pytest.mark.asyncio
+async def test_a_folder_is_a_schema_and_outlives_neither_its_tables_nor_the_disk():
+    """The tree's folders are schemas, so the folder goes when its last table does.
+
+    A folder a user created keeps its ``.gitkeep`` and stays. A folder that exists only as a
+    schema — no directory left, nothing in it — is still deletable: what the tree shows must
+    never be something the API refuses to remove.
+    """
+    import shutil
+
+    from app.core.catalog import quote_ident
+    from lakehouse_helpers import drop_schema, unique_name, write_table
+
+    lakehouse_root = settings.lakehouse_root_path
+    user_folder = unique_name("zzkeep")
+    plain_folder = unique_name("zzdrop")
+    schema_only = unique_name("zzschema")
+    for folder in (user_folder, plain_folder):
+        (lakehouse_root / folder).mkdir(parents=True, exist_ok=True)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # A folder the user made, with a table in it.
+            assert (
+                await client.post(
+                    "/api/catalog/lakehouse/directories", json={"path": user_folder}
+                )
+            ).status_code == 200
+            write_table(f"{user_folder}/orders.parquet", pa.Table.from_pydict({"id": [1, 2]}))
+            # A folder with nothing to mark it as anybody's.
+            write_table(f"{plain_folder}/orders.parquet", pa.Table.from_pydict({"id": [3]}))
+
+            for folder in (user_folder, plain_folder):
+                dropped = await client.delete(
+                    "/api/catalog/lakehouse/tables", params={"folder": folder, "name": "orders"}
+                )
+                assert dropped.status_code == 200, dropped.text
+
+            tree = (await client.get("/api/catalog/tree?refresh=true")).json()
+            folders = {
+                directory["path"]
+                for node in tree
+                if node["id"] == "lakehouse"
+                for directory in node["directories"]
+            }
+            assert user_folder in folders, "the .gitkeep is what makes it the user's folder"
+            assert plain_folder not in folders, "an empty schema is not a folder any more"
+            assert not (lakehouse_root / user_folder).exists() or (
+                lakehouse_root / user_folder / ".gitkeep"
+            ).is_file(), "the user's folder is still on disk, marked"
+            assert not (lakehouse_root / plain_folder).exists(), (
+                "the directory the dropped table left is swept too"
+            )
+
+            # A schema nobody gave a directory: still listed, still deletable.
+            write_table(f"{schema_only}/temp.parquet", pa.Table.from_pydict({"id": [4]}))
+            conn = duckdb_engine.get_connection()
+            try:
+                conn.execute(f"DROP TABLE lakehouse.{quote_ident(schema_only)}.temp")
+            finally:
+                conn.close()
+            shutil.rmtree(lakehouse_root / schema_only, ignore_errors=True)
+
+            tree = (await client.get("/api/catalog/tree?refresh=true")).json()
+            assert schema_only in {
+                directory["path"]
+                for node in tree
+                if node["id"] == "lakehouse"
+                for directory in node["directories"]
+            }
+            removed = await client.delete(
+                "/api/catalog/lakehouse/directories", params={"path": schema_only}
+            )
+            assert removed.status_code == 200, removed.text
+    finally:
+        for folder in (user_folder, plain_folder, schema_only):
+            drop_schema(folder)
+            shutil.rmtree(lakehouse_root / folder, ignore_errors=True)
 

@@ -54,18 +54,31 @@ df = obelisk.query("""
 Use `query_arrow` when the next hop is Arrow-native (Spark, Polars, another engine) and
 you would rather not round-trip through a DataFrame.
 
-## `save(df, target, sync_postgres=None) -> dict`
+## `save(df, target) -> dict`
 
-Writes one Snappy Parquet file through the storage seam -- atomically: a reader sees the
-old file or the new one, never a partial write.
+Writes the DataFrame into a DuckLake table at `lakehouse.<folder>.<name>`. DuckLake owns
+the files: the table is created through its catalog, and nothing is mirrored into
+PostgreSQL.
 
 ```python
 result = obelisk.save(df, "marts.monthly_revenue")
-# {'num_rows': 120, 'file_path': '.../marts/monthly_revenue.parquet', 'table_name': 'monthly_revenue'}
+# {'num_rows': 120, 'file_path': 'lakehouse.marts.monthly_revenue', ...}
 ```
 
-Accepts Polars, PyArrow, pandas or Spark DataFrames. `sync_postgres=True` additionally
-mirrors the table into the warehouse schema of the same name; leave it off in notebooks.
+Accepts Polars, PyArrow, pandas or Spark DataFrames.
+
+## `materialize_sql(sql, target) -> dict`
+
+Materialises a query straight into a DuckLake table. DuckDB reads the sources the SQL
+names and writes the result in one statement, so a multi-GB result never becomes a Python
+or Arrow object:
+
+```python
+obelisk.materialize_sql(
+    "SELECT region, count(*) AS events FROM raw.clickstream GROUP BY 1",
+    "marts.events_by_region",
+)
+```
 
 ## `var(key, default=None)`
 

@@ -16,6 +16,7 @@ import uuid
 import pyarrow as pa
 import pytest
 
+from app.core.catalog import LOAD_TABLE_SUFFIX
 from app.engines.duckdb_engine import duckdb_engine
 from app.engines.ingest_engine import ingest_engine
 
@@ -30,15 +31,11 @@ def write_table(rel_path: str, rows: int = 2) -> None:
     try:
         conn.execute(f'CREATE SCHEMA IF NOT EXISTS lakehouse."{schema}";')
         batch = pa.table({"id": list(range(1, rows + 1))})
-        assert ingest_engine._stage_batches(conn, [batch]) == rows
-        ingest_engine._write_staged(
-            conn,
-            target=f'lakehouse."{schema}".{table}',
-            mode="snapshot",
-            exists=False,
-            write_strategy="append",
-            primary_key=None,
-            watermark_column=None,
+        target = f'lakehouse."{schema}".{table}'
+        load = ingest_engine._target_sql(schema, f"{table}{LOAD_TABLE_SUFFIX}")
+        assert ingest_engine._stage_batches(conn, [batch], sink=load, create=True) == rows
+        ingest_engine._swap_into_place(
+            conn, schema=schema, staged=load, target=target, table=table
         )
     finally:
         conn.close()

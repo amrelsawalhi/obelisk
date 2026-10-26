@@ -26,6 +26,12 @@ from app.core.storage import FileInfo, WarehouseStorage, normalize_rel, warehous
 SOURCE = "lakehouse"
 PARQUET_SUFFIX = ".parquet"
 
+# Tables an ingestion writes into while it streams rows: the snapshot lands in
+# ``<table>__obelisk_load`` next to its target and is renamed into place when it is
+# complete. They are never a user's table — a half-written load must not be offered as one
+# — so every catalog read hides them.
+LOAD_TABLE_SUFFIX = "__obelisk_load"
+
 # One folder or table name: letters, digits, '_' and '-', never starting with '-'.
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _SIMPLE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -185,16 +191,14 @@ def lakehouse_connection():
     return conn
 
 
-def lakehouse_tables(conn) -> list[dict]:
-    """Every live table, as the catalog describes it.
+def _live_table_rows(conn) -> list:
+    """Every live table, as the catalog's own metadata table describes it.
 
-    One query replaces a directory walk plus a footer read per file: the schema and
-    table come from ``ducklake_schema`` / ``ducklake_table``, and the physical facts from
-    ``ducklake_table_stats``. ``modified_at`` is the catalog's newest snapshot — a
-    coarser answer than a file timestamp, and the honest one here, because a table is
-    now many files and only the catalog knows when any of them last changed.
+    One query replaces a directory walk plus a footer read per file: the schema and table
+    come from ``ducklake_schema`` / ``ducklake_table``, and the physical facts from
+    ``ducklake_table_stats``. Some of these rows are load tables, so callers filter.
     """
-    rows = conn.execute(
+    return conn.execute(
         f"""
         SELECT s.schema_name,
                t.table_name,
@@ -211,6 +215,19 @@ def lakehouse_tables(conn) -> list[dict]:
         ORDER BY 1, 2
         """
     ).fetchall()
+
+
+def lakehouse_tables(conn) -> list[dict]:
+    """Every live table, as the catalog describes it.
+
+    ``modified_at`` is the catalog's newest snapshot — a coarser answer than a file
+    timestamp, and the honest one here, because a table is now many files and only the
+    catalog knows when any of them last changed.
+
+    A load table (``<table>__obelisk_load``) is skipped: it holds the rows of a snapshot or
+    an upsert that is still being written, and until it is renamed into place it is not a
+    table anyone may query, preview or join.
+    """
     return [
         {
             "schema": str(schema),
@@ -219,8 +236,85 @@ def lakehouse_tables(conn) -> list[dict]:
             "size_bytes": int(size_bytes or 0),
             "table_id": int(table_id),
         }
-        for schema, table, num_rows, size_bytes, _begin, table_id in rows
+        for schema, table, num_rows, size_bytes, _begin, table_id in _live_table_rows(conn)
+        if not str(table).endswith(LOAD_TABLE_SUFFIX)
     ]
+
+
+def load_tables(conn) -> list[tuple[str, str]]:
+    """The load tables the catalog still holds, as ``(schema, table)``.
+
+    A load table is not a table anyone asked for: it is where one ingest streams the rows it
+    will swap in or merge from, and a run that ends — either way — drops it. Anything listed
+    here therefore belongs to a run that was killed before it could clean up (SIGKILL, an
+    OOM kill, a lost machine), so its rows can never be applied and it is pure waste: bytes
+    no scan reads and every backup copies. Maintenance drops them.
+    """
+    return [
+        (str(schema), str(table))
+        for schema, table, *_rest in _live_table_rows(conn)
+        if str(table).endswith(LOAD_TABLE_SUFFIX)
+    ]
+
+
+def drop_load_tables(conn, *, dry_run: bool = False) -> list[tuple[str, str]]:
+    """Drops the leftovers :func:`load_tables` describes; returns what it found.
+
+    This is the housekeeping half of a crash: the ingest that owned these tables cannot run
+    its own cleanup, so something else has to, or the bytes are carried by every scan of the
+    catalog and every backup. ``dry_run`` reports without changing anything.
+    """
+    orphans = load_tables(conn)
+    if not dry_run:
+        for schema, table in orphans:
+            conn.execute(
+                f"DROP TABLE IF EXISTS {SOURCE}.{quote_ident(schema)}.{quote_ident(table)};"
+            )
+    return orphans
+
+
+def lakehouse_all_columns(conn) -> dict[tuple[str, str], tuple[dict, ...]]:
+    """Every table's columns in one query, keyed by ``(schema, table)``.
+
+    ``scan()`` used to ``DESCRIBE`` each table in turn: one statement per table inside a loop
+    over the whole catalog, which is where a lakehouse of a few hundred tables spent most of
+    a scan's time. DuckDB's own ``duckdb_columns()`` answers for all of them at once.
+
+    It is asked in preference to DuckLake's ``ducklake_column`` metadata table because a
+    column's type is shown to a user and the two disagree on the spelling: the metadata
+    table stores DuckLake's own names (``int32``, ``decimal(2,1)``), while
+    ``duckdb_columns()`` reports exactly what ``DESCRIBE`` would (``INTEGER``,
+    ``DECIMAL(2,1)``).
+
+    Returns an empty mapping if the query fails, which leaves the caller to fall back to
+    :func:`lakehouse_columns` table by table.
+    """
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT schema_name,
+                   table_name,
+                   column_name,
+                   data_type,
+                   is_nullable
+            FROM duckdb_columns()
+            WHERE database_name = '{SOURCE}'
+            ORDER BY schema_name, table_name, column_index
+            """
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - a missing fast path is not a failed scan
+        return {}
+    by_table: dict[tuple[str, str], list[dict]] = {}
+    for schema, table, column, data_type, nullable in rows:
+        by_table.setdefault((str(schema), str(table)), []).append(
+            {
+                "name": str(column),
+                "data_type": str(data_type),
+                "is_nullable": bool(nullable),
+                "is_primary_key": False,
+            }
+        )
+    return {key: tuple(columns) for key, columns in by_table.items()}
 
 
 def lakehouse_columns(conn, schema: str, table: str) -> tuple[dict, ...]:
@@ -311,6 +405,35 @@ def path_for(folder: str, name: str) -> str:
     clean = f"{folder}/{name}" if folder else str(name)
     folder_part, table_part = split_table_path(clean)
     return "/".join(part for part in (folder_part, f"{table_part}{PARQUET_SUFFIX}") if part)
+
+
+def lakehouse_schemas(conn) -> list[str]:
+    """The lakehouse's own schemas, which is what a folder is.
+
+    A folder is a schema, so this is the catalog's answer to "which folders exist" — no
+    walk of the warehouse and no guessing from what happens to be on disk. ``main`` is the
+    root rather than a folder, so it is left out.
+    """
+    rows = conn.execute(
+        f"SELECT schema_name FROM __ducklake_metadata_{SOURCE}.ducklake_schema "
+        "WHERE end_snapshot IS NULL ORDER BY 1"
+    ).fetchall()
+    return [str(name) for (name,) in rows if str(name) != "main"]
+
+
+def table_directory(root: Path, schema: str, table: str) -> Path:
+    """Where DuckLake keeps one table's Parquet: ``<root>/<schema>/<table>``.
+
+    Not part of the address (the catalog is), but the directory exists anyway, and
+    removing it once the table is gone is what keeps it out of anything that walks the
+    warehouse. Two caveats, both of which the caller's sweep has to live with: a nested
+    folder is one schema named with dots and DuckLake names *its* directory itself, and a
+    table that was swapped in from a load table keeps its files under the load table's
+    name — so this is where a table's files *start*, not always where they end up.
+    """
+    if schema == "main":
+        return root / table
+    return root / schema.replace(".", "/") / table
 
 
 def _address_parts(rel_path: str) -> Sequence[str]:
@@ -451,12 +574,17 @@ def scan(storage: Optional[WarehouseStorage] = None) -> WarehouseScan:
     try:
         rows = lakehouse_tables(conn)
         stamp = last_snapshot_time(conn)
+        columns_by_table = lakehouse_all_columns(conn)
         counts: dict[str, int] = {}
         for row in rows:
             schema, name = row["schema"], row["table"]
             folder = "" if schema == "main" else schema
             rel = f"{folder}/{name}" if folder else name
-            columns = lakehouse_columns(conn, schema, name)
+            # One query answered for every table; only a table it did not mention (or could
+            # not answer for) costs a DESCRIBE of its own.
+            columns = columns_by_table.get((schema, name)) or lakehouse_columns(
+                conn, schema, name
+            )
             if not columns:
                 problems.append(f"{rel}: the catalog lists it but DuckDB cannot describe it")
             counts[name.lower()] = counts.get(name.lower(), 0) + 1

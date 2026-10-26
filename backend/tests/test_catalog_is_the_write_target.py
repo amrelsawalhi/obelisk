@@ -55,7 +55,7 @@ async def test_the_view_projects_what_a_write_recorded() -> None:
     name = f"probe_{uuid.uuid4().hex[:4]}"
 
     try:
-        obelisk.save(pl.DataFrame({"id": [1, 2, 3]}), f"{folder}/{name}", sync_postgres=False)
+        obelisk.save(pl.DataFrame({"id": [1, 2, 3]}), f"{folder}/{name}")
         await _project()
 
         with sqlite3.connect(settings.sqlite_db_path) as con:

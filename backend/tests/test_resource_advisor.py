@@ -46,6 +46,16 @@ def test_duckdb_memory_limit_recommendation():
     gb_val = int(limit_str.replace("GB", ""))
     assert gb_val >= 1
 
+def test_duckdb_memory_limit_is_shared_between_concurrent_slots():
+    """Four heavy queries must not each claim the memory meant for the whole host."""
+    single_slot = advisor.get_duckdb_memory_limit(1)
+    four_slots = advisor.get_duckdb_memory_limit(4)
+    assert single_slot.endswith("GB")
+    assert four_slots.endswith("GB")
+    assert int(four_slots.replace("GB", "")) <= int(single_slot.replace("GB", ""))
+    # A nonsensical slot count is clamped to 1 rather than dividing by zero.
+    assert advisor.get_duckdb_memory_limit(0) == single_slot
+
 def test_vault_encryption_and_decryption():
     """Verifies AES-128 Fernet encryption and decryption."""
     secret = "super_confidential_db_token_999"

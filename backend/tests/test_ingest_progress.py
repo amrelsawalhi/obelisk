@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import uuid
 
 import pyarrow as pa
+import pytest
 
 from app.config import settings
+from app.core.catalog import LOAD_TABLE_SUFFIX
 from app.engines.duckdb_engine import duckdb_engine
 from app.engines.ingest_engine import IngestEngine
 from app.engines.ingest_job_manager import IngestJobManager
@@ -29,32 +32,46 @@ def _cleanup(*pairs: tuple[str, str]) -> None:
         con.commit()
 
 
-def test_stage_batches_reports_a_running_total() -> None:
-    """Three batches produce three callbacks, each the total so far — not the batch size."""
+@pytest.fixture()
+def sink():
+    """A throwaway load table to stream into, in a schema of its own."""
     engine = IngestEngine()
     conn = duckdb_engine.get_connection()
+    schema = f"zzprobe{uuid.uuid4().hex[:6]}"
+    conn.execute(f"CREATE SCHEMA IF NOT EXISTS lakehouse.{schema};")
+    try:
+        yield engine, conn, engine._target_sql(schema, f"batches{LOAD_TABLE_SUFFIX}")
+    finally:
+        try:
+            conn.execute(f"DROP SCHEMA lakehouse.{schema} CASCADE;")
+        finally:
+            conn.close()
+
+
+def test_stage_batches_reports_a_running_total(sink) -> None:
+    """Three batches produce three callbacks, each the total so far — not the batch size."""
+    engine, conn, target = sink
     seen: list[int] = []
     batches = [
         pa.table({"n": list(range(5))}),
         pa.table({"n": list(range(5, 9))}),
         pa.table({"n": list(range(9, 15))}),
     ]
-    try:
-        total = engine._stage_batches(conn, batches, on_batch=seen.append)
-    finally:
-        conn.close()
+    total = engine._stage_batches(
+        conn, batches, sink=target, create=True, on_batch=seen.append
+    )
 
     assert seen == [5, 9, 15]
     assert total == 15
 
 
-def test_stage_batches_without_a_callback_still_works() -> None:
-    engine = IngestEngine()
-    conn = duckdb_engine.get_connection()
-    try:
-        assert engine._stage_batches(conn, [pa.table({"n": [1, 2, 3]})]) == 3
-    finally:
-        conn.close()
+def test_stage_batches_without_a_callback_still_works(sink) -> None:
+    engine, conn, target = sink
+
+    assert (
+        engine._stage_batches(conn, [pa.table({"n": [1, 2, 3]})], sink=target, create=True)
+        == 3
+    )
 
 
 def test_batch_progress_lands_when_called_from_a_worker_thread() -> None:
@@ -82,8 +99,8 @@ def test_batch_progress_lands_when_called_from_a_worker_thread() -> None:
     try:
         asyncio.run(run())
 
-        # Staged, not written: the rows sit in the temp table until the write statement runs,
-        # so they must not be added to the rows this job claims to have ingested.
+        # Staged, not written: the rows are in a load table until the swap or merge runs, so
+        # they must not be added to the rows this job claims to have ingested.
         assert job.staged_rows == 150_000
         assert job.total_rows == 0
         assert job.current_phase == "Staged 150,000 rows"

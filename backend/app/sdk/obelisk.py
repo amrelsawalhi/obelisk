@@ -30,12 +30,22 @@ import polars as pl
 from app.config import settings
 from app.core.catalog import SOURCE, fqn_for, path_for, split_table_path, sql_name_for
 from app.core.resource_advisor import advisor
-from app.core.dsn import build_pg_dsn, sql_string, validate_alias
 from app.core.storage import warehouse_storage
 from app.engines.duckdb_engine import DuckDBEngine
 
 duckdb_engine = DuckDBEngine()
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "table",
+    "query",
+    "query_arrow",
+    "save",
+    "materialize_sql",
+    "spark",
+    "var",
+    "TableWrapper",
+]
 
 # One shared connection for SDK helpers that do not receive an explicit one.
 # Creating a fresh in-memory connection per call leaked a DuckDB instance every
@@ -405,123 +415,133 @@ def query_arrow(sql: str) -> pa.Table:
         conn.close()
 
 
-def save(df: Any, target: str, sync_postgres: Optional[bool] = None) -> Dict[str, Any]:
-    """Persists a DataFrame as a table in the lakehouse.
+def _coerce_to_arrow(df: Any) -> pa.Table:
+    """Normalizes a Polars / Arrow / pandas / Spark DataFrame to a PyArrow Table."""
+    if isinstance(df, pl.DataFrame):
+        return df.to_arrow()
+    if isinstance(df, pa.Table):
+        return df
+    if hasattr(df, "to_arrow"):
+        return df.to_arrow()
+    if hasattr(df, "toPandas"):  # PySpark DataFrame
+        return pa.Table.from_pandas(df.toPandas())
+    if hasattr(df, "to_pandas"):
+        return pa.Table.from_pandas(df.to_pandas())
+    if str(type(df)).find("pandas.core.frame.DataFrame") != -1:
+        return pa.Table.from_pandas(df)
+    raise TypeError(f"Unsupported DataFrame type '{type(df)}' for obelisk.save().")
+
+
+def save(df: Any, target: str) -> Dict[str, Any]:
+    """Persists a DataFrame as a table in the DuckLake lakehouse.
 
     ``target`` is a warehouse path — ``"supabase/auth/table1"``, the fully qualified
     ``"lakehouse.supabase.auth.table1"``, or a bare ``"orders"`` for the root. Dots and
     slashes are both separators, so a layer-style ``"marts.sales.orders"`` still works
     and lands in schema ``marts.sales``.
 
-    The catalog is the table: one statement replaces it, and the row count, schema and
-    size follow from the catalog without anything being registered by hand.
+    DuckLake is the single source of truth: the table is created through its catalog and
+    nothing is mirrored into PostgreSQL. The row count, schema and size follow from the
+    catalog without anything being registered by hand.
     """
     folder, stem = split_table_path(target)
     schema_name = folder.replace("/", ".") if folder else "main"
     rel_path = f"{folder}/{stem}" if folder else stem
 
-    # 1. Normalize input to PyArrow Table
-    if isinstance(df, pl.DataFrame):
-        arrow_table = df.to_arrow()
-    elif isinstance(df, pa.Table):
-        arrow_table = df
-    elif hasattr(df, "to_arrow"):
-        arrow_table = df.to_arrow()
-    elif hasattr(df, "toPandas"):  # PySpark DataFrame
-        arrow_table = pa.Table.from_pandas(df.toPandas())
-    elif hasattr(df, "to_pandas"):
-        arrow_table = pa.Table.from_pandas(df.to_pandas())
-    elif str(type(df)).find("pandas.core.frame.DataFrame") != -1:
-        arrow_table = pa.Table.from_pandas(df)
-    else:
-        raise TypeError(f"Unsupported DataFrame type '{type(df)}' for obelisk.save().")
+    arrow_table = _coerce_to_arrow(df)
 
-    # 2. One statement, through the same connection factory as everything else.
     from app.core.catalog import quote_ident
-    from app.engines.duckdb_engine import duckdb_engine
 
-    address = f'{SOURCE}.{quote_ident(schema_name)}.{quote_ident(stem)}'
+    address = f"{SOURCE}.{quote_ident(schema_name)}.{quote_ident(stem)}"
     conn = duckdb_engine.get_connection()
     try:
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema_name)};")
-        conn.register("_obelisk_save", arrow_table)
+        conn.register("_obelisk_save_src", arrow_table)
         try:
             conn.execute(
-                f"CREATE OR REPLACE TABLE {address} AS SELECT * FROM _obelisk_save"
+                f"CREATE OR REPLACE TABLE {address} AS SELECT * FROM _obelisk_save_src;"
             )
         finally:
-            conn.unregister("_obelisk_save")
+            try:
+                conn.unregister("_obelisk_save_src")
+            except Exception:
+                pass
     finally:
         conn.close()
 
-    num_rows = arrow_table.num_rows
+    num_rows = int(arrow_table.num_rows)
+    fqn = fqn_for(f"{rel_path}.parquet")
+    sql_name = sql_name_for(f"{rel_path}.parquet")
 
-    # 3. Mirror into PostgreSQL when the caller wants it. Read from the lake, not from a
-    # file, and report a failure rather than swallow it: the save itself already landed.
-    warehouse_sync: Optional[Dict[str, Any]] = None
-    if sync_postgres is not False:
-        try:
-            _sync_table_to_postgres(schema=schema_name, table_name=stem)
-            warehouse_sync = {"status": "success", "schema": schema_name}
-        except Exception as exc:
-            warehouse_sync = {
-                "status": "error",
-                "schema": schema_name,
-                "error": str(exc),
-            }
+    logger.info(
+        "obelisk.save: wrote %s rows -> %s (fqn=%s)",
+        f"{num_rows:,}",
+        address,
+        fqn,
+    )
 
     return {
         "status": "success",
         "target": target,
         "path": rel_path,
-        "fqn": fqn_for(f"{rel_path}.parquet"),
-        "sql_name": sql_name_for(f"{rel_path}.parquet"),
+        "fqn": fqn,
+        "sql_name": sql_name,
         "folder": folder,
-        "warehouse_schema": schema_name,
-        "warehouse_sync": warehouse_sync,
         "name": stem,
         "num_rows": num_rows,
         "file_path": address,
     }
 
 
-def _sync_table_to_postgres(schema: str, table_name: str) -> None:
-    """Publishes one lakehouse table into PostgreSQL through DuckDB.
+def materialize_sql(sql: str, target: str) -> Dict[str, Any]:
+    """Materializes a SQL query directly into a DuckLake table.
 
-    The source is the lakehouse table, so this needs no Parquet path and no copy of the
-    data in Python: DuckDB reads from the catalog and writes to the attached database in
-    one statement.
+    DuckDB reads the sources named by ``sql`` and writes the result through the catalog in
+    one statement, so a multi-GB result never becomes a Python / Arrow object first. Use
+    this in place of ``save(query_arrow(sql), target)`` when the result is large.
     """
-    from app.core.catalog import SOURCE as _SOURCE
-    from app.core.catalog import attach_lakehouse
-    from app.core.dsn import sql_ident
-    from app.core.warehouse_resolver import resolve_write_warehouse_postgres_params
+    from app.core.catalog import quote_ident
 
-    pg = resolve_write_warehouse_postgres_params()
-    conn_str = build_pg_dsn(
-        dbname=pg["database"],
-        host=pg["host"],
-        port=pg["port"],
-        user=pg["username"],
-        password=pg["password"],
-        sslmode=pg.get("sslmode") or "disable",
-    )
+    folder, stem = split_table_path(target)
+    schema_name = folder.replace("/", ".") if folder else "main"
+    rel_path = f"{folder}/{stem}" if folder else stem
+    address = f"{SOURCE}.{quote_ident(schema_name)}.{quote_ident(stem)}"
 
-    import duckdb
-    conn = duckdb.connect(":memory:")
+    conn = duckdb_engine.get_connection()
     try:
-        attach_lakehouse(conn)
-        conn.execute("LOAD postgres;")
-        alias = validate_alias("pg_sync_wh")
-        conn.execute(f"ATTACH {sql_string(conn_str)} AS {alias} (TYPE POSTGRES);")
-        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{sql_ident(schema)};")
-        conn.execute(
-            f"CREATE OR REPLACE TABLE {alias}.{sql_ident(schema)}.{sql_ident(table_name)} AS "
-            f"SELECT * FROM {_SOURCE}.{quote_ident(schema)}.{quote_ident(table_name)};"
+        storage_path = duckdb_engine._ensure_storage()
+        for attachment in _attachments_for_sql(sql):
+            duckdb_engine.attach(conn, attachment)
+        exec_sql = (
+            duckdb_engine._prepare_sql_and_views(conn, sql, storage_path).strip().rstrip(";")
         )
-        conn.execute(f"DETACH {alias};")
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema_name)};")
+        conn.execute(f"CREATE OR REPLACE TABLE {address} AS {exec_sql};")
+        num_rows = int(conn.execute(f"SELECT count(*) FROM {address};").fetchone()[0])
     finally:
         conn.close()
+
+    fqn = fqn_for(f"{rel_path}.parquet")
+    sql_name = sql_name_for(f"{rel_path}.parquet")
+
+    logger.info(
+        "obelisk.materialize_sql: wrote %s rows -> %s (fqn=%s)",
+        f"{num_rows:,}",
+        address,
+        fqn,
+    )
+
+    return {
+        "status": "success",
+        "target": target,
+        "path": rel_path,
+        "fqn": fqn,
+        "sql_name": sql_name,
+        "folder": folder,
+        "name": stem,
+        "num_rows": num_rows,
+        "file_path": address,
+    }
 
 
 def is_java_compatible() -> bool:

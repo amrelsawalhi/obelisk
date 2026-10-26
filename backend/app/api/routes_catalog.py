@@ -1,6 +1,8 @@
 import asyncio
+import os
 import time
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -15,6 +17,7 @@ from app.core.dsn import sql_string
 from app.models.connection import Connection
 from app.engines.introspector import format_bytes, introspector
 from app.engines.duckdb_engine import duckdb_engine
+from app.core.resource_advisor import advisor
 from app.core.sources import (
     DRIVERS,
     UnsupportedSource,
@@ -25,8 +28,16 @@ from app.core.sources import (
 )
 from app.services.catalog import catalog_service
 from app.core.catalog import (
+    SOURCE,
+    LOAD_TABLE_SUFFIX,
     InvalidTablePath,
+    drop_load_tables,
+    lakehouse_connection,
+    lakehouse_schemas,
+    lakehouse_tables,
+    load_tables,
     quote_ident,
+    table_directory,
     validate_folder,
     validate_segment,
 )
@@ -56,6 +67,18 @@ def _lakehouse_table_exists(conn, schema: str, name: str) -> bool:
     return row is not None
 
 
+def _schema_has_tables(conn, schema: str) -> bool:
+    """Whether one schema still holds a live table. A nested schema is its own name."""
+    rows = conn.execute(
+        "SELECT 1 FROM __ducklake_metadata_lakehouse.ducklake_table AS t "
+        "JOIN __ducklake_metadata_lakehouse.ducklake_schema AS s "
+        "  ON s.schema_id = t.schema_id "
+        "WHERE t.end_snapshot IS NULL AND s.schema_name = ? LIMIT 1",
+        [schema],
+    ).fetchall()
+    return bool(rows)
+
+
 # The three operations below are synchronous on purpose: the routes hand them to
 # ``asyncio.to_thread`` so a DuckDB call never blocks the event loop (audit: async
 # routes must not block). Each returns a word the route turns into a response.
@@ -76,39 +99,179 @@ def _rename_table_sync(schema: str, old_name: str, new_name: str) -> str:
         conn.close()
 
 
+def _prune_table_directory(schema: str, name: str) -> None:
+    """Removes a table's leftover directory, and the folder with it when that emptied it.
+
+    A root-level table's parent is the warehouse itself, which no table operation sweeps.
+    """
+    root = settings.lakehouse_root_path
+    directory = table_directory(root, schema, name)
+    prune_empty_dirs(root, directory if directory.parent == root else directory.parent)
+
+
 def _delete_table_sync(schema: str, name: str) -> str:
+    """Drops one table, and the folder with it when it was the last table in it.
+
+    A folder is a schema, so a folder that holds nothing is a schema that holds nothing —
+    and one nobody made on purpose (no ``.gitkeep`` to keep it) has no reason to outlive
+    its last table. The tree showed such a folder until the schema went, and the directory
+    DuckLake derived from the schema stayed on disk either way.
+    """
     conn = duckdb_engine.get_connection()
     try:
         if not _lakehouse_table_exists(conn, schema, name):
             return "missing"
         conn.execute(f"DROP TABLE lakehouse.{quote_ident(schema)}.{quote_ident(name)}")
+        if schema != "main" and not _schema_has_tables(conn, schema):
+            try:
+                conn.execute(f"DROP SCHEMA IF EXISTS {SOURCE}.{quote_ident(schema)}")
+            except Exception:
+                # A schema that still holds a nested one is not an empty folder; it stays.
+                pass
+        _prune_table_directory(schema, name)
         return "ok"
     finally:
         conn.close()
+
+
+def _live_tables_in(conn, schema_prefix: str) -> List[tuple[str, str]]:
+    """Every live table in the schemas a folder owns, as ``(schema, table)``.
+
+    A folder is a schema, and a nested folder is a schema whose name carries the rest of the
+    path (``raw/nested`` is ``raw.nested``), so a folder owns its own schema *and* every
+    schema beneath it. ``main`` is the warehouse root.
+    """
+    rows = conn.execute(
+        f"SELECT s.schema_name, t.table_name "
+        f"FROM __ducklake_metadata_{SOURCE}.ducklake_table AS t "
+        f"JOIN __ducklake_metadata_{SOURCE}.ducklake_schema AS s ON s.schema_id = t.schema_id "
+        f"WHERE t.end_snapshot IS NULL"
+    ).fetchall()
+    return [
+        (str(schema_name), str(table_name))
+        for schema_name, table_name in rows
+        if schema_name == schema_prefix or schema_name.startswith(f"{schema_prefix}.")
+    ]
+
+
+def _move_table_on(conn, src_schema: str, dst_schema: str, name: str) -> str:
+    """Moves one table to another schema, on a connection the caller owns.
+
+    ``ALTER TABLE ... SET SCHEMA`` is the one-statement move and is tried first, but this
+    DuckLake build answers it with a parser error, so the copy-then-drop below is the path
+    actually taken. That rewrite is also why a folder rename may not simply move the folder
+    on disk: DuckLake derives a table's data directory from its schema, so files left under
+    the old folder would be files the catalog no longer points at.
+    """
+    src = f"{SOURCE}.{quote_ident(src_schema)}.{quote_ident(name)}"
+    dst = f"{SOURCE}.{quote_ident(dst_schema)}"
+    conn.execute(f"CREATE SCHEMA IF NOT EXISTS {dst}")
+    if _lakehouse_table_exists(conn, dst_schema, name):
+        return "exists"
+    try:
+        conn.execute(f"ALTER TABLE {src} SET SCHEMA {dst}")
+    except Exception:
+        # DuckLake may not support SET SCHEMA yet; a copy-then-drop is the honest fallback
+        # and still ends with the data in exactly one place.
+        conn.execute(f"CREATE TABLE {dst}.{quote_ident(name)} AS SELECT * FROM {src}")
+        conn.execute(f"DROP TABLE {src}")
+    # Whichever path moved it, the directory the table used belongs to the schema it left,
+    # and it holds nothing now.
+    _prune_table_directory(src_schema, name)
+    return "ok"
 
 
 def _move_table_sync(src_schema: str, dst_schema: str, name: str) -> str:
     conn = duckdb_engine.get_connection()
-    src = f"lakehouse.{quote_ident(src_schema)}.{quote_ident(name)}"
-    dst = f"lakehouse.{quote_ident(dst_schema)}"
     try:
         if not _lakehouse_table_exists(conn, src_schema, name):
             return "missing"
-        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {dst}")
-        if _lakehouse_table_exists(conn, dst_schema, name):
-            return "exists"
-        try:
-            conn.execute(f"ALTER TABLE {src} SET SCHEMA {dst}")
-        except Exception:
-            # DuckLake may not support SET SCHEMA yet; a copy-then-drop is the honest
-            # fallback and still ends with the data in exactly one place.
-            conn.execute(f"CREATE TABLE {dst}.{quote_ident(name)} AS SELECT * FROM {src}")
-            conn.execute(f"DROP TABLE {src}")
-        return "ok"
+        return _move_table_on(conn, src_schema, dst_schema, name)
+    finally:
+        conn.close()
+
+
+def _rename_directory_sync(old_rel_path: str, new_rel_path: str) -> tuple[int, int]:
+    """Moves every table a folder owns into the renamed schemas.
+
+    Returns ``(moved, skipped)``. Nothing moves when a destination table already exists:
+    overwriting it would destroy rows the user did not name, so the conflicts are counted and
+    the caller reports them, leaving the folder exactly as it was.
+
+    The old schemas are dropped once they are empty — a rename that left ``raw`` behind
+    beside ``marts`` would show the same tables twice in the tree.
+    """
+    old_prefix = _lakehouse_schema(old_rel_path)
+    new_prefix = _lakehouse_schema(new_rel_path)
+    conn = duckdb_engine.get_connection()
+    try:
+        tables = _live_tables_in(conn, old_prefix)
+
+        def destination(schema: str) -> str:
+            return new_prefix + schema[len(old_prefix):]
+
+        conflicts = [
+            table for schema, table in tables if _lakehouse_table_exists(conn, destination(schema), table)
+        ]
+        if conflicts:
+            return 0, len(conflicts)
+
+        moved = 0
+        for schema, table in tables:
+            if _move_table_on(conn, schema, destination(schema), table) == "ok":
+                moved += 1
+        for schema in sorted({schema for schema, _ in tables}, key=len, reverse=True):
+            try:
+                conn.execute(f"DROP SCHEMA IF EXISTS {SOURCE}.{quote_ident(schema)}")
+            except Exception:
+                # A schema that still holds something is not a reason to fail the rename
+                # that already happened; it just stays until the next attempt.
+                pass
+        return moved, len(conflicts)
+    finally:
+        conn.close()
+
+
+def _delete_directory_sync(rel_path: str, cascade: bool) -> int:
+    """Drops every table a folder owns, then the schemas themselves.
+
+    Returns the number of tables dropped, or ``-n`` when ``n`` tables exist and ``cascade``
+    is false: deleting a folder that still holds tables is the caller's decision to confirm,
+    not something to do quietly. Dropping them is what makes the folder safe to remove from
+    disk — DuckLake derives a table's data directory from its schema, so a folder on its own
+    means nothing to it.
+    """
+    prefix = _lakehouse_schema(rel_path)
+    conn = duckdb_engine.get_connection()
+    try:
+        tables = _live_tables_in(conn, prefix)
+        if tables and not cascade:
+            return -len(tables)
+        for schema, table in tables:
+            conn.execute(
+                f"DROP TABLE IF EXISTS {SOURCE}.{quote_ident(schema)}.{quote_ident(table)}"
+            )
+        # A dropped table leaves its data directory behind, empty, one level under the
+        # schema it belonged to. The folder itself is removed by the route.
+        for schema, table in tables:
+            _prune_table_directory(schema, table)
+        # Every schema the folder owns goes, not only the ones that held a table: an empty
+        # schema *is* an empty folder, and it is what the tree shows until it is dropped.
+        owned = [
+            schema
+            for schema in lakehouse_schemas(conn)
+            if schema == prefix or schema.startswith(f"{prefix}.")
+        ]
+        for schema in sorted(owned, key=len, reverse=True):
+            try:
+                conn.execute(f"DROP SCHEMA IF EXISTS {SOURCE}.{quote_ident(schema)}")
+            except Exception:
+                pass
+        return len(tables)
     finally:
         conn.close()
 from app.core.catalog import scan
-from app.core.storage import warehouse_storage
+from app.core.storage import prune_empty_dirs, warehouse_storage
 
 router = APIRouter(prefix="/api/catalog", tags=["catalog"])
 
@@ -602,6 +765,24 @@ def _clean_lakehouse_path(raw_path: str) -> str:
         raise _bad_request(exc) from exc
 
 
+def _folder_exists(rel_path: str) -> bool:
+    """Whether the catalog still describes this folder, even with nothing on disk.
+
+    The tree lists a folder the catalog describes even when its directory is gone — an
+    empty folder is a schema with nothing in it — so deleting what the tree shows must not
+    depend on a directory being there.
+    """
+    prefix = _lakehouse_schema(rel_path)
+    conn = duckdb_engine.get_connection()
+    try:
+        schemas = lakehouse_schemas(conn)
+    finally:
+        conn.close()
+    return any(
+        schema == prefix or schema.startswith(f"{prefix}.") for schema in schemas
+    )
+
+
 def _ensure_lakehouse_directory(target_dir: Path) -> None:
     """Creates a directory and drops a .gitkeep when it is empty.
 
@@ -612,15 +793,13 @@ def _ensure_lakehouse_directory(target_dir: Path) -> None:
         (target_dir / ".gitkeep").touch(exist_ok=True)
 
 
-def _parquet_files_under(directory: Path) -> List[Path]:
-    return list(directory.rglob("*.parquet"))
+def _prune_empty_dirs(directory: Path) -> None:
+    """Removes ``directory`` and any subdirectory that holds no files.
 
-
-def _first_parquet_named(root: Path, stem: str) -> Optional[Path]:
-    for candidate in root.rglob(f"{stem}.parquet"):
-        if candidate.is_file():
-            return candidate
-    return None
+    Kept as the one-call form the folder routes use: the shared helper wants the warehouse
+    root as well, because a directory outside it must never be touched.
+    """
+    prune_empty_dirs(settings.lakehouse_root_path, directory)
 
 
 @router.post("/lakehouse/directories")
@@ -643,6 +822,11 @@ async def rename_lakehouse_directory(
     """Renames a directory or subfolder and updates all associated metadata assets."""
     rel_path = _clean_lakehouse_path(req.path)
     new_name = _require_segment(req.new_name, "folder name")
+    if not rel_path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The lakehouse root cannot be renamed.",
+        )
 
     target_dir = settings.lakehouse_root_path / rel_path
     if not target_dir.exists() or not target_dir.is_dir():
@@ -659,14 +843,37 @@ async def rename_lakehouse_directory(
         )
 
     dest_rel_path = dest_dir.relative_to(settings.lakehouse_root_path).as_posix()
-    await asyncio.to_thread(target_dir.rename, dest_dir)
+    moved, skipped = await asyncio.to_thread(
+        _rename_directory_sync, rel_path, dest_rel_path
+    )
+    if skipped:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"{skipped} table(s) in '{rel_path}' would collide with a table of the same "
+                f"name in '{dest_rel_path}'. Nothing was moved."
+            ),
+        )
 
-    # The rows are a projection of the files, so there is nothing to recompute by hand:
-    # once the directory has moved, one refresh rewrites the affected rows.
+    # The catalog now points at the new schemas. A folder that held tables is left where it
+    # is: its Parquet belongs to old snapshots and is reclaimed by maintenance once those
+    # expire, whereas moving it now would move files nothing points at. A folder with no
+    # tables is pure scaffolding, so it is simply renamed.
+    if moved:
+        await asyncio.to_thread(_prune_empty_dirs, target_dir)
+        await asyncio.to_thread(_ensure_lakehouse_directory, dest_dir)
+    else:
+        await asyncio.to_thread(target_dir.rename, dest_dir)
+
     await catalog_service.refresh(db)
 
     invalidate_catalog_cache()
-    return {"status": "renamed", "old_path": rel_path, "new_path": dest_rel_path}
+    return {
+        "status": "renamed",
+        "old_path": rel_path,
+        "new_path": dest_rel_path,
+        "tables_moved": moved,
+    }
 
 @router.delete("/lakehouse/directories")
 @router.delete("/lakehouse/directories/{dir_name:path}")
@@ -682,24 +889,29 @@ async def delete_lakehouse_directory(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Path parameter is required.")
     rel_path = _clean_lakehouse_path(target_param)
     target_dir = settings.lakehouse_root_path / rel_path
-    if not target_dir.exists() or not target_dir.is_dir():
+    if not target_dir.is_dir() and not await asyncio.to_thread(_folder_exists, rel_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Directory '{rel_path}' does not exist in Lakehouse."
         )
 
-    parquet_files = await asyncio.to_thread(_parquet_files_under, target_dir)
-    if parquet_files and not cascade:
+    # The catalog decides what is in the folder, not a walk of it: DuckLake knows which
+    # tables a schema holds, and a table's bytes are only reachable through the catalog.
+    dropped = await asyncio.to_thread(_delete_directory_sync, rel_path, cascade)
+    if dropped < 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Directory '{rel_path}' contains {len(parquet_files)} Parquet table(s). Confirm deletion to remove directory and its tables."
+            detail=(
+                f"Directory '{rel_path}' contains {-dropped} table(s). "
+                "Confirm deletion to remove the directory and its tables."
+            ),
         )
 
     await asyncio.to_thread(shutil.rmtree, target_dir, True)
-    # Rows follow the files: the walk no longer sees them, so the projection drops them.
+    # Rows follow the catalog: the projection drops the ones whose tables are gone.
     await catalog_service.refresh(db)
     invalidate_catalog_cache()
-    return {"status": "deleted", "path": rel_path}
+    return {"status": "deleted", "path": rel_path, "tables_dropped": dropped}
 
 @router.put("/lakehouse/tables/rename")
 async def rename_lakehouse_table(
@@ -870,6 +1082,71 @@ def _lakehouse_table_entry(table: Any) -> Dict[str, Any]:
     }
 
 
+def _schema_folders(conn) -> set[str]:
+    """The folders the catalog owns, each with the parents a nested name implies.
+
+    A folder is a schema, so ``raw`` and ``raw.nested`` are ``raw`` and ``raw/nested``. The
+    parents are added too: a nested folder whose ``raw`` schema holds no tables is still a
+    folder inside ``raw``, not a folder at the root.
+    """
+    folders: set[str] = set()
+    for schema in lakehouse_schemas(conn):
+        parts = schema.split(".")
+        for depth in range(1, len(parts) + 1):
+            folders.add("/".join(parts[:depth]))
+    return folders
+
+
+def _user_folders(root: Path) -> set[str]:
+    """Folders a user made on purpose: the directories holding a ``.gitkeep``.
+
+    Creating a folder through the API is what puts the marker there, so it is the one piece
+    of on-disk evidence that a directory is a folder somebody asked for rather than
+    something DuckLake made for a table.
+    """
+    folders: set[str] = set()
+    if not root.is_dir():
+        return folders
+    for current, subdirs, files in os.walk(root):
+        subdirs[:] = sorted(name for name in subdirs if not name.startswith("."))
+        if ".gitkeep" not in files:
+            continue
+        directory = Path(current)
+        if directory != root:
+            folders.add(directory.relative_to(root).as_posix())
+    return folders
+
+
+def _lakehouse_folders_sync() -> List[str]:
+    """The Lakehouse folders the tree shows, as relative POSIX paths.
+
+    A walk of the warehouse cannot answer this. DuckLake gives every table a directory of
+    its own (``<schema>/<table>``, with ``<table>__obelisk_load`` beside it while a run is
+    loading), so a walk sees one folder per table and one per killed run — which is exactly
+    what the phantom folders were.
+
+    Two things are a folder, and the catalog answers both: a schema, which is what a folder
+    is, and a directory a user marked with ``.gitkeep``. A load table's directory is
+    excluded even when marked, because ``__obelisk_load`` names an ingest's working area
+    rather than anything a user could have asked for.
+    """
+    root = settings.lakehouse_root_path
+    conn = lakehouse_connection()
+    try:
+        folders = _schema_folders(conn)
+    finally:
+        conn.close()
+
+    return sorted(
+        (
+            folder
+            for folder in folders | _user_folders(root)
+            if not folder.rsplit("/", 1)[-1].endswith(LOAD_TABLE_SUFFIX)
+        ),
+        key=str.lower,
+    )
+
+
 @router.get("/tree")
 async def get_catalog_tree(
     refresh: bool = False,
@@ -887,18 +1164,23 @@ async def get_catalog_tree(
 
     tree: List[Dict[str, Any]] = []
 
-    # 1. Lakehouse. One walk of the warehouse feeds both answers — the tree the UI
-    # renders and the catalog rows — so the two cannot disagree about what exists.
+    # 1. Lakehouse. The table list comes from the catalog and the folder list from the
+    # schemas it describes, so the two cannot disagree about what exists — and a directory
+    # DuckLake made for a table's files is never mistaken for a folder.
     store = warehouse_storage()
     scan_result, directories = await asyncio.gather(
         asyncio.to_thread(scan, store),
-        asyncio.to_thread(store.list_directories),
+        asyncio.to_thread(_lakehouse_folders_sync),
     )
     await catalog_service.refresh(db, scan_result)
 
     tables_by_dir: Dict[str, List[Dict[str, Any]]] = {}
     for table in scan_result.tables:
-        tables_by_dir.setdefault(table.folder, []).append(_lakehouse_table_entry(table))
+        # A nested folder is one schema with dots in its name (``raw/nested`` is
+        # ``raw.nested``), so the folder a table belongs to is its schema with slashes.
+        tables_by_dir.setdefault(table.folder.replace(".", "/"), []).append(
+            _lakehouse_table_entry(table)
+        )
 
     lakehouse_directories: List[Dict[str, Any]] = []
     all_lakehouse_tables: List[Dict[str, Any]] = []
@@ -1039,40 +1321,36 @@ async def get_table_preview(
         or is_root
         or tier_dir is not None
     ):
-        parquet_file = None
-
-        if is_root:
-            candidate = lakehouse_root / f"{table_name}.parquet"
-            if candidate.exists():
-                parquet_file = candidate
-
-        if not parquet_file and tier_dir is not None:
-            candidate = tier_dir / f"{table_name}.parquet"
-            if candidate.exists():
-                parquet_file = candidate
-
-        # Fallbacks: check directly in lakehouse root or search all subdirectories
-        if not parquet_file or not parquet_file.exists():
-            flat = lakehouse_root / f"{table_name}.parquet"
-            if flat.exists():
-                parquet_file = flat
-            else:
-                parquet_file = await asyncio.to_thread(
-                    _first_parquet_named, lakehouse_root, table_name
-                )
-
         # The table's address comes from the catalog, not from a file: DuckLake decides
-        # which files belong to it. Nothing is resolved from the filesystem here, so
-        # there is no path to escape and no "another folder's file with the same name"
-        # fallback - an absent table is a 404.
+        # which files belong to it. Nothing is resolved from the filesystem here, so there
+        # is no path to escape — and the folder is part of the match, because `raw/orders`
+        # and `marts/orders` are two different tables.
         from app.core.catalog import scan as scan_lakehouse
 
         catalogue = await asyncio.to_thread(scan_lakehouse)
-        match = next((t for t in catalogue.tables if t.name == table_name), None)
+        # `folder` on a scanned table is the schema's spelling, where a nested folder is one
+        # dotted name (`raw/nested` is `raw.nested`), so the two are compared as schemas.
+        wanted_folder = "" if is_root else _lakehouse_schema(clean_tier)
+        match = next(
+            (
+                t
+                for t in catalogue.tables
+                if t.name == table_name and (t.folder or "") == wanted_folder
+            ),
+            None,
+        )
+        if match is None and is_root:
+            # A bare name is a convenience, and only while it names exactly one table.
+            candidates = [t for t in catalogue.tables if t.name == table_name]
+            if len(candidates) == 1:
+                match = candidates[0]
         if match is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Table '{table_name}' does not exist in the lakehouse.",
+                detail=(
+                    f"Table '{table_name}' does not exist in folder "
+                    f"'{wanted_folder or 'root'}'."
+                ),
             )
 
         query = f"SELECT * FROM {match.sql_name} LIMIT 50;"
@@ -1160,4 +1438,171 @@ async def get_table_preview(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch preview from source: {str(e)}"
         )
+
+
+# -- lakehouse diagnostics and maintenance ------------------------------------
+#
+# The Settings tabs need two things the lakehouse could only tell a shell script: what it
+# currently costs, and a way to compact and reclaim it. Both are one connection and a few
+# catalog queries, so both are handed to a worker thread — a DuckDB call on the event loop
+# would stall every other request (audit: async routes must not block).
+
+
+def _file_bytes(path: Path) -> int:
+    """Size of one file, or 0 when it is not there. A missing store is not an error."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _directory_bytes(path: Path) -> int:
+    """Total size of the files under a directory, skipping anything unreadable."""
+    total = 0
+    if not path.is_dir():
+        return 0
+    for entry in path.rglob("*"):
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _catalog_counts(conn) -> Dict[str, int]:
+    """What the catalog holds right now: snapshots, live tables, data files and bytes."""
+    snapshots = int(
+        conn.execute(f"SELECT count(*) FROM ducklake_snapshots('{SOURCE}')").fetchall()[0][0]
+    )
+    return {
+        "snapshots": snapshots,
+        "active_tables": len(lakehouse_tables(conn)),
+        **_active_file_totals(conn),
+    }
+
+
+def _active_file_totals(conn) -> Dict[str, int]:
+    row = conn.execute(
+        f"SELECT count(*), coalesce(sum(file_size_bytes), 0) "
+        f"FROM __ducklake_metadata_{SOURCE}.ducklake_data_file "
+        f"WHERE end_snapshot IS NULL"
+    ).fetchall()[0]
+    return {"data_files": int(row[0]), "data_bytes": int(row[1] or 0)}
+
+
+def _lakehouse_diagnostics_sync() -> Dict[str, Any]:
+    """Everything the Storage & Diagnostics tabs show, in one connection."""
+    root = settings.lakehouse_root_path
+    conn = lakehouse_connection()
+    try:
+        counts = _catalog_counts(conn)
+        orphans = len(load_tables(conn))
+    finally:
+        conn.close()
+    return {
+        "storage_uri": settings.STORAGE_URI,
+        "lakehouse_root": str(root),
+        "catalog_sqlite_bytes": _file_bytes(Path(settings.lakehouse_catalog_path)),
+        "obelisk_db_bytes": _file_bytes(Path(settings.sqlite_db_path)),
+        "duckdb_tmp_bytes": _directory_bytes(settings.duckdb_temp_path),
+        "duckdb_tmp_limit": settings.DUCKDB_TEMP_SIZE_LIMIT,
+        "duckdb_memory_limit_per_slot": advisor.get_duckdb_memory_limit(
+            settings.DUCKDB_MAX_CONCURRENT_HEAVY
+        ),
+        "snapshot_count": counts["snapshots"],
+        "active_table_count": counts["active_tables"],
+        "active_data_files": counts["data_files"],
+        "total_data_bytes": counts["data_bytes"],
+        # A load table is a run that was killed: the tab shows it so a user can see what a
+        # crash left behind before maintenance reclaims it.
+        "orphaned_load_tables": orphans,
+    }
+
+
+class LakehouseMaintainRequest(BaseModel):
+    """How much history to keep, and whether to delete the bytes it held."""
+
+    keep_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description="Snapshots older than this are expired; time travel beyond it is gone.",
+    )
+    delete_files: bool = Field(
+        default=True,
+        description=(
+            "Also delete files no snapshot references. Irreversible: keep it on for a "
+            "reclaim, turn it off to only compact and expire."
+        ),
+    )
+
+
+def _maintain_lakehouse_sync(keep_days: int, delete_files: bool) -> Dict[str, Any]:
+    """Compacts, expires and reclaims, and reports what each step did.
+
+    The order matters. Load tables go first: a killed run's leftovers reference bytes that
+    nothing will ever read, and expiring snapshots before dropping them would keep those
+    bytes alive for another retention window. The empty-directory sweep goes last, because
+    it is what the previous steps leave behind.
+    """
+    conn = lakehouse_connection()
+    try:
+        before = _catalog_counts(conn)
+        orphans = drop_load_tables(conn)
+
+        merged = conn.execute(
+            f"CALL ducklake_merge_adjacent_files('{SOURCE}');"
+        ).fetchall()
+
+        older_than = datetime.now(timezone.utc) - timedelta(days=keep_days)
+        expired = conn.execute(
+            f"CALL ducklake_expire_snapshots('{SOURCE}', "
+            f"older_than => TIMESTAMPTZ '{older_than.isoformat()}');"
+        ).fetchall()
+
+        removed: List[Any] = []
+        if delete_files:
+            removed = conn.execute(
+                f"CALL ducklake_cleanup_old_files('{SOURCE}', cleanup_all => true);"
+            ).fetchall()
+
+        after = _catalog_counts(conn)
+    finally:
+        conn.close()
+
+    # 4. Sweep the directories those drops and expiries emptied. The connection is closed
+    #    first: a directory with a file handle still open on it cannot be removed here.
+    pruned = prune_empty_dirs(settings.lakehouse_root_path)
+
+    return {
+        "status": "ok",
+        "orphaned_load_tables_dropped": len(orphans),
+        "tables_compacted": len(merged),
+        "snapshots_expired": len(expired),
+        "files_removed": len(removed),
+        "empty_directories_removed": pruned,
+        "delete_files": delete_files,
+        "keep_days": keep_days,
+        "before": before,
+        "after": after,
+    }
+
+
+@router.get("/lakehouse/diagnostics")
+async def get_lakehouse_diagnostics() -> Dict[str, Any]:
+    """Live storage and catalog facts for the Settings → Storage & Diagnostics tabs."""
+    return await asyncio.to_thread(_lakehouse_diagnostics_sync)
+
+
+@router.post("/lakehouse/maintain")
+async def maintain_lakehouse(req: LakehouseMaintainRequest) -> Dict[str, Any]:
+    """Compacts small files, expires old snapshots and reclaims orphaned bytes.
+
+    Run it when no ingest is running. Deleting files is irreversible, so the response
+    reports the snapshot and file counts before and after rather than just \"done\".
+    """
+    return await asyncio.to_thread(
+        _maintain_lakehouse_sync, req.keep_days, req.delete_files
+    )
 

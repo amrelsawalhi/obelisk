@@ -86,6 +86,34 @@ STEP_REF = re.compile(r"\{\{\s*steps\.([A-Za-z0-9_\-]+)\.([A-Za-z0-9_]+)\s*\}\}"
 STEP_REF_PLAIN = re.compile(r"(?<!\{)\{steps\.([A-Za-z0-9_\-]+)\.([A-Za-z0-9_]+)\}(?!\})")
 
 
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kills a child *and everything it spawned*.
+
+    ``Popen.kill()`` reaps one PID. A step that runs dbt, a notebook or a Spark
+    job spawns grandchildren, and on Windows and POSIX alike those keep running
+    (and keep their memory, their ports and their file locks) after the step has
+    been reported cancelled or timed out. Walking the real process tree is the only
+    way to stop the work the operator asked to stop.
+    """
+    try:
+        import psutil
+
+        parent = psutil.Process(proc.pid)
+        for child in parent.children(recursive=True):
+            try:
+                child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        parent.kill()
+    except Exception:
+        # The helper is best-effort: the child may already be gone, or psutil may
+        # refuse the handle. Never let cancellation fail because cleanup did.
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _stringify(value: Any) -> str:
     """Text form of a captured value.
 
@@ -359,10 +387,7 @@ class PipelineEngine:
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()
         for proc in list(self._procs.values()):
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            _kill_process_tree(proc)
         self._procs.clear()
 
         pending = [task for task in self._tasks if not task.done()]
@@ -746,10 +771,7 @@ class PipelineEngine:
                 elif step_run.status == "running":
                     proc = self._procs.get(step_run.id)
                     if proc is not None:
-                        try:
-                            proc.kill()
-                        except OSError:
-                            pass
+                        _kill_process_tree(proc)
             await session.commit()
         # Finalize right away so the status flips even when no tick is running
         # (tests, or a cancel during shutdown).
@@ -1491,9 +1513,8 @@ class PipelineEngine:
         rel_path = path_for(folder, name)
 
         def _write() -> Dict[str, Any]:
-            arrow = sdk.query_arrow(sql)
-            saved = sdk.save(arrow, rel_path, sync_postgres=False)
-            return {"rows": int(arrow.num_rows), "saved": saved}
+            saved = sdk.materialize_sql(sql, rel_path)
+            return {"rows": int(saved["num_rows"]), "saved": saved}
 
         outcome = await asyncio.wait_for(asyncio.to_thread(_write), timeout=timeout)
         # The published value is the name a later step can query, so binding a table
@@ -1571,19 +1592,15 @@ class PipelineEngine:
                     pass
 
                 if time.monotonic() > deadline and not finished:
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+                    _kill_process_tree(proc)
                     raise asyncio.TimeoutError
 
                 if run_id in self._cancel_runs and not finished:
                     # Kill the child as soon as the operator asks, instead of letting
-                    # it run to completion and only then reporting "cancelled".
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
+                    # it run to completion and only then reporting "cancelled". The
+                    # whole tree goes: a dbt or notebook step leaves grandchildren
+                    # that would otherwise keep writing after the run says "cancelled".
+                    _kill_process_tree(proc)
                     raise StepCancelled()
 
                 if time.monotonic() - last_flush >= 1.0:

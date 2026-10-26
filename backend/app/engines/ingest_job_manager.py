@@ -224,8 +224,8 @@ class IngestJobManager:
                     self.update_progress,
                     job_id,
                     current_phase=phase,
-                    # Deliberately not total_rows: these rows are in the temp table, and a
-                    # write that fails must not leave them counted as ingested.
+                    # Deliberately not total_rows: these rows are staged, not committed — a
+                    # load that fails must not leave them counted as ingested.
                     staged_rows=staged,
                 )
             )

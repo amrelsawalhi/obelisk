@@ -121,12 +121,23 @@ class ResourceAdvisor:
             "remaining_safe_gb": remaining_safe_gb,
         }
 
-    def get_duckdb_memory_limit(self) -> str:
-        """Returns safe memory limit for DuckDB connection initialization."""
+    def get_duckdb_memory_limit(self, concurrent_slots: int = 4) -> str:
+        """Returns safe per-connection memory limit for DuckDB initialization.
+
+        The limit is a share of the RAM the host can still safely give away, divided by
+        the number of connections expected to be heavy at the same time. Giving every
+        connection 25% of total RAM (the previous rule) let four concurrent queries ask
+        for the whole machine.
+        """
         specs = self.get_host_specs()
-        total_gb = specs["total_ram_gb"]
-        limit_gb = max(1, min(16, int(total_gb * 0.25)))
-        return f"{limit_gb}GB"
+        active = self.get_active_container_allocations()
+        remaining_safe_gb = max(
+            2.0, specs["max_safe_allocation_gb"] - active["total_allocated_gb"]
+        )
+        slots = max(1, int(concurrent_slots))
+        # Allocate at most 50% of remaining safe host RAM across concurrent DuckDB slots
+        per_slot_gb = max(1, min(12, int((remaining_safe_gb * 0.50) / slots)))
+        return f"{per_slot_gb}GB"
 
     def get_spark_memory_limit(self) -> str:
         """Returns safe memory limit string for PySpark driver initialization (e.g. '2g', '4g')."""

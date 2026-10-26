@@ -199,6 +199,63 @@ class LocalWarehouse:
         return self._resolve(rel).as_posix()
 
 
+def prune_empty_dirs(
+    root: Path | str,
+    start: Path | str | None = None,
+    *,
+    dry_run: bool = False,
+) -> int:
+    """Removes the directories under ``root`` that hold neither a file nor a directory.
+
+    A lakehouse table is not a directory — the catalog decides what exists — but DuckLake
+    still derives a data directory from the table's schema (``<root>/<schema>/<table>``),
+    and dropping a table or reclaiming the files of an expired snapshot leaves that
+    directory behind, empty. Nothing in the catalog points at it, yet a walk of the
+    warehouse reports it as a folder, which is how a dropped table kept appearing in the
+    tree.
+
+    Two kinds of directory are deliberately kept:
+
+    * one holding a ``.gitkeep`` — that marker is how a user says "I made this folder on
+      purpose", so an empty folder with one is a folder rather than a leftover;
+    * a dot-named directory anywhere in the path — the platform's own bookkeeping, which
+      is never a folder a user created.
+
+    ``start`` bounds the walk to one subtree, which is what a delete or an ingest needs:
+    the directory it just emptied, not the whole warehouse. Without it the whole tree is
+    swept, which is what maintenance does. ``dry_run`` reports the count and removes
+    nothing.
+
+    The walk is bottom-up so a directory whose children were all removed is itself removed
+    in the same pass. Returns how many directories were removed (or would be).
+    """
+    base = Path(root).expanduser().resolve()
+    target = Path(start).expanduser().resolve() if start is not None else base
+    if not target.is_dir() or (target != base and base not in target.parents):
+        return 0
+
+    removed: set[Path] = set()
+    for current, subdirs, files in os.walk(target, topdown=False):
+        directory = Path(current)
+        if directory == base:
+            continue
+        relative = directory.relative_to(base)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        if ".gitkeep" in files:
+            continue
+        # A child that survived this walk still holds something, so neither does this go.
+        if any((directory / name) not in removed for name in subdirs):
+            continue
+        if not dry_run:
+            try:
+                directory.rmdir()
+            except OSError:
+                continue
+        removed.add(directory)
+    return len(removed)
+
+
 _storage: LocalWarehouse | None = None
 _storage_root: str | None = None
 

@@ -15,6 +15,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from app.core.catalog import (
+    LOAD_TABLE_SUFFIX,
     SOURCE,
     InvalidTablePath,
     fqn_for,
@@ -146,15 +147,11 @@ def write_table(schema: str, table: str, rows: int = 3, extra_column: bool = Fal
     conn = duckdb_engine.get_connection()
     try:
         conn.execute(f'CREATE SCHEMA IF NOT EXISTS lakehouse."{schema}";')
-        assert ingest_engine._stage_batches(conn, [pa.table(data)]) == rows
-        ingest_engine._write_staged(
-            conn,
-            target=f'lakehouse."{schema}".{table}',
-            mode="snapshot",
-            exists=False,
-            write_strategy="append",
-            primary_key=None,
-            watermark_column=None,
+        target = f'lakehouse."{schema}".{table}'
+        load = ingest_engine._target_sql(schema, f"{table}{LOAD_TABLE_SUFFIX}")
+        assert ingest_engine._stage_batches(conn, [pa.table(data)], sink=load, create=True) == rows
+        ingest_engine._swap_into_place(
+            conn, schema=schema, staged=load, target=target, table=table
         )
     finally:
         conn.close()
@@ -188,6 +185,35 @@ def test_scan_reads_what_the_catalog_holds(schema):
     assert [column["name"] for column in table.columns] == ["id", "name", "amount"]
     assert table.modified_at.tzinfo == timezone.utc
     assert result.problems == (), "a healthy catalog reports no problems"
+
+
+def test_the_bulk_column_read_answers_exactly_what_describe_would(schema):
+    """One query for the whole catalog, spelling types the way DuckDB spells them.
+
+    DuckLake's own metadata stores ``int32`` and ``varchar``; the catalog has always shown
+    what ``DESCRIBE`` shows, so the fast path is pinned to the per-table read it replaced —
+    and to the names a user reads in the column list.
+    """
+    from app.core.catalog import lakehouse_all_columns, lakehouse_columns
+    from app.engines.duckdb_engine import duckdb_engine
+
+    write_table(schema, "orders", rows=3, extra_column=True)
+    write_table(schema, "no_amount", rows=1)
+
+    conn = duckdb_engine.get_connection()
+    try:
+        bulk = lakehouse_all_columns(conn)
+        assert bulk[(schema, "orders")] == lakehouse_columns(conn, schema, "orders")
+        assert bulk[(schema, "no_amount")] == lakehouse_columns(conn, schema, "no_amount")
+    finally:
+        conn.close()
+
+    table = next(t for t in scan().tables if t.fqn == f"lakehouse.{schema}.orders")
+    assert [column["data_type"] for column in table.columns] == [
+        "BIGINT",
+        "VARCHAR",
+        "DOUBLE",
+    ]
 
 
 def test_a_dropped_table_disappears_from_the_catalog(schema):

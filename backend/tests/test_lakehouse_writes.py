@@ -44,16 +44,41 @@ def _batch(ids, amounts, stamps):
 
 
 def _write(engine, conn, schema, batch, mode, strategy="append", key=None, watermark=None):
-    assert engine._stage_batches(conn, [batch]) == batch.num_rows
-    engine._write_staged(
-        conn,
-        target=f"lakehouse.{schema}.orders",
+    """Streams one batch into the sink the strategy picks, then applies it.
+
+    That is the path an ingest takes: a snapshot and an upsert stream into a load table
+    beside the target, and only an append writes into the target as it arrives.
+    """
+    engine._require_primary_key(strategy, key)
+    target = f"lakehouse.{schema}.orders"
+    exists = mode != "snapshot"
+    sink, create, load = engine._batch_sink(
+        schema=schema,
+        table="orders",
+        target=target,
         mode=mode,
-        exists=(mode != "snapshot"),
+        exists=exists,
         write_strategy=strategy,
-        primary_key=key,
-        watermark_column=watermark,
     )
+    assert engine._stage_batches(conn, [batch], sink=sink, create=create) == batch.num_rows
+    if load is None:
+        return
+    if strategy == "upsert":
+        engine._upsert_from_load(
+            conn,
+            schema=schema,
+            staged=sink,
+            target=target,
+            table="orders",
+            mode=mode,
+            exists=exists,
+            primary_key=key,
+            watermark_column=watermark,
+        )
+    else:
+        engine._swap_into_place(
+            conn, schema=schema, staged=sink, target=target, table="orders"
+        )
 
 
 def test_snapshot_writes_every_row(lake):

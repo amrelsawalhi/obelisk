@@ -1,13 +1,28 @@
 """Ingestion writes into the lakehouse catalog.
 
-Every source is staged in a temporary DuckDB table and then written with one statement:
-``CREATE OR REPLACE`` for a snapshot, ``INSERT`` for an incremental append, ``MERGE INTO``
-for an upsert. Nothing is concatenated in Python, so the size of the existing table never
-becomes a Python object — the old path materialised the whole history to merge 40 MB —
-and a failed run leaves the previous table exactly as it was.
+No run waits for the whole source to arrive before it writes anything.
 
-Postgres is read by DuckDB itself (one statement, no copies). The other drivers stream
-their cursor in batches, so their memory footprint is one batch rather than one table.
+Postgres is read by DuckDB itself, so one statement reads the source and writes the
+lakehouse table: no staging table, no Arrow, no second copy of the rows.
+
+The other drivers stream their cursor in batches and each chunk is committed straight into
+the lake as Parquet. The old path put every row of every source into ``TEMP TABLE
+staging`` first, which is capped by ``DUCKDB_TEMP_SIZE_LIMIT`` — a 150 GB table could never
+finish, whatever the machine's disk held.
+
+A snapshot streams into a load table beside its target and is swapped in with two catalog
+operations, so a reader sees the whole previous table or the whole new one, never a
+half-written one. An incremental append has nothing to swap — the rows belong in the
+target — and since the watermark is read back from the table, a rerun continues exactly
+where a failed run stopped.
+
+The one thing an upsert cannot do is stream *into the target*: deduplication is a
+question about the whole incoming set at once. It streams into the same kind of load
+table and answers that question there, in the lake — a first load is deduplicated into
+the clean table that is swapped in, a later one is ``MERGE``d from it. So no write
+strategy is bounded by ``DUCKDB_TEMP_SIZE_LIMIT`` any more: a load table is Parquet on the
+machine's disk, and the worst case of a deduplication is a sort DuckDB may spill, not a
+copy of the source queued in the temp directory.
 """
 from __future__ import annotations
 
@@ -15,7 +30,7 @@ import itertools
 import json
 import logging
 import uuid
-from typing import Any, Callable, Dict, Iterable, Iterator, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Sequence
 
 import httpx
 import oracledb
@@ -23,14 +38,29 @@ import pyarrow as pa
 import pymysql
 from pymongo import MongoClient
 
-from app.core.catalog import SOURCE, quote_ident, validate_column, validate_segment
+from app.config import settings
+from app.core.catalog import (
+    LOAD_TABLE_SUFFIX,
+    SOURCE,
+    quote_ident,
+    table_directory,
+    validate_column,
+    validate_segment,
+)
 from app.core.dsn import build_pg_dsn, sql_ident, sql_string, validate_alias
 from app.core.host_resolver import resolve_connection_host
+from app.core.storage import prune_empty_dirs
 from app.engines.duckdb_engine import duckdb_engine
 
 logger = logging.getLogger(__name__)
 
 BATCH_ROWS = 50_000
+
+# Rows buffered before one commit into the lake. Committing every batch would create a
+# DuckLake snapshot — and at least one Parquet file — per 50 000 rows, which is thousands
+# of files for a 100 M-row table; the cost of that metadata is paid later by every scan.
+# The buffer is what memory holds, so it is a row count and not "however much arrives".
+STAGE_COMMIT_ROWS = 500_000
 
 
 def _watermark_is_newer(value: Any, reference: Any) -> bool:
@@ -55,14 +85,25 @@ def _literal(value: Any) -> str:
     return sql_string(str(value))
 
 
-def _arrow_batch(columns: Iterable[str], rows: Iterable[Iterable[Any]]) -> pa.Table:
-    """Builds one Arrow batch from column names and row tuples, preserving types."""
+def _arrow_batch(columns: Iterable[str], rows: Sequence[Sequence[Any]]) -> pa.Table:
+    """Builds one Arrow batch from column names and row tuples, preserving types.
+
+    ``zip(*rows)`` transposes in C. The per-cell loop it replaces ran once for every cell
+    of every batch, which for a 100 M-row table is the difference between an ingest that
+    uses the core it was given and one that spends the night in the interpreter.
+    """
     names = list(columns)
-    data: Dict[str, list] = {name: [] for name in names}
-    for row in rows:
-        for name, value in zip(names, row):
-            data[name].append(value)
-    return pa.Table.from_pydict(data)
+    if not rows:
+        return pa.Table.from_pydict({name: [] for name in names})
+    return pa.Table.from_pydict(dict(zip(names, zip(*rows))))
+
+
+def _cells(row: Sequence[Any]) -> tuple:
+    """One driver row with Arrow-friendly values: BSON/JSON objects become text."""
+    return tuple(
+        json.dumps(value, default=str) if isinstance(value, (dict, list)) else value
+        for value in row
+    )
 
 
 def _bt(value: object) -> str:
@@ -110,7 +151,13 @@ class IngestEngine:
 
     @staticmethod
     def _exists(conn, schema: str, table: str) -> bool:
-        row = conn.execute(
+        """Whether the catalog lists the table.
+
+        Read with ``fetchall`` on purpose: on this DuckDB build a result read with
+        ``fetchone`` stays open on the connection, and nothing else may be registered or
+        run on it until the result is drained.
+        """
+        rows = conn.execute(
             f"""
             SELECT 1
             FROM __ducklake_metadata_{SOURCE}.ducklake_table AS t
@@ -122,25 +169,25 @@ class IngestEngine:
             LIMIT 1
             """,
             [schema, table],
-        ).fetchone()
-        return row is not None
+        ).fetchall()
+        return bool(rows)
 
     @staticmethod
     def _max_watermark(conn, target: str, column: str):
         """The highest watermark already stored, asked of the table itself."""
         try:
-            value = conn.execute(
+            rows = conn.execute(
                 f"SELECT max({quote_ident(column)}) FROM {target}"
-            ).fetchone()
+            ).fetchall()
         except Exception:
             return None
-        if not value or value[0] is None:
+        if not rows or rows[0][0] is None:
             return None
-        return value[0]
+        return rows[0][0]
 
     @staticmethod
     def _row_count(conn, target: str) -> int:
-        return int(conn.execute(f"SELECT count(*) FROM {target}").fetchone()[0])
+        return int(conn.execute(f"SELECT count(*) FROM {target}").fetchall()[0][0])
 
     @staticmethod
     def _columns(conn, table: str) -> list[str]:
@@ -150,32 +197,165 @@ class IngestEngine:
 
     @staticmethod
     def _stage_batches(
-        conn, batches: Iterable[pa.Table], on_batch: Optional[Callable[[int], None]] = None
+        conn,
+        batches: Iterable[pa.Table],
+        sink: str,
+        on_batch: Optional[Callable[[int], None]] = None,
+        create: bool = False,
+        commit_rows: int = STAGE_COMMIT_ROWS,
     ) -> int:
-        """Fills a temp table named ``staging`` from Arrow batches; returns rows read.
+        """Writes Arrow batches into ``sink``; returns the rows read.
+
+        The rows are committed every ``commit_rows`` rows, so they become Parquet on the
+        machine's disk instead of rows waiting in the DuckDB temp directory — which is what
+        turns the size of a load into a disk question rather than a
+        ``DUCKDB_TEMP_SIZE_LIMIT`` question.
+
+        ``create`` makes the first batch define the sink, which is how a load table is
+        started; re-creating it also discards whatever a crashed earlier run left behind.
+        Without it the sink must already exist and rows are appended to it.
 
         ``on_batch`` receives the running total after each batch. One large table is the
-        case where a status line with no counter looks wedged, and this is the only
-        progress signal it produces before the write statement runs.
+        case where a status line with no counter looks wedged, and a streamed load has no
+        other signal until its swap.
         """
         total = 0
+        pending: list[pa.Table] = []
+        pending_rows = 0
+        created = False
+
+        def execute_with(chunk: pa.Table, statement: str) -> None:
+            conn.register("_obelisk_batch", chunk)
+            try:
+                # The result is drained on purpose: DuckDB refuses to register the next
+                # chunk while a previous statement's result is still open on the
+                # connection, and a commit returns one row ("Count") whatever it wrote.
+                conn.execute(statement).fetchall()
+            finally:
+                conn.unregister("_obelisk_batch")
+
+        def flush() -> None:
+            nonlocal pending, pending_rows
+            if not pending:
+                return
+            chunk = pending[0] if len(pending) == 1 else pa.concat_tables(pending)
+            pending, pending_rows = [], 0
+            execute_with(chunk, f"INSERT INTO {sink} SELECT * FROM _obelisk_batch")
+
         for batch in batches:
             if batch.num_rows == 0:
                 continue
-            conn.register("_obelisk_batch", batch)
-            try:
-                if total == 0:
-                    conn.execute(
-                        "CREATE OR REPLACE TEMP TABLE staging AS SELECT * FROM _obelisk_batch"
-                    )
-                else:
-                    conn.execute("INSERT INTO staging SELECT * FROM _obelisk_batch")
-            finally:
-                conn.unregister("_obelisk_batch")
+            if create and not created:
+                execute_with(
+                    batch,
+                    f"CREATE OR REPLACE TABLE {sink} AS SELECT * FROM _obelisk_batch",
+                )
+                created = True
+            else:
+                pending.append(batch)
+                pending_rows += batch.num_rows
+                if pending_rows >= commit_rows:
+                    flush()
             total += batch.num_rows
             if on_batch is not None:
                 on_batch(total)
+        flush()
         return total
+
+    def _batch_sink(
+        self,
+        *,
+        schema: str,
+        table: str,
+        target: str,
+        mode: str,
+        exists: bool,
+        write_strategy: str,
+    ) -> tuple[str, bool, Optional[str]]:
+        """Where streamed batches land: ``(sink, create, load_table)``.
+
+        A snapshot and an upsert both stream into a load table beside the target — a
+        snapshot because it replaces the target when it is complete, an upsert because
+        deduplication needs the incoming rows as a set, and a set read from Parquet in the
+        lake is not bounded by ``DUCKDB_TEMP_SIZE_LIMIT`` the way a temp table is.
+
+        An incremental append has nothing to swap and nothing to deduplicate: the rows
+        belong in the target, so they go straight there and the load is resumable because
+        the watermark is read back from the table.
+        """
+        if mode == "snapshot" or not exists or write_strategy == "upsert":
+            load = f"{table}{LOAD_TABLE_SUFFIX}"
+            return self._target_sql(schema, load), True, load
+        return target, False, None
+
+    def _prune_load_directory(self, schema: str, directory: str) -> None:
+        """Removes the directory a load table leaves behind once it is dropped.
+
+        DuckLake derives a table's data directory from the schema, and a drop does not take
+        the directory with it — nor does renaming the load table into place move its
+        Parquet, which is why a table that outgrew DuckLake's inlining keeps its files under
+        the load table's name. A directory that still holds a file therefore belongs to the
+        live table and stays; only an empty one — an inlined load, or a drop whose files
+        ``ducklake_cleanup_old_files`` already reclaimed — is scaffolding, and an empty
+        directory is what made a table appear in the tree as a folder.
+
+        ``directory`` is the load table's own name, suffix included, because the catalog
+        has already forgotten the table by the time this runs — the directory is found on
+        disk instead. A nested folder's schema directory is named by DuckLake itself, so
+        maintenance's sweep of the whole warehouse is what catches anything this misses.
+        """
+        root = settings.lakehouse_root_path
+        prune_empty_dirs(root, table_directory(root, schema, directory))
+
+    def _swap_into_place(self, conn, *, schema: str, staged: str, target: str, table: str) -> None:
+        """Makes a finished load table the live one, atomically.
+
+        ``DROP`` and ``RENAME`` are catalog operations inside one DuckLake transaction: a
+        reader sees the whole previous table or the whole new one, never a half-written
+        one — and not a single row is read back through Python to do it.
+        """
+        try:
+            conn.execute("BEGIN TRANSACTION;")
+            conn.execute(f"DROP TABLE IF EXISTS {target};")
+            conn.execute(f"ALTER TABLE {staged} RENAME TO {quote_ident(table)};")
+            conn.execute("COMMIT;")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK;")
+            except Exception as rollback_error:
+                logger.warning(
+                    "Rolling back the swap of %s failed as well: %s", target, rollback_error
+                )
+            raise
+        # The load table's name is gone. Its directory may be empty — an inlined load — or
+        # it may hold the Parquet the rename did not move, which is the live table's.
+        self._prune_load_directory(schema, f"{table}{LOAD_TABLE_SUFFIX}")
+
+    def _drop_load_table(self, conn, *, schema: str, table: str) -> None:
+        """Removes a load table an earlier run left behind, before this run takes the name.
+
+        A ``finally`` cannot run when the process is killed outright — SIGKILL, an OOM
+        kill, a machine losing power — so a retry can find the previous attempt's load
+        table still in the catalog. Dropping it first is what makes the retry start from
+        nothing instead of writing today's rows into yesterday's half-written load.
+        """
+        if self._exists(conn, schema, table):
+            logger.warning(
+                "Dropping %s, left behind by an interrupted load.",
+                self._target_sql(schema, table),
+            )
+        conn.execute(f"DROP TABLE IF EXISTS {self._target_sql(schema, table)};")
+        # The drop takes the table out of the catalog; the directory it used stays on disk.
+        self._prune_load_directory(schema, table)
+
+    @staticmethod
+    def _require_primary_key(write_strategy: str, primary_key: Optional[str]) -> None:
+        """Refuses an upsert that cannot be deduplicated, before any rows are read."""
+        if write_strategy == "upsert" and not primary_key:
+            raise ValueError(
+                "write_strategy='upsert' requires a primary_key; refusing to write rows "
+                "that cannot be deduplicated."
+            )
 
     def _stage(
         self,
@@ -189,8 +369,15 @@ class IngestEngine:
         watermark_value,
         limit: Optional[int],
         on_batch: Optional[Callable[[int], None]] = None,
+        sink: Optional[str] = None,
+        create: bool = False,
     ) -> int:
-        """Lets the driver fill ``staging``; returns the rows extracted."""
+        """Lets the driver write into ``sink``; returns the rows extracted.
+
+        Postgres is the exception: DuckDB reads it directly, so it only reaches this method
+        for an upsert — the one case whose rows have to be deduplicated before they are
+        written, and which therefore land in a load table first.
+        """
         common = {
             "conn": conn,
             "connection_params": connection_params,
@@ -200,6 +387,8 @@ class IngestEngine:
             "watermark_value": watermark_value,
             "limit": limit,
             "on_batch": on_batch,
+            "sink": sink,
+            "create": create,
         }
         st = source_type.lower()
         if st == "postgres":
@@ -216,71 +405,80 @@ class IngestEngine:
 
     # -- writing the staged rows ------------------------------------------
 
-    def _write_staged(
+    def _upsert_from_load(
         self,
         conn,
         *,
+        schema: str,
+        staged: str,
         target: str,
+        table: str,
         mode: str,
         exists: bool,
-        write_strategy: str,
-        primary_key: Optional[str],
+        primary_key: str,
         watermark_column: Optional[str],
-    ) -> None:
-        """Moves ``staging`` into the lake: replace, append, or merge.
+    ) -> bool:
+        """Turns a load table into the table the upsert asked for.
 
-        Every branch is one statement DuckDB executes, so the size of the existing table
-        never becomes a Python object and a crash cannot leave a half-written table.
+        Returns True when the load table *became* the target (it was renamed, so there is
+        nothing left to clean up) and False when it was merged into a target that already
+        existed and still has to be dropped.
+
+        A first load has nothing to merge into: one row per key is selected where the rows
+        lie and the result is renamed onto the target, the same atomic swap a snapshot uses.
+        A later load is a delta, so it is deduplicated and ``MERGE``d — one statement, so
+        the size of the existing table never becomes a Python object.
         """
-        if write_strategy == "upsert" and not primary_key:
-            raise ValueError(
-                "write_strategy='upsert' requires a primary_key; refusing to write rows "
-                "that cannot be deduplicated."
-            )
+        deduped = self._deduped(primary_key, watermark_column, relation=staged)
 
         if mode == "snapshot" or not exists:
-            if write_strategy == "upsert":
-                conn.execute(f"CREATE OR REPLACE TABLE {target} AS {self._deduped(primary_key, watermark_column)}")
-            else:
-                conn.execute(f"CREATE OR REPLACE TABLE {target} AS SELECT * FROM staging")
-            return
-
-        if write_strategy == "upsert":
-            columns = [c for c in self._columns(conn, target) if c != "_obelisk_rank"]
-            key = quote_ident(primary_key)
-            assignments = ", ".join(
-                f"{quote_ident(c)} = s.{quote_ident(c)}" for c in columns if c != primary_key
+            # Deduplicating in place is one statement over one name: the load table is read
+            # and rewritten as the clean table, so nothing else has to be tracked to the
+            # swap that consumes it.
+            conn.execute(f"CREATE OR REPLACE TABLE {staged} AS {deduped}")
+            self._swap_into_place(
+                conn, schema=schema, staged=staged, target=target, table=table
             )
-            insert_cols = ", ".join(quote_ident(c) for c in columns)
-            source_cols = ", ".join(f"s.{quote_ident(c)}" for c in columns)
-            # Deduplicating the batch is not enough: the *existing* row has a watermark
-            # too, and a staged row with no watermark must never beat it. That is the
-            # failure the old Arrow path shipped (audit F-02), so the condition is in the
-            # statement where it cannot be forgotten.
-            guard = ""
-            if watermark_column:
-                wm = quote_ident(watermark_column)
-                guard = (
-                    f"AND (t.{wm} IS NULL "
-                    f"OR (s.{wm} IS NOT NULL "
-                    f"AND s.{wm} >= t.{wm})) "
-                )
-            conn.execute(
-                f"""
-                MERGE INTO {target} AS t
-                USING ({self._deduped(primary_key, watermark_column)}) AS s
-                ON t.{key} = s.{key}
-                WHEN MATCHED {guard}THEN UPDATE SET {assignments}
-                WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({source_cols})
-                """
-            )
-            return
+            return True
 
-        conn.execute(f"INSERT INTO {target} SELECT * FROM staging")
+        columns = [c for c in self._columns(conn, target) if c != "_obelisk_rank"]
+        key = quote_ident(primary_key)
+        assignments = ", ".join(
+            f"{quote_ident(c)} = s.{quote_ident(c)}" for c in columns if c != primary_key
+        )
+        insert_cols = ", ".join(quote_ident(c) for c in columns)
+        source_cols = ", ".join(f"s.{quote_ident(c)}" for c in columns)
+        # Deduplicating the inbound rows is not enough: the *existing* row has a watermark
+        # too, and an incoming row with no watermark must never beat it. That is the failure
+        # the old Arrow path shipped (audit F-02), so the condition lives in the statement
+        # where it cannot be forgotten.
+        guard = ""
+        if watermark_column:
+            wm = quote_ident(watermark_column)
+            guard = (
+                f"AND (t.{wm} IS NULL "
+                f"OR (s.{wm} IS NOT NULL "
+                f"AND s.{wm} >= t.{wm})) "
+            )
+        # A table whose only column is its key has nothing to set; MERGE would be a syntax
+        # error rather than the no-op that row already is.
+        matched = (
+            f"WHEN MATCHED {guard}THEN UPDATE SET {assignments}" if assignments else ""
+        )
+        conn.execute(
+            f"""
+            MERGE INTO {target} AS t
+            USING ({deduped}) AS s
+            ON t.{key} = s.{key}
+            {matched}
+            WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({source_cols})
+            """
+        )
+        return False
 
     @staticmethod
-    def _deduped(primary_key: str, watermark_column: Optional[str]) -> str:
-        """One row per key, newest first.
+    def _deduped(primary_key: str, watermark_column: Optional[str], relation: str) -> str:
+        """One row per key from ``relation``, newest first.
 
         ``NULLS LAST`` matters: a row whose watermark is missing must never outrank a row
         that has one — that is exactly how the old Arrow path lost updates (audit F-02).
@@ -291,7 +489,7 @@ class IngestEngine:
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY {quote_ident(primary_key)} ORDER BY {order}
                 ) AS _obelisk_rank
-                FROM staging
+                FROM {relation}
             ) WHERE _obelisk_rank = 1
         """
 
@@ -313,12 +511,14 @@ class IngestEngine:
     ) -> Dict[str, Any]:
         """Ingests one entity into the lakehouse.
 
-        The driver stages the rows in a temporary table; one statement then replaces,
-        appends or merges them into the target. A failed run leaves the previous table
-        exactly as it was, because nothing is written until that statement runs.
+        The path depends on what the source can do. Postgres is transferred by one
+        statement that DuckDB executes end to end. Every other driver streams batches into
+        the lake as they arrive: a snapshot into a load table that replaces the target when
+        it is complete, an incremental append straight into the target, an upsert into a
+        load table that is deduplicated and then either swapped in or merged from.
 
-        ``on_batch`` is called with the running row count as rows are staged, so a caller
-        can report progress on a table large enough to look stuck.
+        ``on_batch`` is called with the running row count as rows land, so a caller can
+        report progress on a table large enough to look stuck.
         """
         schema, table_stem = self._address(target_folder, entity, target_name)
         target = self._target_sql(schema, table_stem)
@@ -329,8 +529,10 @@ class IngestEngine:
             watermark_column = validate_column(watermark_column, what="watermark column")
         if primary_key:
             primary_key = validate_column(primary_key, what="primary key")
+        self._require_primary_key(write_strategy, primary_key)
 
         conn = duckdb_engine.get_connection()
+        load_table: Optional[str] = None
         try:
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema)};")
             exists = self._exists(conn, schema, table_stem)
@@ -339,17 +541,69 @@ class IngestEngine:
             if mode == "incremental" and watermark_column and exists:
                 watermark_value = self._max_watermark(conn, target, watermark_column)
 
-            extracted = self._stage(
-                conn,
-                source_type=source_type,
-                connection_params=connection_params,
-                entity=entity,
-                mode=mode,
-                watermark_column=watermark_column,
-                watermark_value=watermark_value,
-                limit=limit,
-                on_batch=on_batch,
-            )
+            if source_type.lower() == "postgres" and write_strategy != "upsert":
+                # DuckDB reads Postgres itself, so the lakehouse table is written by the
+                # same statement: no load table, no Arrow, no second copy of 150 GB.
+                extracted = self._transfer_postgres(
+                    conn,
+                    connection_params=connection_params,
+                    entity=entity,
+                    mode=mode,
+                    watermark_column=watermark_column,
+                    watermark_value=watermark_value,
+                    limit=limit,
+                    target=target,
+                    exists=exists,
+                    on_batch=on_batch,
+                )
+            else:
+                sink, create, load_table = self._batch_sink(
+                    schema=schema,
+                    table=table_stem,
+                    target=target,
+                    mode=mode,
+                    exists=exists,
+                    write_strategy=write_strategy,
+                )
+                if load_table is not None:
+                    # A run killed outright could not clean up after itself, and this run
+                    # is about to take the same name.
+                    self._drop_load_table(conn, schema=schema, table=load_table)
+                extracted = self._stage(
+                    conn,
+                    source_type=source_type,
+                    connection_params=connection_params,
+                    entity=entity,
+                    mode=mode,
+                    watermark_column=watermark_column,
+                    watermark_value=watermark_value,
+                    limit=limit,
+                    on_batch=on_batch,
+                    sink=sink,
+                    create=create,
+                )
+                if extracted and load_table is not None:
+                    if write_strategy == "upsert":
+                        if self._upsert_from_load(
+                            conn,
+                            schema=schema,
+                            staged=sink,
+                            target=target,
+                            table=table_stem,
+                            mode=mode,
+                            exists=exists,
+                            primary_key=primary_key,
+                            watermark_column=watermark_column,
+                        ):
+                            # Renamed onto the target: nothing left under the loaded name.
+                            load_table = None
+                    else:
+                        # The whole snapshot is on disk; two catalog operations make it the
+                        # table everyone else already knows.
+                        self._swap_into_place(
+                            conn, schema=schema, staged=sink, target=target, table=table_stem
+                        )
+                        load_table = None
 
             if extracted == 0:
                 # Nothing arrived. An existing table is left alone on purpose: replacing
@@ -362,18 +616,31 @@ class IngestEngine:
                     )
                 total = self._row_count(conn, target) if exists else 0
             else:
-                self._write_staged(
-                    conn,
-                    target=target,
-                    mode=mode,
-                    exists=exists,
-                    write_strategy=write_strategy,
-                    primary_key=primary_key,
-                    watermark_column=watermark_column,
-                )
                 total = self._row_count(conn, target)
         finally:
+            abandoned = load_table
+            if load_table is not None:
+                # Either the rows were merged into a target that already holds them, so
+                # there is nothing left to swap, or the load failed (or was cancelled)
+                # part-way and the rows it committed are worthless on their own. Either
+                # way the load table goes: no run leaves one behind for a reader, a backup
+                # or the next retry to trip over.
+                try:
+                    conn.execute(
+                        f"DROP TABLE IF EXISTS {self._target_sql(schema, load_table)};"
+                    )
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Could not drop the abandoned load table %s: %s",
+                        load_table,
+                        cleanup_error,
+                    )
+                    abandoned = None
             conn.close()
+            if abandoned is not None:
+                # After the close, so the files the connection had open are released and
+                # the directory the dropped table used can actually be removed.
+                self._prune_load_directory(schema, abandoned)
 
         return {
             "status": "success",
@@ -390,11 +657,14 @@ class IngestEngine:
 
     # -- drivers -----------------------------------------------------------
 
-    def _stage_postgres(
-        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, on_batch=None,
-    ) -> int:
-        """Postgres is read by DuckDB itself: one statement, no copies, no Python rows."""
+    def _postgres_source(
+        self, conn, connection_params, entity, mode, watermark_column, watermark_value, limit
+    ) -> tuple[str, str, str, str]:
+        """Attaches the Postgres database: ``(alias, relation, where, limit_clause)``.
+
+        The alias is random per run so two loads of one source cannot collide on a shared
+        connection, and the caller owns detaching it.
+        """
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
         dsn = build_pg_dsn(
             host=host,
@@ -407,33 +677,127 @@ class IngestEngine:
         )
         alias = validate_alias(f"pg_src_{uuid.uuid4().hex[:6]}")
         conn.execute(f"ATTACH {sql_string(dsn)} AS {alias} (TYPE POSTGRES);")
-        try:
-            if "." in entity:
-                schema_name, table_name = entity.split(".", 1)
-            else:
-                schema_name, table_name = "public", entity
-            where = ""
-            if mode == "incremental" and watermark_column and watermark_value is not None:
-                where = f"WHERE {sql_ident(watermark_column)} > {_literal(watermark_value)}"
-            limit_clause = f" LIMIT {int(limit)}" if limit and limit > 0 else ""
+        if "." in entity:
+            schema_name, table_name = entity.split(".", 1)
+        else:
+            schema_name, table_name = "public", entity
+        where = ""
+        if mode == "incremental" and watermark_column and watermark_value is not None:
+            where = f"WHERE {sql_ident(watermark_column)} > {_literal(watermark_value)}"
+        limit_clause = f" LIMIT {int(limit)}" if limit and limit > 0 else ""
+        relation = f"{alias}.{sql_ident(schema_name)}.{sql_ident(table_name)}"
+        return alias, relation, where, limit_clause
+
+    def _transfer_from(
+        self,
+        *,
+        conn,
+        source_ref: str,
+        target: str,
+        mode: str,
+        exists: bool,
+        where: str = "",
+        limit_clause: str = "",
+        on_batch: Optional[Callable[[int], None]] = None,
+    ) -> int:
+        """Moves rows from a relation DuckDB can scan into the lakehouse, in one statement.
+
+        Nothing passes through Python: DuckDB reads the source and writes DuckLake's
+        Parquet files directly, so the cost of the load is one statement rather than one
+        Python object per row.
+        """
+        if mode == "snapshot" or not exists:
+            # An empty source must not replace a table that has rows: a source that is
+            # briefly empty would otherwise destroy data a rerun cannot bring back.
+            probe = conn.execute(
+                f"SELECT 1 FROM {source_ref} {where} LIMIT 1"
+            ).fetchall()
+            if not probe:
+                return 0
             conn.execute(
-                f'CREATE OR REPLACE TEMP TABLE staging AS SELECT * FROM '
-                f'{alias}.{sql_ident(schema_name)}.{sql_ident(table_name)} {where}{limit_clause}'
+                f"CREATE OR REPLACE TABLE {target} AS "
+                f"SELECT * FROM {source_ref} {where}{limit_clause};"
             )
-            staged = self._row_count(conn, "staging")
-            # DuckDB stages Postgres in one statement, so there is nothing to report while
-            # it runs. The count still lands before the write, which is the slower half.
-            if on_batch is not None:
-                on_batch(staged)
-            return staged
+            written = self._row_count(conn, target)
+        else:
+            before = self._row_count(conn, target)
+            conn.execute(
+                f"INSERT INTO {target} SELECT * FROM {source_ref} {where}{limit_clause};"
+            )
+            written = max(0, self._row_count(conn, target) - before)
+        if on_batch is not None:
+            on_batch(written)
+        return written
+
+    def _transfer_postgres(
+        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
+        limit, target, exists, on_batch=None,
+    ) -> int:
+        """Copies a Postgres table straight into the lakehouse.
+
+        DuckDB's Postgres scanner feeds DuckLake's Parquet writer, so each row is written
+        once, to disk, and never becomes a Python object or a second copy in the temp
+        directory.
+        """
+        alias, relation, where, limit_clause = self._postgres_source(
+            conn, connection_params, entity, mode, watermark_column, watermark_value, limit
+        )
+        try:
+            return self._transfer_from(
+                conn,
+                source_ref=relation,
+                target=target,
+                mode=mode,
+                exists=exists,
+                where=where,
+                limit_clause=limit_clause,
+                on_batch=on_batch,
+            )
+        finally:
+            conn.execute(f"DETACH {alias};")
+
+    def _stage_postgres(
+        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
+        limit, on_batch=None, sink=None, create=False,
+    ) -> int:
+        """Postgres into ``sink``, in one statement DuckDB executes end to end.
+
+        Only an upsert reaches this method, because its rows land in a load table before
+        they are deduplicated; every other Postgres load goes through
+        :meth:`_transfer_postgres`, straight to its target. Either way DuckDB reads the
+        source and writes the lakehouse, and no row becomes a Python object. The sink never
+        exists yet, so ``create`` is implied by the transfer itself.
+        """
+        if sink is None:
+            raise ValueError("A Postgres load needs a sink: DuckDB writes it in one statement.")
+        alias, relation, where, limit_clause = self._postgres_source(
+            conn, connection_params, entity, mode, watermark_column, watermark_value, limit
+        )
+        try:
+            return self._transfer_from(
+                conn,
+                source_ref=relation,
+                target=sink,
+                mode="snapshot",
+                exists=False,
+                where=where,
+                limit_clause=limit_clause,
+                on_batch=on_batch,
+            )
         finally:
             conn.execute(f"DETACH {alias};")
 
     def _stage_mysql(
         self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, on_batch=None,
+        limit, on_batch=None, sink=None, create=False,
     ) -> int:
-        """MySQL/MariaDB: cursor batches in, one Arrow batch at a time."""
+        """MySQL/MariaDB: an unbuffered cursor, streamed into the sink batch by batch.
+
+        ``DictCursor`` is the wrong cursor here: PyMySQL reads the *entire* result set into
+        client memory inside ``execute()``, so ``fetchmany`` never bounded anything. The
+        server-side cursor reads one batch off the socket at a time and hands back tuples,
+        which is also one less dict per row to build.
+        """
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
         connection = pymysql.connect(
             host=host,
@@ -441,7 +805,7 @@ class IngestEngine:
             user=connection_params.get("username"),
             password=connection_params.get("password"),
             database=connection_params["database"],
-            cursorclass=pymysql.cursors.DictCursor,
+            cursorclass=pymysql.cursors.SSCursor,
             charset="utf8mb4",
         )
         try:
@@ -469,25 +833,17 @@ class IngestEngine:
                         rows = cur.fetchmany(BATCH_ROWS)
                         if not rows:
                             return
-                        clean = []
-                        for row in rows:
-                            clean.append(
-                                tuple(
-                                    json.dumps(row.get(col), default=str)
-                                    if isinstance(row.get(col), (dict, list))
-                                    else row.get(col)
-                                    for col in columns
-                                )
-                            )
-                        yield _arrow_batch(columns, clean)
+                        yield _arrow_batch(columns, [_cells(row) for row in rows])
 
-                return self._stage_batches(conn, batches(), on_batch=on_batch)
+                return self._stage_batches(
+                    conn, batches(), on_batch=on_batch, sink=sink, create=create
+                )
         finally:
             connection.close()
 
     def _stage_mongodb(
         self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, on_batch=None,
+        limit, on_batch=None, sink=None, create=False,
     ) -> int:
         """MongoDB: documents in batches, BSON types kept (dates, ints, floats)."""
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
@@ -537,13 +893,15 @@ class IngestEngine:
                         rows.append(tuple(values))
                     yield _arrow_batch(keys, rows)
 
-            return self._stage_batches(conn, batches(), on_batch=on_batch)
+            return self._stage_batches(
+                conn, batches(), on_batch=on_batch, sink=sink, create=create
+            )
         finally:
             client.close()
 
     def _stage_oracle(
         self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, on_batch=None,
+        limit, on_batch=None, sink=None, create=False,
     ) -> int:
         """Oracle: cursor batches, column names lowercased as the rest of the platform is."""
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
@@ -579,25 +937,17 @@ class IngestEngine:
                     rows = cur.fetchmany(BATCH_ROWS)
                     if not rows:
                         return
-                    clean = []
-                    for row in rows:
-                        clean.append(
-                            tuple(
-                                json.dumps(value, default=str)
-                                if isinstance(value, (dict, list))
-                                else value
-                                for value in row
-                            )
-                        )
-                    yield _arrow_batch(columns, clean)
+                    yield _arrow_batch(columns, [_cells(row) for row in rows])
 
-            return self._stage_batches(conn, batches(), on_batch=on_batch)
+            return self._stage_batches(
+                conn, batches(), on_batch=on_batch, sink=sink, create=create
+            )
         finally:
             connection.close()
 
     def _stage_api(
         self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, on_batch=None,
+        limit, on_batch=None, sink=None, create=False,
     ) -> int:
         """A REST endpoint returns one document, so it is staged in one batch."""
         from app.engines.introspector import Introspector
@@ -655,7 +1005,9 @@ class IngestEngine:
                     value = json.dumps(value, default=str)
                 values.append(value)
             rows.append(tuple(values))
-        return self._stage_batches(conn, [_arrow_batch(columns, rows)], on_batch=on_batch)
+        return self._stage_batches(
+            conn, [_arrow_batch(columns, rows)], on_batch=on_batch, sink=sink, create=create
+        )
 
 
 ingest_engine = IngestEngine()

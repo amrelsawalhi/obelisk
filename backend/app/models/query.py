@@ -22,6 +22,12 @@ class OpenQueryTab(Base):
     __tablename__ = "open_query_tabs"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # Which browser window (or team member) the tab belongs to. The row key is the
+    # client id plus the tab id ("<client>:tab-1"), because every window names its
+    # tabs "tab-1" and a shared primary key meant the last save won.
+    client_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="default", server_default="default", index=True
+    )
     title: Mapped[str] = mapped_column(String(200), default="Query 1")
     sql_text: Mapped[str] = mapped_column(Text, default="-- Obelisk Query Studio\nSELECT 1;")
     target_id: Mapped[str] = mapped_column(String(100), default="duckdb")

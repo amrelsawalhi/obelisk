@@ -180,6 +180,63 @@ async def health_check():
         "storage_uri": settings.STORAGE_URI,
     }
 
+# ---------------------------------------------------------------------------
+# One telemetry probe for every client.
+#
+# Each connected tab used to run its own three probes (host specs, active
+# allocations, managed containers) every 2 seconds, so five windows meant ten
+# docker.sock round-trips per second for numbers that are identical in all of them.
+# The computed payload is now shared for 1.5 s: just under the 2 s poll interval, so
+# a single client still sees a fresh sample on every tick, while N clients cost one
+# probe instead of N.
+# ---------------------------------------------------------------------------
+_TELEMETRY_CACHE_TTL_SECONDS = 1.5
+_telemetry_cache: "tuple[float, dict] | None" = None
+_telemetry_cache_lock = asyncio.Lock()
+
+
+async def _compute_telemetry() -> dict:
+    """Reads host specs, allocations and container count once."""
+    specs = await asyncio.to_thread(advisor.get_host_specs)
+    allocations = await asyncio.to_thread(advisor.get_active_container_allocations)
+    containers = await asyncio.to_thread(docker_mgr.list_managed_containers)
+    return {
+        "cpu_percent": specs.get("cpu_percent", 0.0),
+        "cpu_count": specs.get("cpu_count", 1),
+        "ram_percent_used": specs.get("ram_percent_used", 0.0),
+        "total_ram_gb": specs.get("total_ram_gb", 0.0),
+        "available_ram_gb": specs.get("available_ram_gb", 0.0),
+        "ram_used_gb": round(
+            specs.get("total_ram_gb", 0.0) - specs.get("available_ram_gb", 0.0), 2
+        ),
+        "max_safe_allocation_gb": specs.get("max_safe_allocation_gb", 0.0),
+        "active_containers_count": len(containers),
+        "allocated_ram_gb": allocations.get("total_allocated_gb", 0.0),
+    }
+
+
+async def _get_cached_telemetry() -> dict:
+    """Telemetry shared by every caller, recomputed at most once per TTL.
+
+    The returned dict is a copy: each websocket stamps its own ``timestamp`` on it,
+    and a caller that mutated the shared payload would corrupt the next reader.
+    """
+    global _telemetry_cache
+    cached = _telemetry_cache
+    now = asyncio.get_running_loop().time()
+    if cached is not None and now - cached[0] < _TELEMETRY_CACHE_TTL_SECONDS:
+        return dict(cached[1])
+    async with _telemetry_cache_lock:
+        # A client that waited on the lock may find the payload already refreshed.
+        cached = _telemetry_cache
+        now = asyncio.get_running_loop().time()
+        if cached is not None and now - cached[0] < _TELEMETRY_CACHE_TTL_SECONDS:
+            return dict(cached[1])
+        data = await _compute_telemetry()
+        _telemetry_cache = (now, data)
+        return dict(data)
+
+
 @app.websocket("/ws/telemetry")
 async def websocket_telemetry(websocket: WebSocket):
     if await authorize_websocket(websocket, "telemetry") is None:
@@ -188,22 +245,8 @@ async def websocket_telemetry(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            specs = await asyncio.to_thread(advisor.get_host_specs)
-            allocations = await asyncio.to_thread(advisor.get_active_container_allocations)
-            containers = await asyncio.to_thread(docker_mgr.list_managed_containers)
-
-            data = {
-                "cpu_percent": specs.get("cpu_percent", 0.0),
-                "cpu_count": specs.get("cpu_count", 1),
-                "ram_percent_used": specs.get("ram_percent_used", 0.0),
-                "total_ram_gb": specs.get("total_ram_gb", 0.0),
-                "available_ram_gb": specs.get("available_ram_gb", 0.0),
-                "ram_used_gb": round(specs.get("total_ram_gb", 0.0) - specs.get("available_ram_gb", 0.0), 2),
-                "max_safe_allocation_gb": specs.get("max_safe_allocation_gb", 0.0),
-                "active_containers_count": len(containers),
-                "allocated_ram_gb": allocations.get("total_allocated_gb", 0.0),
-                "timestamp": asyncio.get_event_loop().time(),
-            }
+            data = await _get_cached_telemetry()
+            data["timestamp"] = asyncio.get_running_loop().time()
             await websocket.send_json(data)
             await asyncio.sleep(2.0)
     except WebSocketDisconnect:
@@ -215,21 +258,7 @@ async def websocket_telemetry(websocket: WebSocket):
 @app.get("/api/system/telemetry")
 async def get_telemetry():
     """HTTP polling fallback for live telemetry (matches /ws/telemetry schema)."""
-    specs = await asyncio.to_thread(advisor.get_host_specs)
-    allocations = await asyncio.to_thread(advisor.get_active_container_allocations)
-    containers = await asyncio.to_thread(docker_mgr.list_managed_containers)
-
-    return {
-        "cpu_percent": specs.get("cpu_percent", 0.0),
-        "cpu_count": specs.get("cpu_count", 1),
-        "ram_percent_used": specs.get("ram_percent_used", 0.0),
-        "total_ram_gb": specs.get("total_ram_gb", 0.0),
-        "available_ram_gb": specs.get("available_ram_gb", 0.0),
-        "ram_used_gb": round(specs.get("total_ram_gb", 0.0) - specs.get("available_ram_gb", 0.0), 2),
-        "max_safe_allocation_gb": specs.get("max_safe_allocation_gb", 0.0),
-        "active_containers_count": len(containers),
-        "allocated_ram_gb": allocations.get("total_allocated_gb", 0.0),
-    }
+    return await _get_cached_telemetry()
 
 @app.websocket("/ws/events")
 async def websocket_events(websocket: WebSocket):

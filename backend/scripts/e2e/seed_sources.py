@@ -238,7 +238,7 @@ def seed_lakehouse(scale: dict) -> dict:
         "category": [("apparel", "beauty", "home", "tech")[(i - 1) % 4] for i in range(1, n + 1)],
         "unit_price": [round(5.0 + (i % 97) * 1.35, 2) for i in range(1, n + 1)],
     })
-    result = save(frame, "bronze.e2e_products", sync_postgres=False)
+    result = save(frame, "bronze.e2e_products")
     elapsed = time.perf_counter() - started
     print(f"  lakehouse  products={result.get('num_rows', n):,} -> {result.get('file_path', '?')} "
           f"({elapsed:.1f}s)", flush=True)

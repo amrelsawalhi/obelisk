@@ -145,6 +145,17 @@ class Settings(BaseSettings):
     DUCKDB_TEMP_SIZE_LIMIT: str = Field(
         default_factory=lambda: os.getenv("DUCKDB_TEMP_SIZE_LIMIT", "50GB")
     )
+    # Interactive JSON query responses are capped: `SELECT *` on a 200 GB table must
+    # never turn into millions of Python dicts. The cap is a *display* limit — exports
+    # stream the full result to disk instead.
+    DUCKDB_MAX_QUERY_ROWS: int = Field(
+        default_factory=lambda: int(os.getenv("DUCKDB_MAX_QUERY_ROWS", "10000"))
+    )
+    # How many DuckDB connections may be doing heavy work at once. The per-slot memory
+    # limit is derived from this so concurrent queries cannot together exceed the host.
+    DUCKDB_MAX_CONCURRENT_HEAVY: int = Field(
+        default_factory=lambda: int(os.getenv("DUCKDB_MAX_CONCURRENT_HEAVY", "4"))
+    )
 
     @property
     def lakehouse_catalog_path(self) -> Path:

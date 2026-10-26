@@ -18,6 +18,7 @@ Sample data exists, but only when `POST /api/dbt/sample-data` asks for it.
 
 import os
 import re
+import shutil
 import sys
 import time
 import json
@@ -1091,6 +1092,7 @@ class DbtRunner:
         selector: Optional[str] = None,
         target: str = "",
         connection_id: Optional[str] = None,
+        target_path: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """
         Executes dbt <command> --select <selector> --target <target>.
@@ -1100,6 +1102,12 @@ class DbtRunner:
         legacy alias for whichever output uses the postgres adapter. ``connection_id``
         names the warehouse a Postgres target publishes into; without it the saved
         selection is used.
+
+        ``target_path`` moves every artifact of this run (``manifest.json``,
+        ``compiled/``, ``run_results.json``, dbt's parse cache) into a directory the
+        caller owns. Without it dbt writes the project's shared ``target/``, so two
+        concurrent compiles overwrite each other and the slower reader is handed the
+        other model's SQL.
         """
         clean_target = (target or self.default_target()).strip().lower()
         if clean_target == "postgres" and self._target_adapter(clean_target) == "":
@@ -1157,6 +1165,8 @@ class DbtRunner:
             "--target",
             clean_target,
         ]
+        if target_path is not None:
+            cmd.extend(["--target-path", str(target_path)])
         if selector and selector != "*":
             clean_sel = selector.strip()
             cmd.extend(["--select", clean_sel])
@@ -1201,40 +1211,47 @@ class DbtRunner:
         self, model_name: str, target: str = "postgres", connection_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Runs dbt compile --select <model_name> --target <target> via a sys.executable -m dbt.cli.main.
-        Reads the generated compiled SQL from target/compiled/obelisk_dbt/models/.../<model_name>.sql and returns it.
+        Compiles one model and returns the SQL dbt produced for it.
+
+        The run writes to a scratch ``--target-path`` under
+        ``settings.duckdb_temp_path`` rather than the project's shared ``target/``:
+        two operators previewing different models at the same time would otherwise
+        overwrite each other's ``manifest.json`` and ``compiled/`` tree, and one of
+        them would be handed the other's SQL. The scratch directory is removed in
+        ``finally``, so a failed or interrupted compile leaves nothing behind.
         """
         clean_name = model_name.strip().replace(".sql", "")
-        # Run dbt compile
-        res = self.run_scoped_dbt(
-            command="compile", selector=clean_name, target=target, connection_id=connection_id
-        )
+        scratch_target = settings.duckdb_temp_path / f"dbt_compile_{uuid.uuid4().hex[:8]}"
+        scratch_target.mkdir(parents=True, exist_ok=True)
+        try:
+            res = self.run_scoped_dbt(
+                command="compile",
+                selector=clean_name,
+                target=target,
+                connection_id=connection_id,
+                target_path=scratch_target,
+            )
 
-        # Read compiled SQL from target/compiled/
-        compiled_sql = ""
-        compiled_dir = self.dbt_project_dir / "target" / "compiled" / "obelisk_dbt" / "models"
-        if compiled_dir.exists():
-            matches = list(compiled_dir.rglob(f"{clean_name}.sql"))
-            if matches:
-                latest_match = max(matches, key=lambda f: f.stat().st_mtime)
-                compiled_sql = latest_match.read_text(encoding="utf-8")
-
-        if not compiled_sql:
-            target_compiled = self.dbt_project_dir / "target" / "compiled"
-            if target_compiled.exists():
-                all_matches = list(target_compiled.rglob(f"{clean_name}.sql"))
-                if all_matches:
-                    latest_match = max(all_matches, key=lambda f: f.stat().st_mtime)
+            # This run's compiled SQL can only be the copy dbt just wrote into its
+            # own target path — never a leftover in the shared one.
+            compiled_sql = ""
+            compiled_dir = scratch_target / "compiled"
+            if compiled_dir.exists():
+                matches = list(compiled_dir.rglob(f"{clean_name}.sql"))
+                if matches:
+                    latest_match = max(matches, key=lambda f: f.stat().st_mtime)
                     compiled_sql = latest_match.read_text(encoding="utf-8")
 
-        return {
-            "model_name": clean_name,
-            "target": target,
-            "compiled_sql": compiled_sql or "",
-            "duration_ms": res.get("duration_ms", int(res.get("duration_seconds", 0) * 1000)),
-            "logs": res.get("output", ""),
-            "success": res.get("success", False) and bool(compiled_sql),
-        }
+            return {
+                "model_name": clean_name,
+                "target": target,
+                "compiled_sql": compiled_sql or "",
+                "duration_ms": res.get("duration_ms", int(res.get("duration_seconds", 0) * 1000)),
+                "logs": res.get("output", ""),
+                "success": res.get("success", False) and bool(compiled_sql),
+            }
+        finally:
+            shutil.rmtree(scratch_target, ignore_errors=True)
 
     def preview_model_data(
         self,

@@ -68,7 +68,7 @@ class DuckDBEngine:
     def _apply_session_budget(self, conn: duckdb.DuckDBPyConnection) -> None:
         """One place that decides how much of the machine a connection may use."""
         statements = [
-            f"SET memory_limit = '{advisor.get_duckdb_memory_limit()}';",
+            f"SET memory_limit = '{advisor.get_duckdb_memory_limit(settings.DUCKDB_MAX_CONCURRENT_HEAVY)}';",
             f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
             f"SET max_temp_directory_size = '{settings.DUCKDB_TEMP_SIZE_LIMIT}';",
             "SET preserve_insertion_order = false;",
@@ -400,6 +400,8 @@ class DuckDBEngine:
         sql: str,
         attachments: Optional[List[Dict[str, Any]]] = None,
         postgres_attachments: Optional[List[Dict[str, Any]]] = None,
+        max_rows: Optional[int] = None,
+        on_connection: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Executes a SQL query against DuckDB in a thread-safe synchronous runner.
@@ -408,10 +410,18 @@ class DuckDBEngine:
         ``attachments`` carries one dict per source to attach (see
         :func:`app.core.sources.attachment_for`); ``postgres_attachments`` is the old name
         and is still accepted so an out-of-tree caller keeps working.
+
+        Rows are capped and never materialised beyond ``max_rows``
+        (``DUCKDB_MAX_QUERY_ROWS`` by default): a ``SELECT *`` on a huge table returns a
+        truncated preview instead of loading the whole relation into Python memory.
+        ``on_connection`` receives the live connection so a caller waiting on a timeout can
+        call ``conn.interrupt()`` and stop the DuckDB C++ work instead of leaking it.
         """
         start_time = time.time()
         storage_path = self._ensure_storage()
         conn = self.get_connection()
+        if on_connection is not None:
+            on_connection(conn)
 
         try:
             for attachment in attachments or postgres_attachments or []:
@@ -428,23 +438,72 @@ class DuckDBEngine:
                     "columns": [],
                     "rows": [],
                     "row_count": 0,
+                    "truncated": False,
                     "duration_ms": duration_ms,
                 }
 
-            arrow_reader = rel.arrow()
-            arrow_table = arrow_reader.read_all() if hasattr(arrow_reader, "read_all") else arrow_reader
-            columns = arrow_table.column_names
-            # Convert arrow to list of dicts for JSON serialization
-            rows = arrow_table.to_pylist()
-            row_count = len(rows)
+            limit_cap = max_rows if max_rows is not None else settings.DUCKDB_MAX_QUERY_ROWS
+            columns = list(rel.columns or [])
+            # DuckDB 2.x relations keep no result between calls (and have no fetchmany), so
+            # the cap is pushed into the plan with limit() — only cap + 1 rows are ever
+            # materialised, which is what makes `SELECT *` on a huge table safe.
+            if limit_cap > 0:
+                fetched_tuples = rel.limit(limit_cap + 1).fetchall()
+                truncated = len(fetched_tuples) > limit_cap
+                if truncated:
+                    fetched_tuples = fetched_tuples[:limit_cap]
+            else:
+                fetched_tuples = rel.fetchall()
+                truncated = False
+
+            rows = [dict(zip(columns, tup)) for tup in fetched_tuples]
             duration_ms = int((time.time() - start_time) * 1000)
 
             return {
                 "columns": columns,
                 "rows": rows,
-                "row_count": row_count,
+                "row_count": len(rows),
+                "truncated": truncated,
                 "duration_ms": duration_ms,
             }
+        finally:
+            conn.close()
+
+    def export_query_to_file(
+        self,
+        sql: str,
+        dest_path: Path,
+        output_format: str = "parquet",
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        postgres_attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> Path:
+        """Streams query results directly to ``dest_path`` using DuckDB's native COPY.
+
+        The result never passes through Python: a multi-GB export is written by DuckDB to
+        the file, not accumulated in an Arrow table and an ``io.BytesIO`` buffer.
+        """
+        storage_path = self._ensure_storage()
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = self.get_connection()
+        try:
+            for attachment in attachments or postgres_attachments or []:
+                self.attach(conn, attachment)
+
+            # Register bronze parquet views and normalize relative paths
+            exec_sql = self._prepare_sql_and_views(conn, sql, storage_path).strip().rstrip(";")
+            dest_posix = dest_path.resolve().as_posix().replace("'", "''")
+            fmt = output_format.lower()
+            if fmt == "parquet":
+                conn.execute(
+                    f"COPY ({exec_sql}) TO '{dest_posix}' (FORMAT PARQUET, COMPRESSION SNAPPY);"
+                )
+            elif fmt == "csv":
+                conn.execute(
+                    f"COPY ({exec_sql}) TO '{dest_posix}' (FORMAT CSV, HEADER TRUE);"
+                )
+            else:
+                raise ValueError(f"Unsupported export format: {output_format}")
+            return dest_path
         finally:
             conn.close()
 
@@ -455,36 +514,26 @@ class DuckDBEngine:
         attachments: Optional[List[Dict[str, Any]]] = None,
         postgres_attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> bytes:
-        """Executes a query and returns the serialized result as Parquet or CSV bytes."""
-        storage_path = self._ensure_storage()
-        conn = self.get_connection()
-        try:
-            for attachment in attachments or postgres_attachments or []:
-                self.attach(conn, attachment)
+        """Executes a query and returns Parquet or CSV bytes.
 
-            # Register bronze parquet views and normalize relative paths
-            exec_sql = self._prepare_sql_and_views(conn, sql, storage_path)
+        Compatibility helper for callers that need bytes in hand. The HTTP export route
+        uses :meth:`export_query_to_file` instead, so a large export is streamed from
+        disk rather than held in RAM here.
+        """
+        import tempfile
 
-            rel = conn.sql(exec_sql)
-            arrow_reader = rel.arrow()
-            arrow_table = arrow_reader.read_all() if hasattr(arrow_reader, "read_all") else arrow_reader
+        fmt = output_format.lower()
+        with tempfile.TemporaryDirectory(prefix="obelisk_export_") as scratch:
+            dest = Path(scratch) / f"export.{fmt}"
+            self.export_query_to_file(
+                sql,
+                dest,
+                output_format=fmt,
+                attachments=attachments,
+                postgres_attachments=postgres_attachments,
+            )
+            return dest.read_bytes()
 
-            if output_format.lower() == "parquet":
-                import pyarrow.parquet as pq
-                import io
-                buf = io.BytesIO()
-                pq.write_table(arrow_table, buf, compression="snappy")
-                return buf.getvalue()
-            elif output_format.lower() == "csv":
-                import io
-                import pyarrow.csv as pacsv
-                buf = io.BytesIO()
-                pacsv.write_csv(arrow_table, buf)
-                return buf.getvalue()
-            else:
-                raise ValueError(f"Unsupported export format: {output_format}")
-        finally:
-            conn.close()
 
     def query_bronze_to_polars(self, table_name: str) -> pl.DataFrame:
         """Reads a Bronze Parquet file into a Polars DataFrame."""

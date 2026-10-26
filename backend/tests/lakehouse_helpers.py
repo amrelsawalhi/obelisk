@@ -65,7 +65,7 @@ def drop_schema(prefix: str) -> None:
             [f"{prefix}%"],
         ).fetchall()
         for (schema,) in rows:
-            conn.execute(f"DROP SCHEMA {SOURCE}.{quote_ident(schema)} CASCADE")
+            conn.execute(f"DROP SCHEMA IF EXISTS {SOURCE}.{quote_ident(schema)} CASCADE")
         for (table,) in conn.execute(
             "SELECT table_name FROM __ducklake_metadata_lakehouse.ducklake_table "
             "WHERE table_name LIKE ?",

@@ -5,18 +5,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies, OpenJDK JRE (required for PySpark), curl, git, and build tools
+# Install system dependencies, curl, git, and build tools. No JVM: obelisk-core is an
+# embedded DuckDB/Polars appliance and talks to Spark through pyspark[connect], so a
+# local JRE only added ~200 MB to every image pull.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    default-jre-headless \
     curl \
     git \
     build-essential \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
-
-# Set JAVA_HOME dynamically
-ENV JAVA_HOME="/usr/lib/jvm/default-java"
-ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 WORKDIR /app
 
