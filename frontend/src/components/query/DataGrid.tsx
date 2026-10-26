@@ -1,10 +1,54 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Copy, Check } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { Copy, Check, Loader2 } from 'lucide-react';
 
 interface DataGridProps {
   columns: string[];
   rows: Record<string, unknown>[];
+  columnTypes?: Record<string, string>;
   loading?: boolean;
+}
+
+function inferColumnType(col: string, rows: Record<string, unknown>[], explicitType?: string): string {
+  if (explicitType) {
+    const cleaned = explicitType.toUpperCase().replace(/\(.*?\)/, '').trim();
+    return cleaned.length > 12 ? cleaned.slice(0, 10) : cleaned;
+  }
+  for (let i = 0; i < Math.min(rows.length, 15); i++) {
+    const val = rows[i]?.[col];
+    if (val === null || val === undefined) continue;
+    if (typeof val === 'number') {
+      return Number.isInteger(val) ? 'INT' : 'DECIMAL';
+    }
+    if (typeof val === 'boolean') return 'BOOL';
+    if (typeof val === 'string') {
+      if (/^\d{4}-\d{2}-\d{2}(T|\s)\d{2}:\d{2}:\d{2}/.test(val)) return 'TIMESTAMP';
+      if (/^\d{4}-\d{2}-\d{2}$/.test(val)) return 'DATE';
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val)) return 'UUID';
+      return 'VARCHAR';
+    }
+    if (typeof val === 'object') return 'JSON';
+  }
+  return 'VARCHAR';
+}
+
+function getTypeBadgeStyle(type: string): string {
+  const t = type.toUpperCase();
+  if (['INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'DECIMAL', 'NUMERIC', 'FLOAT', 'DOUBLE'].some((k) => t.includes(k))) {
+    return 'bg-blue-50 text-blue-700 border-blue-200/60';
+  }
+  if (['VARCHAR', 'TEXT', 'STRING', 'CHAR'].some((k) => t.includes(k))) {
+    return 'bg-slate-100 text-slate-700 border-slate-200/80';
+  }
+  if (['TIMESTAMP', 'DATE', 'TIME'].some((k) => t.includes(k))) {
+    return 'bg-purple-50 text-purple-700 border-purple-200/60';
+  }
+  if (['BOOL', 'BOOLEAN'].some((k) => t.includes(k))) {
+    return 'bg-amber-50 text-amber-700 border-amber-200/60';
+  }
+  if (['JSON', 'STRUCT', 'LIST', 'ARRAY', 'MAP'].some((k) => t.includes(k))) {
+    return 'bg-emerald-50 text-emerald-700 border-emerald-200/60';
+  }
+  return 'bg-slate-100 text-slate-600 border-slate-200';
 }
 
 const ROW_HEIGHT = 33; // Fixed row height in px
@@ -15,6 +59,7 @@ const BUFFER_ROWS = 25; // Pre-render buffer above and below viewport
 export const DataGrid = React.memo(function DataGrid({
   columns,
   rows,
+  columnTypes,
   loading,
 }: DataGridProps) {
   const [copiedCell, setCopiedCell] = useState<string | null>(null);
@@ -66,8 +111,8 @@ export const DataGrid = React.memo(function DataGrid({
   // Compute or retrieve width for a given column
   const getColWidth = (col: string): number => {
     if (columnWidths[col]) return columnWidths[col];
-    // Default width based on column name length (min: 120px, max: 320px)
-    return Math.max(120, Math.min(320, col.length * 9 + 48));
+    // Default width based on column name length and type badge (min: 130px, max: 340px)
+    return Math.max(130, Math.min(340, col.length * 9 + 60));
   };
 
   // Draggable Column Width Resizer
@@ -120,8 +165,9 @@ export const DataGrid = React.memo(function DataGrid({
 
   if (loading) {
     return (
-      <div className="h-64 flex items-center justify-center text-xs text-slate-400 font-mono">
-        Executing SQL in DuckDB engine...
+      <div className="h-64 flex flex-col items-center justify-center text-xs text-slate-400 font-mono gap-2">
+        <Loader2 className="w-5 h-5 animate-spin text-sky-600" />
+        <span>Executing query...</span>
       </div>
     );
   }
@@ -165,15 +211,26 @@ export const DataGrid = React.memo(function DataGrid({
               {/* Data Column Headers */}
               {columns.map((col) => {
                 const width = getColWidth(col);
+                const colType = inferColumnType(col, rows, columnTypes?.[col]);
+                const badgeStyle = getTypeBadgeStyle(colType);
+
                 return (
                   <th
                     key={col}
                     style={{ width: `${width}px`, minWidth: `${width}px`, maxWidth: `${width}px` }}
                     className="relative py-2 px-3 font-semibold text-slate-800 whitespace-nowrap border-r border-slate-200 last:border-r-0 select-none group bg-slate-100"
                   >
-                    <span className="truncate block pr-2" title={`${col} (double-click divider to auto-fit)`}>
-                      {col}
-                    </span>
+                    <div className="flex items-center justify-between gap-1.5 pr-2">
+                      <span className="truncate block font-semibold text-slate-800" title={`${col} (double-click divider to auto-fit)`}>
+                        {col}
+                      </span>
+                      <span
+                        className={`shrink-0 text-[9px] font-mono font-medium px-1.5 py-0.5 rounded border uppercase tracking-wider ${badgeStyle}`}
+                        title={`Data type: ${colType}`}
+                      >
+                        {colType}
+                      </span>
+                    </div>
 
                     {/* Column Resizer Drag Handle */}
                     <div

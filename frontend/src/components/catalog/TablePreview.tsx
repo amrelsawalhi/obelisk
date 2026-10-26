@@ -11,6 +11,8 @@ import {
   Database,
   Terminal,
   BookOpen,
+  Copy,
+  Check,
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import type { CatalogTable, TablePreviewResponse } from '../../lib/types';
@@ -41,6 +43,15 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
   const [preview, setPreview] = useState<TablePreviewResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [copiedFqn, setCopiedFqn] = useState<boolean>(false);
+
+  const columnTypeMap = React.useMemo(() => {
+    const map: Record<string, string> = {};
+    table.columns?.forEach((c) => {
+      map[c.name] = c.data_type;
+    });
+    return map;
+  }, [table.columns]);
 
   const fetchPreview = async () => {
     try {
@@ -81,16 +92,27 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-base font-bold text-slate-900">{table.name}</h2>
-              <span
-                className={`text-[11px] font-mono px-2 py-0.5 rounded-md font-medium border inline-flex items-center gap-1.5 ${
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(canonicalFqn);
+                  setCopiedFqn(true);
+                  setTimeout(() => setCopiedFqn(false), 1500);
+                }}
+                className={`text-[11px] font-mono px-2 py-0.5 rounded-md font-medium border inline-flex items-center gap-1.5 transition-colors cursor-pointer group/copy ${
                   isLakehouse
-                    ? 'bg-slate-100 text-slate-700 border-slate-200'
-                    : 'bg-sky-50 text-sky-700 border-sky-200'
+                    ? 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200/80'
+                    : 'bg-sky-50 text-sky-700 border-sky-200 hover:bg-sky-100'
                 }`}
-                title={`Canonical FQN: ${canonicalFqn}`}
+                title="Click to copy fully-qualified table name"
               >
                 <span className="font-semibold">{canonicalFqn}</span>
-              </span>
+                {copiedFqn ? (
+                  <Check className="w-3 h-3 text-emerald-600 shrink-0" />
+                ) : (
+                  <Copy className="w-3 h-3 opacity-40 group-hover/copy:opacity-100 shrink-0 transition-opacity" />
+                )}
+              </button>
             </div>
             <div className="text-xs text-slate-500 font-mono">
               {(table.columns || []).length} columns • {table.format || 'Snappy Parquet'}{tableSizeLabel(table) ? ` • ${tableSizeLabel(table)}` : ''}
@@ -206,7 +228,7 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
 
               {/* Virtualized DataGrid */}
               <div className="h-[calc(100vh-270px)] min-h-[350px]">
-                <DataGrid columns={preview.columns} rows={preview.rows} />
+                <DataGrid columns={preview.columns} rows={preview.rows} columnTypes={columnTypeMap} />
               </div>
             </div>
           )
