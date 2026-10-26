@@ -106,12 +106,25 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
             <div
               key={column.name}
               onClick={() => onInsertColumn(column.name)}
-              style={treeIndent(depth + 1)}
-              className="flex h-6 cursor-pointer items-center pr-2 text-[10px] text-slate-500 transition-colors hover:bg-sky-50 hover:text-sky-700"
+              className="group flex h-6 cursor-pointer items-center pr-2 text-[10px] text-slate-500 transition-colors hover:bg-sky-50 hover:text-sky-700 pl-1"
               title="Click to insert column name"
             >
-              <span className="min-w-0 flex-1 truncate font-mono">{column.name}</span>
-              <span className="ml-2 shrink-0 font-mono text-[9px] text-slate-400">
+              {Array.from({ length: Math.max(0, depth + 1) }).map((_, index) => (
+                <span
+                  key={index}
+                  aria-hidden
+                  className="h-full w-[18px] shrink-0 flex justify-center items-center"
+                >
+                  <span className="w-px h-full bg-slate-200/90" />
+                </span>
+              ))}
+              <span className="w-[18px] h-full shrink-0 flex items-center justify-center text-slate-300 font-mono text-[9px]">
+                •
+              </span>
+              <span className="min-w-0 flex-1 truncate font-mono text-slate-700 group-hover:text-sky-800">
+                {column.name}
+              </span>
+              <span className="ml-2 shrink-0 font-mono text-[9px] text-slate-400 group-hover:text-sky-600">
                 {column.data_type}
               </span>
             </div>
@@ -184,7 +197,7 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
         />
 
         {!isCollapsed && tree.length > 0 && (
-          <div className="pb-1">{tree.map((dir) => renderDirectory(dir, 0))}</div>
+          <div className="pb-1">{tree.map((dir) => renderDirectory(dir, 1))}</div>
         )}
 
         {/* Fallback for a lakehouse payload without folder metadata. */}
@@ -193,7 +206,7 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
             {node.tables.map((table) =>
               renderTableRow({
                 rowKey: `${node.id}.${table.name}`,
-                depth: 0,
+                depth: 1,
                 name: table.name,
                 table,
                 info: { isLakehouse: true, folderPath: '', fqn: table.fqn },
@@ -204,12 +217,11 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
         )}
 
         {!isCollapsed && tree.length === 0 && (node.tables?.length || 0) === 0 && (
-          <TreeMessage depth={0}>No tables in the lakehouse yet.</TreeMessage>
+          <TreeMessage depth={1}>No tables in the lakehouse yet.</TreeMessage>
         )}
       </div>
     );
   };
-
 
   const renderExternalNode = (node: CatalogNode) => {
     const groupKey = `source:${node.id}`;
@@ -227,19 +239,28 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
     const schemaNames = Object.keys(schemaGroups).sort();
 
     return (
-      <div key={node.id}>
+      <div key={node.id} className="border-t border-slate-200/60 first:border-t-0 mt-1 first:mt-0 pt-0.5">
         <TreeRow
           variant="section"
           expandable
           expanded={!isCollapsed}
           onClick={() => onToggleGroup(groupKey, !isCollapsed)}
           icon={<Database className={`h-4 w-4 ${TREE_ICON.database}`} />}
-          label={node.name}
+          label={
+            <span className="flex items-center gap-1.5 min-w-0">
+              <span className="truncate">{node.name}</span>
+              {node.type && node.type.toLowerCase() !== node.name.toLowerCase() && (
+                <span className="text-[10px] font-mono text-slate-400 font-normal shrink-0">
+                  ({node.type})
+                </span>
+              )}
+            </span>
+          }
           badge={node.tables?.length || 0}
         />
 
         {!isCollapsed && schemaNames.length === 0 && (
-          <TreeMessage depth={0}>No tables found</TreeMessage>
+          <TreeMessage depth={1}>No tables found</TreeMessage>
         )}
 
         {!isCollapsed &&
@@ -252,13 +273,13 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
             return (
               <React.Fragment key={schemaKey}>
                 <TreeRow
-                  depth={0}
+                  depth={1}
                   expandable
                   expanded={isSchemaExpanded}
                   onClick={() => onToggleGroup(schemaKey, isSchemaExpanded)}
-                  icon={<Table2 className={`h-3.5 w-3.5 ${TREE_ICON.schema}`} />}
+                  icon={<Layers className={`h-3.5 w-3.5 ${TREE_ICON.schema}`} />}
                   label={schemaName}
-                  labelClassName="font-mono text-[11px] font-semibold"
+                  labelClassName="font-mono text-[11px] font-semibold text-slate-700"
                   badge={tablesInSchema.length}
                 />
 
@@ -272,7 +293,7 @@ export const SchemaExplorerPanel: React.FC<SchemaExplorerPanelProps> = ({
 
                     return renderTableRow({
                       rowKey: `${node.id}.${schemaName}.${cleanTableName}`,
-                      depth: 1,
+                      depth: 2,
                       name: cleanTableName,
                       table,
                       info: {

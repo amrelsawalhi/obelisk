@@ -24,6 +24,7 @@ import {
   Terminal,
   BookOpen,
   ChevronsUpDown,
+  Database,
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import type { CatalogNode, CatalogTable } from '../../lib/types';
@@ -584,14 +585,23 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
               });
 
               return (
-                <div key={node.id}>
+                <div key={node.id} className="border-t border-slate-200/60 first:border-t-0 mt-1 first:mt-0 pt-0.5">
                   <TreeRow
                     variant="section"
                     expandable
                     expanded={isExpanded}
                     onClick={() => toggleNode(node.id, isExpanded)}
-                    icon={<Server className={`h-4 w-4 ${TREE_ICON.database}`} />}
-                    label={node.name}
+                    icon={<Database className={`h-4 w-4 ${TREE_ICON.database}`} />}
+                    label={
+                      <span className="flex items-center gap-1.5 min-w-0">
+                        <span className="truncate">{node.name}</span>
+                        {node.type && node.type.toLowerCase() !== node.name.toLowerCase() && (
+                          <span className="text-[10px] font-mono text-slate-400 font-normal shrink-0">
+                            ({node.type})
+                          </span>
+                        )}
+                      </span>
+                    }
                     badge={node.tables.length}
                     actionsVisible
                     actions={
@@ -667,9 +677,9 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
                   {isExpanded && (
                     <div className="pb-1">
                       {node.tables.length === 0 ? (
-                        <TreeMessage depth={0}>No tables discovered.</TreeMessage>
+                        <TreeMessage depth={1}>No tables discovered.</TreeMessage>
                       ) : filteredConnTables.length === 0 ? (
-                        <TreeMessage depth={0}>
+                        <TreeMessage depth={1}>
                           No tables matching "{searchTerm.trim()}".
                         </TreeMessage>
                       ) : (
@@ -689,13 +699,13 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
                           return (
                             <React.Fragment key={schemaKey}>
                               <TreeRow
-                                depth={0}
+                                depth={1}
                                 expandable
                                 expanded={shouldDisplaySchema}
                                 onClick={() => toggleNode(schemaKey, shouldDisplaySchema)}
                                 icon={<Layers className={`h-3.5 w-3.5 ${TREE_ICON.schema}`} />}
                                 label={schemaName}
-                                labelClassName="font-mono text-[11px] font-semibold"
+                                labelClassName="font-mono text-[11px] font-semibold text-slate-700"
                                 badge={filteredSchemaTables.length}
                                 actions={
                                   onOpenBatchIngest && schemaTables.length > 0 ? (
@@ -734,7 +744,7 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
                                     return (
                                       <TreeRow
                                         key={tableKey}
-                                        depth={1}
+                                        depth={2}
                                         selected={selectedTableKey === tableKey}
                                         onClick={() =>
                                           onSelectTable(node.id, table, false, node.name)

@@ -13,11 +13,11 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 export type TreeAccent = 'indigo' | 'sky';
 
 /** One indent step, in pixels. Rails and nested padding both use it. */
-export const TREE_INDENT = 14;
+export const TREE_INDENT = 18;
 
 /** Left padding of a row at `depth` (0 = flush with the panel edge). */
 export function treeIndent(depth: number): React.CSSProperties {
-  return { paddingLeft: `${6 + Math.max(0, depth) * TREE_INDENT}px` };
+  return { paddingLeft: `${4 + Math.max(0, depth) * TREE_INDENT}px` };
 }
 
 const ACCENT: Record<TreeAccent, { selected: string; bar: string }> = {
@@ -97,7 +97,7 @@ export const TreeRow: React.FC<TreeRowProps> = ({
       title={title}
       onClick={onClick}
       className={[
-        'group relative flex items-center pr-1.5 text-xs select-none',
+        'group relative flex items-center pr-1.5 text-xs select-none pl-1',
         isSection ? 'h-8 font-semibold' : 'h-7',
         onClick || onToggle ? 'cursor-pointer' : '',
         selected
@@ -112,10 +112,18 @@ export const TreeRow: React.FC<TreeRowProps> = ({
         <span aria-hidden className={`absolute inset-y-0 left-0 w-0.5 ${tone.bar}`} />
       )}
 
+      {/* Indent Guide Rails */}
       {Array.from({ length: Math.max(0, depth) }).map((_, index) => (
-        <span key={index} aria-hidden className="h-full w-3.5 shrink-0 border-l border-slate-200/80" />
+        <span
+          key={index}
+          aria-hidden
+          className="h-full w-[18px] shrink-0 flex justify-center items-center"
+        >
+          <span className="w-px h-full bg-slate-200/90" />
+        </span>
       ))}
 
+      {/* Expand/Collapse Chevron Button */}
       {expandable ? (
         <button
           type="button"
@@ -126,7 +134,7 @@ export const TreeRow: React.FC<TreeRowProps> = ({
             if (onToggle) onToggle(event);
             else onClick?.(event);
           }}
-          className="flex h-4 w-4 shrink-0 items-center justify-center rounded text-slate-400 transition-colors hover:bg-slate-200/70 hover:text-slate-700"
+          className="flex h-5 w-[18px] shrink-0 items-center justify-center rounded text-slate-400 transition-colors hover:bg-slate-200/70 hover:text-slate-700"
         >
           {expanded ? (
             <ChevronDown className="h-3.5 w-3.5" />
@@ -135,12 +143,14 @@ export const TreeRow: React.FC<TreeRowProps> = ({
           )}
         </button>
       ) : (
-        <span aria-hidden className="h-4 w-4 shrink-0" />
+        <span aria-hidden className="h-5 w-[18px] shrink-0" />
       )}
 
       {icon && <span className="mr-1.5 flex h-4 w-4 shrink-0 items-center justify-center">{icon}</span>}
 
-      <span className={`min-w-0 flex-1 truncate ${labelClassName}`}>{label}</span>
+      <span className={`min-w-0 truncate ${labelClassName}`}>{label}</span>
+
+      <span className="flex-1 min-w-1" />
 
       {meta != null && meta !== '' && (
         <span className="ml-2 shrink-0 font-mono text-[10px] tabular-nums text-slate-400">{meta}</span>

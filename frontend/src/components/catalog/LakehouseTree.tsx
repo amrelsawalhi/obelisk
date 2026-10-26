@@ -103,12 +103,12 @@ export const LakehouseTree: React.FC<LakehouseTreeProps> = (props) => {
   const visibleTree = useMemo(() => filterDirectoryTree(tree, searchTerm), [tree, searchTerm]);
 
   if (tree.length === 0) {
-    return <TreeMessage className="px-2">No folders in the lakehouse yet.</TreeMessage>;
+    return <TreeMessage depth={0} className="px-2">No folders in the lakehouse yet.</TreeMessage>;
   }
 
   if (visibleTree.length === 0) {
     return (
-      <TreeMessage className="px-2">
+      <TreeMessage depth={0} className="px-2">
         No tables matching "{searchTerm.trim()}".
       </TreeMessage>
     );
@@ -369,5 +369,5 @@ export const LakehouseTree: React.FC<LakehouseTreeProps> = (props) => {
     );
   };
 
-  return <div role="group">{visibleTree.map((node) => renderFolder(node, 0))}</div>;
+  return <div role="group">{visibleTree.map((node) => renderFolder(node, 1))}</div>;
 };
