@@ -110,11 +110,25 @@ async def lifespan(app: FastAPI):
         instance_lock.release()
 
 def _cors_origins() -> list[str]:
-    """Origins allowed to make credentialed requests once auth is enforced."""
+    """Origins allowed to call the API, with or without auth.
+
+    A wildcard used to be served while auth was off, which meant any page the operator
+    happened to visit could POST /api/pipelines/{id}/run against localhost. Credentialed
+    requests cannot ride a wildcard either, so the set is explicit in both modes: the dev
+    server and localhost by default, plus whatever ``OBELISK_ALLOWED_ORIGINS`` lists.
+    """
     configured = [
         item.strip().rstrip("/") for item in settings.ALLOWED_ORIGINS.split(",") if item.strip()
     ]
-    return sorted({*configured, "http://localhost:5173", "http://127.0.0.1:5173"})
+    return sorted(
+        {
+            *configured,
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+        }
+    )
 
 
 app = FastAPI(
@@ -128,12 +142,11 @@ app = FastAPI(
     dependencies=[Depends(require_principal)],
 )
 
-# CORS. While auth is off, the wildcard is what LAN clients and the Vite dev server
-# rely on. A wildcard cannot carry credentials, so the moment auth is enforced the set
-# has to be explicit -- otherwise the session cookie would silently never be sent.
+# CORS. Explicit origins only, in both modes: a wildcard let any page the operator visited
+# drive the API, and it cannot carry credentials anyway.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins() if settings.AUTH_ENABLED else ["*"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
