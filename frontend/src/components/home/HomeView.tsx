@@ -276,9 +276,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
       </div>
 
       {/* 3. Two-Column Layout: Managed Services (2/3) + Stacked Engine & Storage Cards (1/3) */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Managed Services Grid (Left Column 2/3) */}
-        <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs space-y-4">
+        <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex flex-col justify-between h-full space-y-4">
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
             <div>
               <h3 className="text-sm font-bold text-slate-900 tracking-tight">
@@ -368,9 +368,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         </div>
 
         {/* Right Stacked Column (1/3): 1. Compute & System Resources + 2. Lakehouse Storage & Engine */}
-        <div className="space-y-4">
+        <div className="flex flex-col gap-4 h-full">
           {/* Card 1: Compute & System Resources */}
-          <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs space-y-4">
+          <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex-1 flex flex-col justify-between space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div className="flex items-center gap-2">
                 <Activity className="w-4 h-4 text-sky-600" />
@@ -442,7 +442,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
           </div>
 
           {/* Card 2: Lakehouse Storage & Engine Health */}
-          <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs space-y-4">
+          <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex-1 flex flex-col justify-between space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div className="flex items-center gap-2">
                 <Database className="w-4 h-4 text-emerald-600" />
