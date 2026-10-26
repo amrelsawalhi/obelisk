@@ -18,12 +18,14 @@ import {
   Edit2,
   AlertTriangle,
   Code2,
+  Database,
 } from 'lucide-react';
 import { api } from '../../lib/api';
 import type {
   VariableItem,
   Connection,
   ConnectionTestResult,
+  DbtWarehouseInfo,
 } from '../../lib/types';
 import { AddConnectionModal } from '../catalog/AddConnectionModal';
 import { SdkDocsView } from './SdkDocsView';
@@ -55,6 +57,10 @@ export const SettingsView: React.FC = () => {
   const [testingConnId, setTestingConnId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, ConnectionTestResult>>({});
   const [deletingConnId, setDeletingConnId] = useState<string | null>(null);
+  // Which connection dbt publishes marts into. A decision, stored server-side — the
+  // platform no longer infers it from whichever Postgres row is newest.
+  const [warehouse, setWarehouse] = useState<DbtWarehouseInfo | null>(null);
+  const [warehouseSaving, setWarehouseSaving] = useState(false);
 
   const loadData = async (silent = false) => {
     try {
@@ -62,19 +68,37 @@ export const SettingsView: React.FC = () => {
       else setRefreshing(true);
       setError(null);
 
-      const [varsData, connsData] = await Promise.all([
+      const [varsData, connsData, warehouseData] = await Promise.all([
         api.getVariables(),
         api.listConnections(),
+        api.getDbtWarehouse().catch(() => null),
       ]);
 
       setVariables(varsData);
       setConnections(connsData);
+      if (warehouseData) setWarehouse(warehouseData.warehouse);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'Failed to fetch settings';
       setError(msg);
     } finally {
       setLoading(false);
       setRefreshing(false);
+    }
+  };
+
+  const chooseWarehouse = async (connectionId: string) => {
+    setWarehouseSaving(true);
+    try {
+      const res = await api.setDbtWarehouse(connectionId || null);
+      setWarehouse(res.warehouse);
+    } catch (e: unknown) {
+      const msg =
+        e && typeof e === 'object' && 'response' in e
+          ? (e as { response?: { data?: { detail?: string } } }).response?.data?.detail ?? 'Could not set the warehouse.'
+          : 'Could not set the warehouse.';
+      setError(msg);
+    } finally {
+      setWarehouseSaving(false);
     }
   };
 
@@ -457,6 +481,36 @@ export const SettingsView: React.FC = () => {
             Enterprise database and API credentials are encrypted at rest with Fernet AES-128 tokens in <code className="font-mono text-slate-700 bg-slate-100 px-1 py-0.5 rounded">data/obelisk.db</code>.
           </p>
 
+          {/* Where the marts go is a choice, so it is made here instead of inferred */}
+          <div className="flex flex-wrap items-center gap-3 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+            <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-600">
+              <Database className="w-3.5 h-3.5 text-slate-400" />
+              Publish marts into
+            </div>
+            <select
+              value={warehouse?.id ?? ''}
+              onChange={(e) => void chooseWarehouse(e.target.value)}
+              disabled={warehouseSaving}
+              className="text-[11px] font-mono bg-white border border-slate-300 rounded-md px-2 py-1 outline-hidden focus:border-sky-500"
+            >
+              <option value="">Not selected — publishing is refused</option>
+              {connections
+                .filter((c) => ['postgres', 'postgresql'].includes(c.source_type))
+                .map((c) => (
+                  <option key={c.id} value={c.id} disabled={c.read_only !== false}>
+                    {c.name} · {c.host}:{c.port}/{c.database}
+                    {c.read_only !== false ? ' (read-only)' : ''}
+                  </option>
+                ))}
+            </select>
+            <span className="text-[10px] text-slate-500">
+              {warehouse?.message ||
+                (warehouse?.read_only
+                  ? 'Read-only target: publishing is refused.'
+                  : 'dbt builds and obelisk.save() publish here.')}
+            </span>
+          </div>
+
           {connections.length === 0 ? (
             <div className="p-8 text-center border border-dashed border-slate-200 rounded-lg">
               <Key className="w-8 h-8 text-slate-300 mx-auto mb-2" />
@@ -501,6 +555,21 @@ export const SettingsView: React.FC = () => {
                           <span className="px-2 py-0.5 rounded text-[10px] uppercase font-semibold bg-sky-50 text-sky-700 border border-sky-200">
                             {conn.source_type}
                           </span>
+                          {conn.read_only !== false ? (
+                            <span
+                              className="ml-1 px-2 py-0.5 rounded text-[10px] uppercase font-semibold bg-slate-100 text-slate-600 border border-slate-200"
+                              title="Obelisk reads this source and never writes into it."
+                            >
+                              Read-only
+                            </span>
+                          ) : (
+                            <span
+                              className="ml-1 px-2 py-0.5 rounded text-[10px] uppercase font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200"
+                              title="Obelisk may publish dbt models or a saved DataFrame into this database."
+                            >
+                              Writable
+                            </span>
+                          )}
                         </td>
                         <td className="py-2.5 px-3.5 text-slate-600 truncate max-w-[200px]" title={`${conn.host}:${conn.port}`}>
                           {conn.source_type === 'api' ? conn.host : `${conn.host}:${conn.port}`}

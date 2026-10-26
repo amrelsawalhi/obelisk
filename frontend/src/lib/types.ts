@@ -175,6 +175,8 @@ export interface Connection {
   database: string;
   username: string;
   options?: Record<string, unknown> | null;
+  /** The operator's setting: false means Obelisk may publish into this database. */
+  read_only?: boolean;
   created_at: string;
   updated_at?: string;
 }
@@ -188,6 +190,8 @@ export interface CreateConnectionRequest {
   username: string;
   password?: string;
   options?: Record<string, unknown>;
+  /** Omit to let the driver decide (postgres read-only, everything else writable). */
+  read_only?: boolean;
 }
 
 export interface UpdateConnectionRequest {
@@ -199,6 +203,7 @@ export interface UpdateConnectionRequest {
   username?: string;
   password?: string;
   options?: Record<string, unknown>;
+  read_only?: boolean;
 }
 
 export interface ConnectionTestResult {
@@ -740,19 +745,55 @@ export interface DbtTarget {
   name: string;
   adapter: string;
   available: boolean;
+  /** The connection this row publishes into (Postgres outputs appear once per connection). */
+  connection_id?: string | null;
+  connection?: string | null;
+  /** True when the row is a read-only source: publishing is refused. */
+  read_only?: boolean;
   detail: {
     host?: string;
     port?: number;
     database?: string;
     path?: string;
     source?: string;
+    connection?: string | null;
+    read_only?: boolean;
+    message?: string;
   };
+}
+
+export interface DbtWarehouseInfo {
+  source: 'selection' | 'environment' | 'unset';
+  id?: string;
+  name?: string;
+  host?: string;
+  port?: number;
+  database?: string;
+  read_only: boolean;
+  message?: string;
+}
+
+export interface WarehouseCandidate {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  database: string;
+  read_only: boolean;
+  service_name?: string | null;
+}
+
+export interface DbtWarehouseState {
+  warehouse: DbtWarehouseInfo;
+  candidates: WarehouseCandidate[];
 }
 
 export interface DbtTargets {
   project: string;
   default: string;
   targets: DbtTarget[];
+  /** The connection the Postgres target publishes into, if one is selected. */
+  warehouse?: DbtWarehouseInfo;
 }
 
 export interface PipelineTargets {

@@ -1,10 +1,10 @@
 obelisk:
-  target: "{{ env_var('DBT_TARGET', 'dev') }}"
+  target: "{{ env_var('DBT_TARGET', 'lakehouse') }}"
   outputs:
     # Marts live in the lakehouse itself: this target attaches the DuckLake catalog, so
     # `dbt run` writes tables the catalog tree, the SDK and Query Studio can see without
-    # any import step. It is opt-in (DBT_TARGET=lakehouse) because switching the default
-    # would move every existing model's output to a different place.
+    # any import step. It is the default because a warehouse you do not have to import
+    # into is the point of the platform; set DBT_TARGET=dev to publish into PostgreSQL.
     lakehouse:
       type: duckdb
       path: "{{ env_var('DBT_DUCKDB_PATH', 'dbt.duckdb') }}"
@@ -17,18 +17,6 @@ obelisk:
           alias: lakehouse
           is_ducklake: true
     dev:
-      type: postgres
-      host: "{{ env_var('DBT_PG_HOST', 'localhost') }}"
-      port: "{{ env_var('DBT_PG_PORT', '5434') | int }}"
-      user: "{{ env_var('DBT_PG_USER', 'testuser') }}"
-      password: "{{ env_var('DBT_PG_PASSWORD', 'testpass') }}"
-      dbname: "{{ env_var('DBT_PG_DBNAME', 'sourcedb') }}"
-      schema: public
-      sslmode: "{{ env_var('DBT_PG_SSLMODE', 'disable') }}"
-      threads: 2
-      connect_timeout: 10
-      keepalives_idle: 0
-    postgres:
       type: postgres
       host: "{{ env_var('DBT_PG_HOST', 'localhost') }}"
       port: "{{ env_var('DBT_PG_PORT', '5434') | int }}"

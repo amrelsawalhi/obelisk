@@ -427,10 +427,11 @@ def _sync_table_to_postgres(schema: str, table_name: str) -> None:
     one statement.
     """
     from app.core.catalog import SOURCE as _SOURCE
-    from app.core.catalog import attach_lakehouse, quote_ident
-    from app.core.warehouse_resolver import resolve_warehouse_postgres_params
+    from app.core.catalog import attach_lakehouse
+    from app.core.dsn import sql_ident
+    from app.core.warehouse_resolver import resolve_write_warehouse_postgres_params
 
-    pg = resolve_warehouse_postgres_params()
+    pg = resolve_write_warehouse_postgres_params()
     conn_str = build_pg_dsn(
         dbname=pg["database"],
         host=pg["host"],
@@ -447,9 +448,9 @@ def _sync_table_to_postgres(schema: str, table_name: str) -> None:
         conn.execute("LOAD postgres;")
         alias = validate_alias("pg_sync_wh")
         conn.execute(f"ATTACH {sql_string(conn_str)} AS {alias} (TYPE POSTGRES);")
-        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{schema};")
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{sql_ident(schema)};")
         conn.execute(
-            f'CREATE OR REPLACE TABLE {alias}.{schema}."{table_name}" AS '
+            f"CREATE OR REPLACE TABLE {alias}.{sql_ident(schema)}.{sql_ident(table_name)} AS "
             f"SELECT * FROM {_SOURCE}.{quote_ident(schema)}.{quote_ident(table_name)};"
         )
         conn.execute(f"DETACH {alias};")

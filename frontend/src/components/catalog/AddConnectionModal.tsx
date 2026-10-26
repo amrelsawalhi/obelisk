@@ -26,6 +26,10 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [dataKey, setDataKey] = useState('');
+  // The operator's own decision, not something inferred at write time: a Postgres source
+  // defaults to read-only because it is read live, and everything else defaults to
+  // writable. Sending it explicitly is what makes the choice survive the form.
+  const [readOnly, setReadOnly] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ status: 'ok' | 'error'; message: string; latency_ms?: number } | null>(null);
@@ -42,6 +46,7 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
       setPassword('');
       const opts = initialConnection.options as Record<string, any> | undefined;
       setDataKey(opts?.data_key || '');
+      setReadOnly(initialConnection.read_only ?? initialConnection.source_type === 'postgres');
     } else {
       setName('');
       setSourceType('postgres');
@@ -51,6 +56,7 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
       setUsername('');
       setPassword('');
       setDataKey('');
+      setReadOnly(true);
     }
     setError(null);
   }, [initialConnection, isOpen]);
@@ -64,6 +70,9 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
     else if (type === 'oracle') setPort(1521);
     else if (type === 'mongodb') setPort(27017);
     else if (type === 'api') setPort(443);
+    // A fresh choice follows the safe default for that driver; the operator can still
+    // override it below, and once they do we stop moving it for them.
+    setReadOnly(type === 'postgres');
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -87,6 +96,7 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
           username: username.trim(),
           ...(password ? { password } : {}),
           options,
+          read_only: readOnly,
         });
       } else {
         await api.createConnection({
@@ -98,6 +108,7 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
           username: username.trim(),
           password,
           options,
+          read_only: readOnly,
         });
       }
 
@@ -339,6 +350,42 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
               </p>
             </div>
           )}
+
+          {/* Access: the operator's decision about writes, not an inference */}
+          <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
+            <div className="flex items-center justify-between gap-3">
+              <label className="block text-xs font-semibold text-slate-700">Access</label>
+              <div className="inline-flex rounded-lg border border-slate-300 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setReadOnly(true)}
+                  className={`px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                    readOnly
+                      ? 'bg-slate-800 text-white'
+                      : 'bg-white text-slate-600 hover:bg-slate-100'
+                  }`}
+                >
+                  Read-only
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setReadOnly(false)}
+                  className={`px-2.5 py-1 text-[11px] font-semibold transition-colors border-l border-slate-300 ${
+                    !readOnly
+                      ? 'bg-indigo-600 text-white'
+                      : 'bg-white text-slate-600 hover:bg-slate-100'
+                  }`}
+                >
+                  Read &amp; write
+                </button>
+              </div>
+            </div>
+            <p className="text-[10px] text-slate-500 leading-snug">
+              {readOnly
+                ? 'Obelisk reads this source and never writes into it. dbt models and obelisk.save() will not publish here.'
+                : 'Obelisk may create schemas and tables in this database when publishing dbt models or a DataFrame mirror.'}
+            </p>
+          </div>
 
           {testResult && (
             <div

@@ -66,7 +66,6 @@ export const ServicesView: React.FC = () => {
       const s = services[e.name];
       if (!s) return 2;
       if (s.status === 'running' && s.deployment_type === 'local') return 0;
-      if (s.deployment_type === 'remote') return 1;
       return 2;
     };
     return rank(a) - rank(b);
@@ -75,8 +74,7 @@ export const ServicesView: React.FC = () => {
     const s = services[e.name];
     return !!s && s.status === 'running' && s.deployment_type === 'local';
   }).length;
-  const connectedCount = sortedCatalog.filter((e) => services[e.name]?.deployment_type === 'remote').length;
-  const stoppedCount = catalog.length - runningCount - connectedCount;
+  const stoppedCount = catalog.length - runningCount;
 
   const selected = selectedService ? catalog.find((e) => e.name === selectedService) : undefined;
 
@@ -122,7 +120,6 @@ export const ServicesView: React.FC = () => {
           <div className="flex items-center gap-3">
             <div className="hidden md:flex items-center gap-3 text-xs font-mono">
               <span className="inline-flex items-center gap-1.5 text-emerald-600"><span className="w-2 h-2 rounded-full bg-emerald-500"></span>{runningCount} running</span>
-              <span className="inline-flex items-center gap-1.5 text-sky-600"><span className="w-2 h-2 rounded-full bg-sky-500"></span>{connectedCount} connected</span>
               <span className="inline-flex items-center gap-1.5 text-slate-400"><span className="w-2 h-2 rounded-full bg-slate-300"></span>{stoppedCount} stopped</span>
             </div>
             <button

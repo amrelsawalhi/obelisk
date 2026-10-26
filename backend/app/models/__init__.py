@@ -1,4 +1,5 @@
 from app.models.base import Base
+from app.models.app_setting import AppSetting
 from app.models.connection import Connection
 from app.models.service_config import ServiceConfig
 from app.models.query import QueryHistory
@@ -17,6 +18,7 @@ from app.models.pipeline import (
 
 __all__ = [
     "Base",
+    "AppSetting",
     "Connection",
     "ServiceConfig",
     "QueryHistory",

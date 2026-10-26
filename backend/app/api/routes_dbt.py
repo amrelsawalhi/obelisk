@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.core.catalog import InvalidTablePath
+from app.core.warehouse_resolver import WarehouseNotSelected, WarehouseReadOnly
 from app.engines.dbt_runner import dbt_runner
 
 router = APIRouter(prefix="/api/dbt", tags=["dbt Studio"])
@@ -25,11 +26,26 @@ class FileDeleteRequest(BaseModel):
     path: str = Field(..., description="Relative file path inside git_repo/dbt_project/")
 
 
+class WarehouseBinding(BaseModel):
+    """Which connection a Postgres target publishes into.
+
+    ``connection_id`` is the binding; the target name only picks the adapter. Without a
+    binding a Postgres build is refused, because the alternative is guessing.
+    """
+
+    connection_id: Optional[str] = Field(
+        default=None, description="Connection id to use as a warehouse; null clears it"
+    )
+
+
 class CompileModelRequest(BaseModel):
     model_name: str = Field(..., description="Name of the dbt model (e.g. stg_orders)")
     target: Optional[str] = Field(
         default=None,
         description="A target name from profiles.yml; defaults to the profile's own default",
+    )
+    connection_id: Optional[str] = Field(
+        default=None, description="Warehouse connection for a Postgres target"
     )
 
 
@@ -40,6 +56,9 @@ class PreviewModelRequest(BaseModel):
         description="A target name from profiles.yml; defaults to the profile's own default",
     )
     limit: Optional[int] = Field(default=50, description="Max rows to return for DataGrid preview")
+    connection_id: Optional[str] = Field(
+        default=None, description="Warehouse connection for a Postgres target"
+    )
 
 
 class RunDbtRequest(BaseModel):
@@ -48,6 +67,10 @@ class RunDbtRequest(BaseModel):
         default=None,
         description="A target name from profiles.yml; defaults to the profile's own default",
     )
+    connection_id: Optional[str] = Field(
+        default=None,
+        description="Warehouse connection this run publishes into (Postgres targets only)",
+    )
 
 
 class TestDbtRequest(BaseModel):
@@ -55,6 +78,9 @@ class TestDbtRequest(BaseModel):
     target: Optional[str] = Field(
         default=None,
         description="A target name from profiles.yml; defaults to the profile's own default",
+    )
+    connection_id: Optional[str] = Field(
+        default=None, description="Warehouse connection for a Postgres target"
     )
 
 
@@ -151,12 +177,57 @@ async def delete_dbt_file(
         raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
 
 
+@router.get("/warehouse")
+async def get_warehouse():
+    """The connection marts publish into, plus the candidates a picker can offer."""
+    from app.core.warehouse_resolver import describe_warehouse_postgres, warehouse_candidates
+
+    return {
+        "warehouse": describe_warehouse_postgres(),
+        "candidates": warehouse_candidates(),
+    }
+
+
+@router.put("/warehouse")
+async def set_warehouse(req: WarehouseBinding):
+    """Bind the Postgres target to one connection — or clear the choice."""
+    from app.core.warehouse_resolver import (
+        describe_warehouse_postgres,
+        set_warehouse_connection_id,
+        warehouse_candidate,
+    )
+
+    if req.connection_id:
+        candidate = warehouse_candidate(req.connection_id.strip())
+        if not candidate:
+            raise HTTPException(status_code=404, detail="No such Postgres connection.")
+        if candidate["read_only"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Connection {candidate['name']!r} is read-only. Mark it writable "
+                    "before making it the warehouse."
+                ),
+            )
+    set_warehouse_connection_id(req.connection_id)
+    return {"warehouse": describe_warehouse_postgres()}
+
+
 @router.post("/compile")
 async def compile_dbt_model(req: CompileModelRequest):
     """Runs dbt compile for a specific model and returns the compiled SQL, duration, and logs."""
     try:
-        res = await asyncio.to_thread(dbt_runner.compile_model, req.model_name, req.target or dbt_runner.default_target())
+        res = await asyncio.to_thread(
+            dbt_runner.compile_model,
+            req.model_name,
+            req.target or dbt_runner.default_target(),
+            req.connection_id,
+        )
         return res
+    except WarehouseNotSelected as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except WarehouseReadOnly as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"dbt compilation failed: {str(e)}")
 
@@ -170,8 +241,13 @@ async def preview_dbt_model_data(req: PreviewModelRequest):
             model_name=req.model_name,
             target=req.target or dbt_runner.default_target(),
             limit=req.limit or 50,
+            connection_id=req.connection_id,
         )
         return res
+    except WarehouseNotSelected as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except WarehouseReadOnly as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to preview model data: {str(e)}")
 
@@ -185,8 +261,14 @@ async def run_dbt_models(req: RunDbtRequest):
             command="run",
             selector=req.selector or "*",
             target=req.target or dbt_runner.default_target(),
+            connection_id=req.connection_id,
         )
         return res
+    except WarehouseNotSelected as exc:
+        # No warehouse chosen: a refusal with the fix, not a build failure.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except WarehouseReadOnly as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"dbt run failed: {str(e)}")
 
@@ -200,8 +282,13 @@ async def test_dbt_models(req: TestDbtRequest):
             command="test",
             selector=req.selector or "*",
             target=req.target or dbt_runner.default_target(),
+            connection_id=req.connection_id,
         )
         return res
+    except WarehouseNotSelected as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except WarehouseReadOnly as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"dbt test failed: {str(e)}")
 

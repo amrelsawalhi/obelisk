@@ -19,6 +19,10 @@ from app.core.service_blueprints import get_blueprint, blueprint_catalog_entries
 from app.core.deploy_tracker import deploy_tracker
 from app.core.process_manager import process_manager
 from app.core.vault import encrypt, decrypt
+from app.core.warehouse_resolver import (
+    get_warehouse_connection_id,
+    set_warehouse_connection_id,
+)
 from app.config import settings
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -45,20 +49,10 @@ class DeployLocalRequest(BaseModel):
     database: Optional[str] = Field(None, description="Custom database name (e.g. for PostgreSQL)")
     env_vars: Optional[Dict[str, str]] = Field(None, description="Additional environment variable overrides")
 
-class ConnectRemoteRequest(BaseModel):
-    service_name: str = Field(..., description="Service identifier, e.g. postgres, clickhouse")
-    host: str = Field(..., description="Remote host or IP")
-    port: int = Field(..., description="Remote port")
-    config_json: Optional[Dict[str, Any]] = Field(None, description="Additional connection params")
-    username: Optional[str] = Field(None, description="Remote database username")
-    password: Optional[str] = Field(None, description="Remote database password (stored encrypted)")
-    database: Optional[str] = Field(None, description="Remote database name")
-    sslmode: Optional[str] = Field(None, description="SSL mode, e.g. 'disable' or 'require'")
-
 class ServiceStatusResponse(BaseModel):
     service_name: str
-    deployment_type: str # local or remote
-    status: str # running, stopped, connected, error
+    deployment_type: str # retained for older clients; services are always local now
+    status: str # running, stopped, error
     host: str
     port: int
     allocated_memory_mb: int
@@ -89,6 +83,55 @@ class HostSpecsResponse(BaseModel):
     cpu_percent: float
     max_safe_allocation_bytes: int
     max_safe_allocation_gb: float
+
+async def _register_service_connection(
+    db: AsyncSession, bp, credentials, host_port: int
+) -> Optional[Connection]:
+    """Makes a ready service's database a first-class Connection.
+
+    Linked by ``service_name`` — not by display name — so a redeploy updates the same row,
+    and created **writable**: Obelisk publishes marts into the database it deployed, and a
+    read-only row would make the write resolver refuse its own warehouse.
+    """
+    if not bp.provides or credentials is None:
+        return None
+
+    record = (
+        await db.execute(select(Connection).where(Connection.service_name == bp.name))
+    ).scalar_one_or_none()
+    values = {
+        "name": f"{bp.display_name} (local)",
+        "source_type": bp.provides,
+        "host": "localhost",
+        "port": host_port,
+        "database": credentials.database or "",
+        "username": credentials.username or "",
+        "encrypted_credentials": encrypt(credentials.password or ""),
+        "options": {},
+        "read_only": False,
+    }
+    if record:
+        for key, value in values.items():
+            setattr(record, key, value)
+    else:
+        record = Connection(service_name=bp.name, **values)
+        db.add(record)
+    await db.flush()
+    return record
+
+
+async def _forget_service_connection(db: AsyncSession, service_name: str) -> None:
+    """A destroyed service's database is gone, so its Connection goes with it."""
+    record = (
+        await db.execute(select(Connection).where(Connection.service_name == service_name))
+    ).scalar_one_or_none()
+    if not record:
+        return
+    if get_warehouse_connection_id() == record.id:
+        set_warehouse_connection_id(None)
+    await db.delete(record)
+    await db.commit()
+
 
 @router.get("/advisor/specs", response_model=HostSpecsResponse)
 async def get_hardware_specs():
@@ -499,24 +542,21 @@ async def deploy_local_service(
             svc_record.port = host_port
             svc_record.config_json = config_json
 
-        # Auto-register as a catalog Connection so Query Studio / pipelines can use it immediately
+        # A service that provides a database owns a Connection row the moment it is
+        # ready: one rule, applied by what the blueprint declares rather than by a flag
+        # somebody has to remember to set.
         registered_name = None
-        if ready and bp.register_connection and bp.connection_type and credentials:
-            conn_name = f"Obelisk {bp.display_name} (local)"
-            existing_conn = (await db.execute(
-                select(Connection).where(Connection.name == conn_name))).scalar_one_or_none()
-            enc_pw = encrypt(credentials.password or "")
-            if existing_conn:
-                existing_conn.host = "localhost"
-                existing_conn.port = host_port
-                existing_conn.database = credentials.database or ""
-                existing_conn.username = credentials.username or ""
-                existing_conn.encrypted_credentials = enc_pw
-            else:
-                db.add(Connection(name=conn_name, source_type=bp.connection_type, host="localhost",
-                                  port=host_port, database=credentials.database or "",
-                                  username=credentials.username or "", encrypted_credentials=enc_pw))
-            registered_name = conn_name
+        if ready and bp.provides and credentials:
+            conn_record = await _register_service_connection(db, bp, credentials, host_port)
+            registered_name = conn_record.name if conn_record else None
+            # Deploying the warehouse is itself a choice, so adopt it unless the operator
+            # already picked a different one.
+            if (
+                conn_record is not None
+                and bp.provides == "postgres"
+                and get_warehouse_connection_id() is None
+            ):
+                set_warehouse_connection_id(conn_record.id)
 
         await db.commit()
         await db.refresh(svc_record)
@@ -542,98 +582,6 @@ async def deploy_local_service(
         deploy_tracker.fail(svc_name, str(e))
         raise
 
-
-@router.post("/connect", response_model=ServiceStatusResponse)
-async def connect_remote_service(
-    req: ConnectRemoteRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """Connect existing remote enterprise database or service."""
-    svc_name = req.service_name.lower()
-    if svc_name not in SUPPORTED_SERVICES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported service '{svc_name}'."
-        )
-
-    # Stop local container if running
-    try:
-        await asyncio.to_thread(docker_mgr.stop_service, svc_name)
-    except Exception:
-        pass
-
-    stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
-    result = await db.execute(stmt)
-    svc_record = result.scalar_one_or_none()
-
-    # Persist the connection parameters so Query Studio, dbt and the SDK all
-    # resolve the same credentials. The password is vaulted, never plaintext.
-    config_json: Dict[str, Any] = dict(svc_record.config_json or {}) if svc_record else {}
-    config_json.update(dict(req.config_json or {}))
-    if req.username and req.username.strip():
-        config_json["username"] = req.username.strip()
-    if req.database and req.database.strip():
-        config_json["database"] = req.database.strip()
-    if req.sslmode and req.sslmode.strip():
-        config_json["sslmode"] = req.sslmode.strip()
-    if req.password and req.password.strip():
-        config_json["encrypted_password"] = encrypt(req.password.strip())
-
-    if not svc_record:
-        svc_record = ServiceConfig(
-            service_name=svc_name,
-            deployment_type="remote",
-            status="connected",
-            container_id=None,
-            host=req.host,
-            port=req.port,
-            allocated_memory_mb=0,
-            config_json=config_json,
-        )
-        db.add(svc_record)
-    else:
-        svc_record.deployment_type = "remote"
-        svc_record.status = "connected"
-        svc_record.container_id = None
-        svc_record.host = req.host
-        svc_record.port = req.port
-        svc_record.allocated_memory_mb = 0
-        svc_record.config_json = config_json
-
-    # A remote PostgreSQL becomes a first-class catalog Connection so it appears in
-    # the Data Catalog and Query Studio straight away.
-    if svc_name == "postgres" and config_json.get("username") and config_json.get("encrypted_password"):
-        conn_name = "Obelisk PostgreSQL (remote)"
-        remote_conn = (await db.execute(
-            select(Connection).where(Connection.name == conn_name))).scalar_one_or_none()
-        conn_values: Dict[str, Any] = {
-            "source_type": "postgres",
-            "host": req.host,
-            "port": req.port,
-            "database": config_json.get("database") or "",
-            "username": config_json["username"],
-            "encrypted_credentials": config_json["encrypted_password"],
-            "options": {"sslmode": config_json.get("sslmode", "disable")},
-        }
-        if remote_conn:
-            for key, value in conn_values.items():
-                setattr(remote_conn, key, value)
-        else:
-            db.add(Connection(name=conn_name, **conn_values))
-
-    await db.commit()
-    await db.refresh(svc_record)
-
-    return ServiceStatusResponse(
-        service_name=svc_name,
-        deployment_type="remote",
-        status="connected",
-        host=req.host,
-        port=req.port,
-        allocated_memory_mb=0,
-        container_id=None,
-        live_docker_status=None,
-    )
 
 @router.post("/{service_name}/stop")
 async def stop_service(
@@ -737,6 +685,7 @@ async def destroy_service(service_name: str, db: AsyncSession = Depends(get_db))
             svc_record.status = "stopped"
             svc_record.container_id = None
             await db.commit()
+        await _forget_service_connection(db, svc_name)
         return {"service_name": svc_name, "status": "destroyed", "data_removed": True}
 
     # Destroy is also the cleanup path for orphaned volumes (after stop or a crash),
@@ -766,4 +715,5 @@ async def destroy_service(service_name: str, db: AsyncSession = Depends(get_db))
         svc_record.container_id = None
         await db.commit()
 
+    await _forget_service_connection(db, svc_name)
     return {"service_name": svc_name, "status": "destroyed", "data_removed": True}

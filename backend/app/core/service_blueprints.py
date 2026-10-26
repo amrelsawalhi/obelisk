@@ -46,8 +46,10 @@ class ServiceBlueprint:
     readiness: Optional[ReadinessProbe] = None
     probe_timeout_seconds: int = 90
     image_size_gb: float = 1.0                   # rough pull footprint for disk pre-flight
-    register_connection: bool = False            # auto-register as catalog Connection when ready
-    connection_type: Optional[str] = None        # Connection.source_type for registration
+    # What this service *is*, in platform terms: the Connection.source_type it provides
+    # once it is ready. Declared once here, and the deploy path registers the Connection
+    # from it — no per-service boolean to remember and no second way to describe a source.
+    provides: Optional[str] = None
     web_ui: bool = False                         # primary host port serves a browsable web UI
     web_ui_path: Optional[str] = None             # relative gateway subpath (e.g. "/gitea") served by Caddy / Vite proxy
     post_start_commands: List[str] = field(default_factory=list)  # exec'd after container start (init flows)
@@ -79,8 +81,7 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
         image_size_gb=1.0,
         credential_username="postgres",
         credential_database="obelisk",
-        register_connection=True,
-        connection_type="postgres",
+        provides="postgres",
     ),
     ServiceBlueprint(
         name="clickhouse",
@@ -202,7 +203,7 @@ def blueprint_catalog_entries() -> List[Dict[str, Any]]:
             "needs_credentials": "__GENERATED__" in bp.env.values(),
             "default_username": bp.credential_username,
             "default_database": bp.credential_database,
-            "register_connection": bp.register_connection,
+            "provides": bp.provides,
             "web_ui": bp.web_ui,
             "web_ui_path": bp.web_ui_path,
             "post_start": bool(bp.post_start_commands),

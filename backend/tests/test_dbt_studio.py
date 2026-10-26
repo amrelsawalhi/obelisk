@@ -1,9 +1,49 @@
 import pytest
 from httpx import AsyncClient, ASGITransport
 from pathlib import Path
+import uuid
 
+from app.core.warehouse_resolver import get_warehouse_connection_id, set_warehouse_connection_id
 from app.main import app
 from app.engines.dbt_runner import dbt_runner
+
+
+@pytest.fixture()
+async def bound_warehouse(source_postgres_params):
+    """Binds the live Postgres these dbt tests build against as the warehouse.
+
+    Publishing is a decision now — there is no "newest Postgres row" fallback — so the
+    test makes the same explicit choice an operator makes: register the database, then
+    select it in Settings. Without this a Postgres target is refused with a 409.
+    """
+    transport = ASGITransport(app=app)
+    previous = get_warehouse_connection_id()
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/api/catalog/connections",
+            json={
+                "name": f"zzdbt{uuid.uuid4().hex[:6]}",
+                "source_type": "postgres",
+                "host": source_postgres_params["host"],
+                "port": int(source_postgres_params["port"]),
+                "database": source_postgres_params["database"],
+                "username": source_postgres_params["user"],
+                "password": source_postgres_params["password"],
+                "read_only": False,
+            },
+        )
+        assert created.status_code == 200, created.text
+        connection = created.json()
+        bound = await client.put(
+            "/api/dbt/warehouse", json={"connection_id": connection["id"]}
+        )
+        assert bound.status_code == 200, bound.text
+    try:
+        yield connection["id"]
+    finally:
+        set_warehouse_connection_id(previous)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            await client.delete(f"/api/catalog/connections/{connection['id']}")
 
 
 async def _seed_sample_data(client: AsyncClient) -> dict:
@@ -33,7 +73,7 @@ async def test_dbt_studio_project_tree():
 
 
 @pytest.mark.asyncio
-async def test_dbt_studio_file_lifecycle_and_compile(source_postgres_params):
+async def test_dbt_studio_file_lifecycle_and_compile(source_postgres_params, bound_warehouse):
     """
     Tests creating a real model file models/staging/stg_test_unit.sql,
     reading it, compiling it with real dbt compile, and verifying output.
@@ -90,7 +130,7 @@ async def test_dbt_studio_file_lifecycle_and_compile(source_postgres_params):
 
 
 @pytest.mark.asyncio
-async def test_dbt_studio_preview_data(source_postgres_params):
+async def test_dbt_studio_preview_data(source_postgres_params, bound_warehouse):
     """
     Tests previewing data from a compiled model against the real PostgreSQL container.
     """
@@ -121,7 +161,7 @@ async def test_dbt_studio_preview_data(source_postgres_params):
 
 
 @pytest.mark.asyncio
-async def test_dbt_studio_run_and_test(source_postgres_params):
+async def test_dbt_studio_run_and_test(source_postgres_params, bound_warehouse):
     """
     Tests executing real dbt run and dbt test against schema validations.
     """

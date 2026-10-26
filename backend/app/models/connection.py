@@ -26,6 +26,12 @@ class Connection(Base):
     read_only: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="1"
     )
+    # Set when a deployed service provides this database. It makes the link explicit
+    # instead of matching on a display name, so a redeploy updates the same row and
+    # destroying the service can remove it.
+    service_name: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True, unique=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, 

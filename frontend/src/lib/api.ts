@@ -4,7 +4,6 @@ import type {
   ServiceRecommendation,
   ServiceStatus,
   DeployLocalRequest,
-  ConnectRemoteRequest,
   CatalogNode,
   Connection,
   CreateConnectionRequest,
@@ -38,6 +37,8 @@ import type {
   PipelineExecutionDetail,
   PipelineTargets,
   DbtTargets,
+  DbtWarehouseState,
+  DbtWarehouseInfo,
   CreatePipelinePayload,
   GraphPayload,
   ExecutionStatus,
@@ -93,10 +94,6 @@ export const api = {
   },
   destroyService: async (serviceName: string): Promise<{ service_name: string; status: string; data_removed: boolean }> => {
     const res = await apiClient.post<{ service_name: string; status: string; data_removed: boolean }>(`/services/${serviceName}/destroy`);
-    return res.data;
-  },
-  connectRemoteService: async (req: ConnectRemoteRequest): Promise<ServiceStatus> => {
-    const res = await apiClient.post<ServiceStatus>('/services/connect', req);
     return res.data;
   },
   stopService: async (serviceName: string): Promise<{ service_name: string; status: string }> => {
@@ -473,6 +470,18 @@ export const api = {
     return res.data;
   },
 
+  getDbtWarehouse: async (): Promise<DbtWarehouseState> => {
+    const res = await apiClient.get<DbtWarehouseState>('/dbt/warehouse');
+    return res.data;
+  },
+
+  setDbtWarehouse: async (connection_id: string | null): Promise<{ warehouse: DbtWarehouseInfo }> => {
+    const res = await apiClient.put<{ warehouse: DbtWarehouseInfo }>('/dbt/warehouse', {
+      connection_id,
+    });
+    return res.data;
+  },
+
   getDbtTree: async (): Promise<DbtTreeNode> => {
     const res = await apiClient.get<DbtTreeNode>('/dbt/tree');
     return res.data;
@@ -500,35 +509,39 @@ export const api = {
     return res.data;
   },
 
-  compileDbtModel: async (model_name: string, target: string = 'postgres'): Promise<DbtCompileResponse> => {
+  compileDbtModel: async (model_name: string, target: string = 'postgres', connection_id?: string | null): Promise<DbtCompileResponse> => {
     const res = await apiClient.post<DbtCompileResponse>('/dbt/compile', {
       model_name,
       target,
+      connection_id: connection_id ?? null,
     });
     return res.data;
   },
 
-  previewDbtModel: async (model_name: string, target: string = 'postgres', limit: number = 50): Promise<DbtPreviewResponse> => {
+  previewDbtModel: async (model_name: string, target: string = 'postgres', limit: number = 50, connection_id?: string | null): Promise<DbtPreviewResponse> => {
     const res = await apiClient.post<DbtPreviewResponse>('/dbt/preview', {
       model_name,
       target,
       limit,
+      connection_id: connection_id ?? null,
     });
     return res.data;
   },
 
-  runDbtModels: async (selector: string = '*', target: string = 'postgres'): Promise<DbtExecutionResponse> => {
+  runDbtModels: async (selector: string = '*', target: string = 'postgres', connection_id?: string | null): Promise<DbtExecutionResponse> => {
     const res = await apiClient.post<DbtExecutionResponse>('/dbt/run', {
       selector,
       target,
+      connection_id: connection_id ?? null,
     });
     return res.data;
   },
 
-  testDbtModels: async (selector: string = '*', target: string = 'postgres'): Promise<DbtExecutionResponse> => {
+  testDbtModels: async (selector: string = '*', target: string = 'postgres', connection_id?: string | null): Promise<DbtExecutionResponse> => {
     const res = await apiClient.post<DbtExecutionResponse>('/dbt/test', {
       selector,
       target,
+      connection_id: connection_id ?? null,
     });
     return res.data;
   },

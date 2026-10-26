@@ -29,10 +29,34 @@ def test_targets_are_read_from_the_profile():
         assert isinstance(target["available"], bool)
 
 
+def test_the_shipped_profile_has_no_duplicate_outputs():
+    """Two outputs with one configuration made the Studio's target list look broken."""
+    info = dbt_runner.list_targets()
+    names = [target["name"] for target in info["targets"]]
+    assert len(names) == len(set(names))
+
+    by_adapter: dict[str, list[str]] = {}
+    for target in info["targets"]:
+        by_adapter.setdefault(target["adapter"], []).append(target["name"])
+    assert len(by_adapter.get("postgres", [])) == 1, "exactly one PostgreSQL target"
+
+
+def test_the_default_target_is_the_lakehouse():
+    """dbt builds into the lakehouse unless the operator says otherwise."""
+    assert dbt_runner.default_target() == "lakehouse"
+    assert dbt_runner.postgres_target() == "dev"
+
+
 def test_the_target_name_is_passed_through_to_dbt():
-    env = dbt_runner._get_target_env("postgres")
-    # Not rewritten to 'dev': dbt must receive the target the operator picked.
-    assert env["DBT_TARGET"] == "postgres"
+    env = dbt_runner._get_target_env("lakehouse")
+    # Not rewritten to the default: dbt must receive the target the operator picked.
+    assert env["DBT_TARGET"] == "lakehouse"
+
+
+def test_the_old_postgres_target_name_still_resolves():
+    """``postgres`` was a duplicate output; an env var left over from it means ``dev``."""
+    assert dbt_runner._target_adapter("postgres") == ""
+    assert dbt_runner.postgres_target() == "dev"
 
 
 @pytest.mark.asyncio

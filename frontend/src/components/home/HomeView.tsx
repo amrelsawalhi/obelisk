@@ -433,21 +433,17 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                         : 'bg-slate-100 text-slate-500'
                     }`}
                   >
-                    {isRunning ? (status?.deployment_type === 'remote' ? 'Remote' : 'Running') : 'Stopped'}
+                    {isRunning ? 'Running' : 'Stopped'}
                   </span>
                 </div>
 
                 <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs">
                   {isRunning ? (
-                    status?.deployment_type === 'remote' ? (
-                      <span className="font-mono text-[11px] text-slate-500">Remote Service</span>
-                    ) : (
-                      <span className="font-mono text-[11px] text-slate-700 font-medium">
-                        {status?.allocated_memory_mb && status.allocated_memory_mb > 0
-                          ? `${(status.allocated_memory_mb / 1024).toFixed(1)} GB RAM`
-                          : 'Localhost'}
-                      </span>
-                    )
+                    <span className="font-mono text-[11px] text-slate-700 font-medium">
+                      {status?.allocated_memory_mb && status.allocated_memory_mb > 0
+                        ? `${(status.allocated_memory_mb / 1024).toFixed(1)} GB RAM`
+                        : 'Localhost'}
+                    </span>
                   ) : (
                     <span className="text-[11px] text-slate-400">Offline</span>
                   )}

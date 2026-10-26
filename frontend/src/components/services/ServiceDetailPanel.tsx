@@ -3,10 +3,8 @@ import { createPortal } from 'react-dom';
 import {
   X,
   Zap,
-  Globe,
   StopCircle,
   ExternalLink,
-  Unlink,
   Terminal,
   Trash2,
   ChevronDown,
@@ -52,19 +50,12 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
   const isProcess = service.run_mode === 'process';
 
   const [recommendation, setRecommendation] = useState<ServiceRecommendation | null>(null);
-  const [mode, setMode] = useState<'local' | 'remote'>(status?.deployment_type === 'remote' ? 'remote' : 'local');
   const [customMem, setCustomMem] = useState('');
   const [customPort, setCustomPort] = useState('');
   const [customImage, setCustomImage] = useState('');
   const [customUsername, setCustomUsername] = useState('');
   const [customPassword, setCustomPassword] = useState('');
   const [customDatabase, setCustomDatabase] = useState('');
-  const [remoteHost, setRemoteHost] = useState(status?.host || '');
-  const [remotePort, setRemotePort] = useState(status?.port ? String(status.port) : '');
-  const [remoteUsername, setRemoteUsername] = useState('');
-  const [remotePassword, setRemotePassword] = useState('');
-  const [remoteDatabase, setRemoteDatabase] = useState('');
-  const [remoteSslMode, setRemoteSslMode] = useState('disable');
   const [operating, setOperating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
@@ -82,10 +73,9 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
   }, [service.name]);
 
   const isLocalRunning = status?.status === 'running' && status?.deployment_type === 'local';
-  const isRemoteConnected = (status?.status === 'connected' || status?.status === 'running') && status?.deployment_type === 'remote';
-  const isRunning = isLocalRunning || isRemoteConnected;
+  const isRunning = isLocalRunning;
   const engineDown = engineStatus ? !engineStatus.docker.available : false;
-  // Services that accept user-supplied credentials at deploy/connect time.
+  // Services that accept user-supplied credentials at deploy time.
   const acceptsCredentials = service.needs_credentials || service.name === 'postgres' || service.name === 'superset';
   const acceptsDatabase = service.name === 'postgres' || service.name === 'clickhouse';
 
@@ -156,27 +146,6 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
     }
   };
 
-  const handleConnectRemote = async () => {
-    setOperating(true);
-    setError(null);
-    try {
-      await api.connectRemoteService({
-        service_name: service.name,
-        host: remoteHost || 'localhost',
-        port: parseInt(remotePort) || service.default_host_port,
-        username: remoteUsername.trim() || undefined,
-        password: remotePassword || undefined,
-        database: remoteDatabase.trim() || undefined,
-        sslmode: remoteSslMode,
-      });
-      onChanged();
-    } catch (e: unknown) {
-      setError(extractErrorMessage(e, `Failed to connect remote ${service.name}`));
-    } finally {
-      setOperating(false);
-    }
-  };
-
   const handleDestroy = async () => {
     const confirmed = window.confirm(
       isProcess
@@ -242,7 +211,7 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
               {isRunning ? (
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-600 text-white">
                   <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
-                  {isRemoteConnected ? 'Connected' : 'Running'}
+                  Running
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-200 text-slate-500">
@@ -281,18 +250,6 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
               </div>
             )}
 
-            <div className="flex rounded-lg bg-slate-100 p-0.5 text-xs font-medium text-slate-600">
-              <button onClick={() => setMode('local')} className={`flex-1 py-1.5 rounded-md flex items-center justify-center gap-1.5 transition-all ${mode === 'local' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'hover:text-slate-900'}`}>
-                <Zap className="w-3.5 h-3.5 text-amber-500" />
-                Deploy Locally
-              </button>
-              <button onClick={() => setMode('remote')} className={`flex-1 py-1.5 rounded-md flex items-center justify-center gap-1.5 transition-all ${mode === 'remote' ? 'bg-white text-slate-900 font-semibold shadow-2xs' : 'hover:text-slate-900'}`}>
-                <Globe className="w-3.5 h-3.5 text-sky-600" />
-                Connect Remote
-              </button>
-            </div>
-
-            {mode === 'local' ? (
               <div className="space-y-3">
                 <div className="flex items-center gap-2 flex-wrap">
                   {isLocalRunning ? (
@@ -378,60 +335,6 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
                   </div>
                 )}
               </div>
-            ) : (
-              <div className="space-y-3">
-                <div className="grid grid-cols-3 gap-2">
-                  <div className="col-span-2">
-                    <label className="text-[11px] font-medium text-slate-500 block mb-1">Remote Host / IP</label>
-                    <input type="text" placeholder="db.internal.corp" value={remoteHost} onChange={(e) => setRemoteHost(e.target.value)} className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500" />
-                  </div>
-                  <div>
-                    <label className="text-[11px] font-medium text-slate-500 block mb-1">Port</label>
-                    <input type="number" placeholder={String(service.default_host_port)} value={remotePort} onChange={(e) => setRemotePort(e.target.value)} className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500" />
-                  </div>
-                </div>
-
-                {acceptsDatabase && (
-                  <>
-                    <div className="grid grid-cols-3 gap-2">
-                      <div>
-                        <label className="text-[11px] font-medium text-slate-500 block mb-1">Username</label>
-                        <input type="text" placeholder={service.default_username || 'postgres'} value={remoteUsername} onChange={(e) => setRemoteUsername(e.target.value)} className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500" />
-                      </div>
-                      <div>
-                        <label className="text-[11px] font-medium text-slate-500 block mb-1">Password</label>
-                        <input type="password" autoComplete="new-password" placeholder="Required" value={remotePassword} onChange={(e) => setRemotePassword(e.target.value)} className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500" />
-                      </div>
-                      <div>
-                        <label className="text-[11px] font-medium text-slate-500 block mb-1">SSL Mode</label>
-                        <select value={remoteSslMode} onChange={(e) => setRemoteSslMode(e.target.value)} className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500">
-                          <option value="disable">disable</option>
-                          <option value="require">require</option>
-                        </select>
-                      </div>
-                    </div>
-                    <div>
-                      <label className="text-[11px] font-medium text-slate-500 block mb-1">Database Name</label>
-                      <input type="text" placeholder={service.default_database || 'obelisk'} value={remoteDatabase} onChange={(e) => setRemoteDatabase(e.target.value)} className="w-full px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-mono bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-500/20 focus:border-sky-500" />
-                    </div>
-                  </>
-                )}
-
-                <div className="flex justify-end gap-2 pt-1">
-                  {isRemoteConnected ? (
-                    <button onClick={handleStop} disabled={operating} className="px-3.5 py-1.5 rounded-lg border border-slate-200 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold flex items-center gap-1.5 transition-all disabled:opacity-50">
-                      <Unlink className="w-3.5 h-3.5 text-slate-500" />
-                      <span>{operating ? 'Disconnecting...' : 'Disconnect Remote'}</span>
-                    </button>
-                  ) : (
-                    <button onClick={handleConnectRemote} disabled={operating} className="px-3.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-all disabled:opacity-50">
-                      <Globe className="w-3.5 h-3.5" />
-                      <span>{operating ? 'Connecting...' : 'Save & Connect'}</span>
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
           </div>
         </div>
       </div>

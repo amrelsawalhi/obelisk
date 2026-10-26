@@ -44,6 +44,19 @@ interface OpenEditorTab {
   durationMs?: number;
 }
 
+/** Where a target actually writes, short enough to sit inside a <select>. */
+const targetDestination = (target: DbtTarget): string => {
+  const detail = target.detail ?? {};
+  if (target.adapter === 'duckdb') return 'lakehouse catalog';
+  const where = detail.host
+    ? `${detail.host}:${detail.port ?? ''}${detail.database ? `/${detail.database}` : ''}`
+    : detail.path ?? detail.source ?? target.adapter;
+  const who = target.connection ? `${target.connection} · ` : '';
+  const blocked = target.read_only ? ' · read-only' : '';
+  return `${who}${where}${blocked}`;
+};
+
+
 export const DbtStudio: React.FC = () => {
   // Tree & Explorer State
   const [treeRoot, setTreeRoot] = useState<DbtTreeNode | null>(null);
@@ -54,9 +67,19 @@ export const DbtStudio: React.FC = () => {
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
   const [isSplitView, setIsSplitView] = useState(true);
 
-  // Target Database
+  // Target Database. ``targetDb`` holds the binding key (``output|connection_id``) so a
+  // Postgres output appears once per connection: picking the row *is* picking the
+  // warehouse, and the backend is told both halves.
   const [targetDb, setTargetDb] = useState('');
   const [targets, setTargets] = useState<DbtTarget[]>([]);
+  const [defaultTarget, setDefaultTarget] = useState('');
+  const targetKey = (item: DbtTarget) => `${item.name}|${item.connection_id ?? ''}`;
+  const activeTarget = targets.find((item) => targetKey(item) === targetDb);
+  const activeTargetName = activeTarget?.name ?? targetDb.split('|')[0] ?? '';
+  const activeConnectionId = activeTarget?.connection_id ?? null;
+  // A read-only connection is a source: the API refuses to publish into it, so say it
+  // here rather than letting the operator find out from a failed build.
+  const targetReadOnly = Boolean(activeTarget?.read_only);
 
   // Modals
   const [isNewModelOpen, setIsNewModelOpen] = useState(false);
@@ -119,7 +142,13 @@ export const DbtStudio: React.FC = () => {
       .getDbtTargets()
       .then((res) => {
         setTargets(res.targets);
-        setTargetDb((current) => current || res.default || res.targets[0]?.name || '');
+        setDefaultTarget(res.default || '');
+        // Prefer the binding the operator selected in Settings, then the profile default.
+        const key = (item: DbtTarget) => `${item.name}|${item.connection_id ?? ''}`;
+        const selected = res.targets.find(
+          (item) => item.name === res.default && item.connection_id === (res.warehouse?.id ?? null),
+        );
+        setTargetDb((current) => current || (selected ? key(selected) : '') || (res.targets[0] ? key(res.targets[0]) : ''));
       })
       .catch(() => setTargets([]));
   }, []);
@@ -257,7 +286,7 @@ export const DbtStudio: React.FC = () => {
         );
       }
 
-      const res = await api.compileDbtModel(activeModelName, targetDb);
+      const res = await api.compileDbtModel(activeModelName, activeTargetName, activeConnectionId);
       setOpenTabs((prev) =>
         prev.map((t) =>
           t.path === activeTab.path
@@ -301,7 +330,7 @@ export const DbtStudio: React.FC = () => {
         );
       }
 
-      const res = await api.previewDbtModel(modelName, targetDb, 50);
+      const res = await api.previewDbtModel(modelName, activeTargetName, 50, activeConnectionId);
       setPreviewData(res);
       setPreviewModel(modelName);
       setDockTab('preview');
@@ -330,7 +359,7 @@ export const DbtStudio: React.FC = () => {
       setIsRunningDbt(true);
       setDockTab('terminal');
       setIsDockCollapsed(false);
-      setTerminalLogs(`$ dbt run --select ${activeModelName} --target ${targetDb}\nExecuting dbt models...\n`);
+      setTerminalLogs(`$ dbt run --select ${activeModelName} --target ${activeTargetName}\nExecuting dbt models...\n`);
 
       if (activeTab.isDirty) {
         await api.saveDbtFile(activeTab.path, activeTab.content);
@@ -343,7 +372,7 @@ export const DbtStudio: React.FC = () => {
         );
       }
 
-      const res = await api.runDbtModels(activeModelName, targetDb);
+      const res = await api.runDbtModels(activeModelName, activeTargetName, activeConnectionId);
       setTerminalLogs(res.output || res.logs || 'dbt run finished with no output.');
       setLastExecutionStatus(res.success ? 'success' : 'failed');
 
@@ -365,9 +394,9 @@ export const DbtStudio: React.FC = () => {
       setIsRunningTest(true);
       setDockTab('terminal');
       setIsDockCollapsed(false);
-      setTerminalLogs(`$ dbt test --select ${activeModelName} --target ${targetDb}\nRunning test validations...\n`);
+      setTerminalLogs(`$ dbt test --select ${activeModelName} --target ${activeTargetName}\nRunning test validations...\n`);
 
-      const res = await api.testDbtModels(activeModelName, targetDb);
+      const res = await api.testDbtModels(activeModelName, activeTargetName, activeConnectionId);
       setTerminalLogs(res.output || res.logs || 'dbt test finished with no output.');
       setLastExecutionStatus(res.success ? 'success' : 'failed');
     } catch (err: any) {
@@ -545,24 +574,38 @@ export const DbtStudio: React.FC = () => {
                   value={targetDb}
                   onChange={(e) => setTargetDb(e.target.value)}
                   title={(() => {
-                    const active = targets.find((item) => item.name === targetDb);
+                    const active = targets.find((item) => targetKey(item) === targetDb);
                     if (!active) return 'No dbt target defined in profiles.yml';
                     const d = active.detail;
                     const where = d.host ? `${d.host}:${d.port}/${d.database ?? ''}` : d.path ?? d.source;
-                    return `${active.adapter}${where ? ' \u00b7 ' + where : ''}${active.available ? '' : ' \u00b7 adapter not installed'}`;
+                    const access = active.read_only ? ' \u00b7 read-only, publishing is refused' : '';
+                    return `${active.adapter}${where ? ' \u00b7 ' + where : ''}${access}${active.available ? '' : ' \u00b7 adapter not installed'}`;
                   })()}
                   className="appearance-none bg-white border border-slate-200 hover:border-slate-300 rounded-md pl-2 pr-6 py-1 text-[11px] font-semibold text-slate-700 shadow-2xs focus:outline-sky-500 cursor-pointer"
                 >
                   {targets.length === 0 && <option value="">No targets in profiles.yml</option>}
                   {targets.map((item) => (
-                    <option key={item.name} value={item.name} disabled={!item.available}>
-                      {item.name} \u00b7 {item.adapter}
+                    <option
+                      key={targetKey(item)}
+                      value={targetKey(item)}
+                      disabled={!item.available || Boolean(item.read_only)}
+                    >
+                      {item.name}
+                      {item.name === defaultTarget ? ' (default)' : ''} — {targetDestination(item)}
                       {item.available ? '' : ' (adapter not installed)'}
                     </option>
                   ))}
                 </select>
                 <ChevronDown className="w-3 h-3 text-slate-400 absolute right-1.5 top-2 pointer-events-none" />
               </div>
+              {targetReadOnly && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase bg-rose-50 text-rose-700 border border-rose-200"
+                  title={`"${activeTarget?.connection ?? activeTarget?.name}" is read-only: obelisk will not publish dbt models into it. Mark it writable in Settings → Connections, or pick another warehouse.`}
+                >
+                  Read-only
+                </span>
+              )}
             </div>
 
             {/* Save Button (Ctrl+S) */}
@@ -625,8 +668,12 @@ export const DbtStudio: React.FC = () => {
             {isSqlModel && (
               <button
                 onClick={handleRunDbt}
-                disabled={isRunningDbt}
-                title={`Run dbt run --select ${activeModelName}`}
+                disabled={isRunningDbt || targetReadOnly}
+                title={
+                  targetReadOnly
+                    ? 'This target is a read-only source: mark the connection writable in Settings → Connections.'
+                    : `Run dbt run --select ${activeModelName}`
+                }
                 className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold shadow-2xs transition-all disabled:opacity-40"
               >
                 <Boxes className="w-3 h-3 text-sky-400" />

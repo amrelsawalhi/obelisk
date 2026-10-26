@@ -17,7 +17,10 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.core.warehouse_resolver import resolve_warehouse_postgres_params
+from app.core.warehouse_resolver import (
+    WarehouseReadOnly,
+    resolve_write_warehouse_postgres_params,
+)
 from app.engines.dbt_runner import dbt_runner
 
 router = APIRouter(prefix="/api/pipelines", tags=["dbt Pipelines"])
@@ -66,7 +69,12 @@ async def trigger_pipeline_run(req: Optional[TriggerPipelineRequest] = None):
     pipeline_name = req.pipeline_name if req else None
 
     if not pg_params:
-        pg_params = await asyncio.to_thread(resolve_warehouse_postgres_params)
+        try:
+            pg_params = await asyncio.to_thread(resolve_write_warehouse_postgres_params)
+        except WarehouseReadOnly as exc:
+            # A read-only target is a refusal, not a server fault: 409 with the reason
+            # so the Studio can show it instead of a generic build failure.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     try:
         return await asyncio.to_thread(

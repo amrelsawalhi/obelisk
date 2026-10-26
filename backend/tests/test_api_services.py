@@ -34,10 +34,9 @@ async def test_advisor_recommend_endpoint():
     assert data["recommended_ram_mb"] > 0
 
 @pytest.mark.asyncio
-async def test_services_catalog_status_and_connect_remote():
+async def test_services_catalog_status_and_no_remote_mode():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        # Check listing catalog services
         resp = await ac.get("/api/services/status")
         assert resp.status_code == 200
         services = resp.json()
@@ -46,25 +45,10 @@ async def test_services_catalog_status_and_connect_remote():
         assert "postgres" in service_names
         assert "superset" in service_names
 
-        # Connect remote postgres
-        connect_payload = {
-            "service_name": "postgres",
-            "host": "remote-pg.corp.internal",
-            "port": 5432,
-            "config_json": {"ssl": "require"}
-        }
-        resp = await ac.post("/api/services/connect", json=connect_payload)
-        assert resp.status_code == 200
-        connected = resp.json()
-        assert connected["service_name"] == "postgres"
-        assert connected["deployment_type"] == "remote"
-        assert connected["status"] == "connected"
-        assert connected["host"] == "remote-pg.corp.internal"
-
-        # Verify status listing reflects remote connection
-        resp = await ac.get("/api/services/status")
-        services = resp.json()
-        pg = next(s for s in services if s["service_name"] == "postgres")
-        assert pg["deployment_type"] == "remote"
-        assert pg["status"] == "connected"
-        assert pg["host"] == "remote-pg.corp.internal"
+        # Connecting to a remote instance is the Connection Vault's job now: a remote
+        # database is a source, and a service is a container this host manages.
+        resp = await ac.post(
+            "/api/services/connect",
+            json={"service_name": "postgres", "host": "remote-pg.corp.internal", "port": 5432},
+        )
+        assert resp.status_code in (404, 405), resp.text

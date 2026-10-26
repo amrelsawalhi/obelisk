@@ -33,7 +33,7 @@ from app.core.catalog import path_for
 from app.core.host_resolver import resolve_connection_host
 from app.core.dsn import build_pg_dsn, sql_ident, sql_string, validate_alias
 from app.core.storage import warehouse_storage
-from app.core.warehouse_resolver import resolve_warehouse_postgres_params
+from app.core.warehouse_resolver import resolve_write_warehouse_postgres_params
 from app.services.state import task_history
 
 
@@ -376,19 +376,21 @@ class DbtRunner:
             alias = validate_alias(f"pg_sync_{uuid.uuid4().hex[:6]}")
             conn.execute(f"ATTACH {sql_string(conn_str)} AS {alias} (TYPE POSTGRES);")
 
-            # The folder's own schema, created on first use.
+            # The folder's own schema, created on first use. `schema` is already quoted.
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{schema};")
 
             for table in target_tables:
                 table_name = table.name
                 query = f"""
-                    CREATE OR REPLACE TABLE {alias}.{schema}."{table_name}" AS
+                    CREATE OR REPLACE TABLE {alias}.{schema}.{sql_ident(table_name)} AS
                     SELECT * FROM {table.sql_name};
                 """
                 conn.execute(query)
 
                 # Get row count
-                cnt_row = conn.execute(f'SELECT COUNT(*) FROM {alias}.{schema}."{table_name}";').fetchone()
+                cnt_row = conn.execute(
+                    f"SELECT COUNT(*) FROM {alias}.{schema}.{sql_ident(table_name)};"
+                ).fetchone()
                 cnt = cnt_row[0] if cnt_row else 0
                 synced_info.append({"table": table_name, "rows": cnt})
 
@@ -515,6 +517,10 @@ class DbtRunner:
         host = resolve_connection_host(postgres_params["host"], port)
         user = postgres_params.get("username") or postgres_params.get("user")
         env_vars = {
+            # This pipeline copies the staging folder into PostgreSQL and then builds, so
+            # it must build *there*: pin the target instead of inheriting the profile
+            # default, which is the lakehouse.
+            "DBT_TARGET": self.postgres_target(),
             "DBT_PG_HOST": str(host),
             "DBT_PG_PORT": str(port),
             "DBT_PG_USER": str(user),
@@ -823,9 +829,18 @@ class DbtRunner:
             "active_pipeline_selector": selector or "*",
             "active_node_count": len([n for n in all_nodes if n.get("is_in_pipeline", False)]),
         }
-    def _resolve_postgres_params(self, custom_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Resolves target PostgreSQL warehouse connection parameters."""
-        return resolve_warehouse_postgres_params(custom_params)
+    def _resolve_postgres_params(
+        self,
+        custom_params: Optional[Dict[str, Any]] = None,
+        connection_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Credentials for the PostgreSQL warehouse a build writes into.
+
+        ``connection_id`` is the binding the caller chose; without it the operator's saved
+        selection is used. There is no fallback to "some Postgres connection" — a build
+        either targets a chosen warehouse or refuses.
+        """
+        return resolve_write_warehouse_postgres_params(custom_params, connection_id)
 
     # ---------------------------------------------------------- dbt targets
 
@@ -874,33 +889,86 @@ class DbtRunner:
                 return self._profile_default(block.get("target"), "dev")
         return "dev"
 
-    def list_targets(self) -> Dict[str, Any]:
-        """Every target the project defines, with enough context to be trusted.
+    def postgres_target(self) -> str:
+        """The output that publishes into PostgreSQL (``dev`` in the shipped profile).
 
-        The Studio used to hardcode ``postgres | duckdb``. dbt is multi-target by
-        design: whatever the operator writes in ``profiles.yml`` is the list, and the
-        only honest extras are whether the adapter is installed and what the resolved
-        connection looks like.
+        Derived from ``profiles.yml`` rather than hardcoded: a build that syncs the
+        staging folder into PostgreSQL must also *build* there, and the name of that
+        output is the operator's to choose.
+        """
+        _, outputs = self._profile_block()
+        for name, config in outputs.items():
+            if isinstance(config, dict) and str(config.get("type", "")).lower() == "postgres":
+                return name
+        return "dev"
+
+    def _target_adapter(self, name: str) -> str:
+        """The adapter type declared for one output; ``""`` when the name is unknown."""
+        _, outputs = self._profile_block()
+        config = outputs.get(name)
+        return str(config.get("type") or "").lower() if isinstance(config, dict) else ""
+
+    def list_targets(self) -> Dict[str, Any]:
+        """Every target the project defines, as *bindings* the operator can pick.
+
+        ``profiles.yml`` names the adapters; a Postgres output still needs to know which
+        database it publishes into. So a Postgres output appears once per registered
+        Postgres connection — picking a row *is* choosing the warehouse — while a duckdb
+        output appears once. Nothing is resolved until a row is picked.
         """
         from importlib.util import find_spec
 
-        from app.core.warehouse_resolver import describe_warehouse_postgres
+        from app.core.warehouse_resolver import describe_warehouse_postgres, warehouse_candidates
 
         project, outputs = self._profile_block()
+        candidates = warehouse_candidates()
         targets: List[Dict[str, Any]] = []
         for name, config in outputs.items():
             config = config if isinstance(config, dict) else {}
             adapter = str(config.get("type", "unknown")).lower()
-            detail: Dict[str, Any] = {}
+            available = find_spec(f"dbt.adapters.{adapter}") is not None
+
             if adapter == "postgres":
-                info = describe_warehouse_postgres()
-                detail = {
-                    "host": info.get("host"),
-                    "port": info.get("port"),
-                    "database": info.get("database"),
-                    "source": info.get("source"),
-                }
-            elif adapter == "duckdb":
+                if not candidates:
+                    targets.append(
+                        {
+                            "name": name,
+                            "adapter": adapter,
+                            "available": available,
+                            "connection_id": None,
+                            "connection": None,
+                            "read_only": True,
+                            "detail": {
+                                "source": "unbound",
+                                "message": "No Postgres connection registered. Add one in "
+                                "Settings → Connection Vault.",
+                            },
+                        }
+                    )
+                    continue
+                for candidate in candidates:
+                    targets.append(
+                        {
+                            "name": name,
+                            "adapter": adapter,
+                            "available": available,
+                            "connection_id": candidate["id"],
+                            "connection": candidate["name"],
+                            "read_only": candidate["read_only"],
+                            "detail": {
+                                "host": candidate["host"],
+                                "port": candidate["port"],
+                                "database": candidate["database"],
+                                "source": "connection",
+                                "connection": candidate["name"],
+                                "read_only": candidate["read_only"],
+                            },
+                        }
+                    )
+                continue
+
+            detail: Dict[str, Any] = {}
+            if adapter == "duckdb":
                 detail = {
                     "path": (settings.lakehouse_root_path / "lakehouse.duckdb")
                     .resolve()
@@ -913,26 +981,38 @@ class DbtRunner:
                 {
                     "name": name,
                     "adapter": adapter,
-                    "available": find_spec(f"dbt.adapters.{adapter}") is not None,
+                    "available": available,
+                    "connection_id": None,
+                    "connection": None,
+                    "read_only": False,
                     "detail": detail,
                 }
             )
-        return {"project": project, "default": self.default_target(), "targets": targets}
+        return {
+            "project": project,
+            "default": self.default_target(),
+            "targets": targets,
+            "warehouse": describe_warehouse_postgres(),
+        }
 
-    def _get_target_env(self, target: str = "") -> Dict[str, str]:
+    def _get_target_env(
+        self, target: str = "", connection_id: Optional[str] = None
+    ) -> Dict[str, str]:
         """Environment for one dbt target.
 
         The target name is passed through untouched: if the profile calls its default
-        ``dev``, dbt must see ``dev``. Credentials come from, in order: an
-        ``OBELISK_CONNECTION`` reference resolved from the vault (exported as the
-        standard ``DBT_*`` set), the PostgreSQL resolver, or the profile's own
-        ``env_var`` defaults.
+        ``dev``, dbt must see ``dev``. Credentials come from an ``OBELISK_CONNECTION``
+        reference in the profile, or — for a Postgres output — from the connection the
+        caller chose (``connection_id``) or the operator selected in Settings. Nothing is
+        guessed: an unbound Postgres target raises instead of picking a database.
         """
-        clean_target = (target or self.default_target()).strip() or "postgres"
+        clean_target = (target or self.default_target()).strip() or self.default_target()
         _, outputs = self._profile_block()
-        config = outputs.get(clean_target)
-        if not isinstance(config, dict):
-            config = outputs.get("dev" if clean_target == "postgres" else clean_target, {})
+        if clean_target not in outputs and clean_target.lower() == "postgres":
+            # ``postgres`` used to be a duplicate output; it now means "the PostgreSQL
+            # target", so an env var left over from that era keeps working.
+            clean_target = self.postgres_target()
+        config = outputs.get(clean_target, {})
         config = config if isinstance(config, dict) else {}
         adapter = str(config.get("type") or "").lower()
 
@@ -942,8 +1022,8 @@ class DbtRunner:
         if isinstance(connection_ref, str) and connection_ref.strip():
             env.update(self._connection_env(connection_ref.strip()))
 
-        if adapter == "postgres" or (not adapter and clean_target in ("dev", "postgres")):
-            pg = self._resolve_postgres_params()
+        if adapter == "postgres":
+            pg = self._resolve_postgres_params(connection_id=connection_id)
             resolved_host = resolve_connection_host(pg["host"], int(pg["port"]))
             env.update(
                 {
@@ -1009,15 +1089,22 @@ class DbtRunner:
         self,
         command: str = "run",
         selector: Optional[str] = None,
-        target: str = "postgres",
+        target: str = "",
+        connection_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes dbt <command> --select <selector> --target <target>.
         Captures exit codes, durations, and clean terminal logs.
+
+        An empty ``target`` means the profile's default. ``postgres`` is accepted as a
+        legacy alias for whichever output uses the postgres adapter. ``connection_id``
+        names the warehouse a Postgres target publishes into; without it the saved
+        selection is used.
         """
-        clean_target = (target or "postgres").strip().lower()
-        if clean_target == "dev":
-            clean_target = "postgres"
+        clean_target = (target or self.default_target()).strip().lower()
+        if clean_target == "postgres" and self._target_adapter(clean_target) == "":
+            clean_target = self.postgres_target().lower()
+        is_postgres_target = self._target_adapter(clean_target) == "postgres"
 
         dbt_vars = self._dbt_vars_payload()
         staging_folder = self._dbt_folders()["staging"]
@@ -1025,7 +1112,7 @@ class DbtRunner:
 
         # A build against an empty source folder has nothing to read: report that,
         # with the fix, rather than seeding sample tables and calling it a success.
-        if clean_target == "postgres" and command in ("run", "test"):
+        if is_postgres_target and command in ("run", "test"):
             if not self.folder_tables(staging_folder):
                 return self._no_source_data_result(
                     command,
@@ -1035,8 +1122,8 @@ class DbtRunner:
                     store.location(staging_folder),
                 )
 
-        if clean_target == "postgres" and command == "run":
-            pg_params = self._resolve_postgres_params()
+        if is_postgres_target and command == "run":
+            pg_params = self._resolve_postgres_params(connection_id=connection_id)
             try:
                 self.sync_folder_to_postgres(pg_params, folder=staging_folder)
             except NoSourceData as exc:
@@ -1057,7 +1144,7 @@ class DbtRunner:
             except Exception:
                 pass
 
-        env_vars = self._get_target_env(clean_target)
+        env_vars = self._get_target_env(clean_target, connection_id=connection_id)
         cmd = [
             sys.executable,
             "-m",
@@ -1110,14 +1197,18 @@ class DbtRunner:
             "logs": output,
         }
 
-    def compile_model(self, model_name: str, target: str = "postgres") -> Dict[str, Any]:
+    def compile_model(
+        self, model_name: str, target: str = "postgres", connection_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        Runs dbt compile --select <model_name> --target <target> via sys.executable -m dbt.cli.main.
+        Runs dbt compile --select <model_name> --target <target> via a sys.executable -m dbt.cli.main.
         Reads the generated compiled SQL from target/compiled/obelisk_dbt/models/.../<model_name>.sql and returns it.
         """
         clean_name = model_name.strip().replace(".sql", "")
         # Run dbt compile
-        res = self.run_scoped_dbt(command="compile", selector=clean_name, target=target)
+        res = self.run_scoped_dbt(
+            command="compile", selector=clean_name, target=target, connection_id=connection_id
+        )
 
         # Read compiled SQL from target/compiled/
         compiled_sql = ""
@@ -1150,13 +1241,16 @@ class DbtRunner:
         model_name: str,
         target: str = "postgres",
         limit: int = 50,
+        connection_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Compiles the model, wraps the compiled SQL with SELECT * FROM (...) AS _subq LIMIT 50,
         and executes it via NativeQueryEngine or DuckDBEngine to return column headers and data rows as JSON.
         """
         clean_name = model_name.strip().replace(".sql", "")
-        comp_res = self.compile_model(model_name=clean_name, target=target)
+        comp_res = self.compile_model(
+            model_name=clean_name, target=target, connection_id=connection_id
+        )
         compiled_sql = comp_res.get("compiled_sql", "").strip()
 
         if not compiled_sql:
@@ -1169,9 +1263,11 @@ class DbtRunner:
                 "error": f"Failed to compile model '{clean_name}'. Logs:\n{comp_res.get('logs', '')}",
             }
 
-        clean_target = (target or "postgres").strip().lower()
-        if clean_target in ("postgres", "dev"):
-            pg_params = self._resolve_postgres_params()
+        clean_target = (target or self.default_target()).strip().lower()
+        if clean_target == "postgres" and self._target_adapter(clean_target) == "":
+            clean_target = self.postgres_target().lower()
+        if self._target_adapter(clean_target) == "postgres":
+            pg_params = self._resolve_postgres_params(connection_id=connection_id)
             db_name = pg_params.get("database", "sourcedb")
 
             import re
