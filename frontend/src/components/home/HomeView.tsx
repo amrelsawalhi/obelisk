@@ -11,10 +11,13 @@ import {
   Terminal,
   Plus,
   Activity,
+  Files,
+  Archive,
 } from 'lucide-react';
 import { useTelemetry } from '../../lib/useTelemetry';
 import { usePolling } from '../../lib/viewActivity';
 import { api } from '../../lib/api';
+import { formatBytes } from '../../lib/format';
 import type {
   ServiceStatus,
   CatalogNode,
@@ -24,6 +27,7 @@ import type {
   AssetGraphNode,
   PipelineSummary,
   ServiceCatalogEntry,
+  LakehouseDiagnostics,
 } from '../../lib/types';
 import type { NavigationTab } from '../layout/Sidebar';
 
@@ -41,6 +45,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const [notebookStatus, setNotebookStatus] = useState<NotebookServerStatus | null>(null);
   const [assetNodes, setAssetNodes] = useState<AssetGraphNode[]>([]);
   const [pipelines, setPipelines] = useState<PipelineSummary[]>([]);
+  const [diagnostics, setDiagnostics] = useState<LakehouseDiagnostics | null>(null);
 
   const loadData = async () => {
     try {
@@ -53,6 +58,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         nbStatus,
         assetGraphData,
         pipelineData,
+        diagData,
       ] = await Promise.all([
         api.listServices().catch(() => []),
         api.getServiceCatalog().catch(() => []),
@@ -62,6 +68,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         api.getNotebookServerStatus().catch(() => null),
         api.getAssetGraph().catch(() => ({ nodes: [], edges: [] })),
         api.listPipelines().catch(() => []),
+        api.getLakehouseDiagnostics().catch(() => null),
       ]);
       setServices(svcData);
       setServiceCatalog(svcCatalogData);
@@ -71,6 +78,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
       setNotebookStatus(nbStatus);
       setAssetNodes(assetGraphData.nodes || []);
       setPipelines(pipelineData);
+      setDiagnostics(diagData);
     } catch (err) {
       console.error('Failed to load home view metrics:', err);
     }
@@ -106,7 +114,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
 
   return (
     <div className="flex-1 overflow-y-auto bg-slate-100/75 p-6 space-y-6">
-      {/* 1. Platform Key Metrics (Distinct cards with contrast against slate-100 canvas) */}
+      {/* 1. Platform Key Metrics */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
         {/* Data Sources */}
         <div
@@ -267,9 +275,9 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         </button>
       </div>
 
-      {/* 3. Two-Column Layout: Managed Services (2/3) + Engine Health (1/3) */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Managed Services Grid */}
+      {/* 3. Two-Column Layout: Managed Services (2/3) + Stacked Engine & Storage Cards (1/3) */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+        {/* Managed Services Grid (Left Column 2/3) */}
         <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs space-y-4">
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
             <div>
@@ -359,87 +367,146 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
           </div>
         </div>
 
-        {/* Host Compute & System Resources Card */}
-        <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex flex-col justify-between space-y-4">
-          <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-            <div className="flex items-center gap-2">
-              <Activity className="w-4 h-4 text-sky-600" />
-              <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                Compute & System Resources
-              </h3>
+        {/* Right Stacked Column (1/3): 1. Compute & System Resources + 2. Lakehouse Storage & Engine */}
+        <div className="space-y-4">
+          {/* Card 1: Compute & System Resources */}
+          <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <Activity className="w-4 h-4 text-sky-600" />
+                <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                  Compute & Resources
+                </h3>
+              </div>
+              <span className="text-[11px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200/80 px-2 py-0.5 rounded-full flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                Healthy
+              </span>
             </div>
-            <span className="text-[11px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200/80 px-2 py-0.5 rounded-full flex items-center gap-1.5">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-              Healthy
-            </span>
+
+            {telemetry ? (
+              <div className="space-y-3.5">
+                {/* RAM Usage Gauge */}
+                <div>
+                  <div className="flex justify-between text-xs mb-1.5">
+                    <span className="text-slate-600 font-medium flex items-center gap-1">
+                      <HardDrive className="w-3.5 h-3.5 text-sky-600" /> Host Memory
+                    </span>
+                    <span className="font-mono font-bold text-slate-900">
+                      {telemetry.ram_used_gb} / {telemetry.total_ram_gb} GB ({telemetry.ram_percent_used}%)
+                    </span>
+                  </div>
+                  <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all duration-500 ${
+                        telemetry.ram_percent_used > 85
+                          ? 'bg-red-500'
+                          : telemetry.ram_percent_used > 65
+                            ? 'bg-amber-500'
+                            : 'bg-sky-600'
+                      }`}
+                      style={{ width: `${Math.min(telemetry.ram_percent_used, 100)}%` }}
+                    />
+                  </div>
+                </div>
+
+                {/* CPU Load Gauge */}
+                <div>
+                  <div className="flex justify-between text-xs mb-1.5">
+                    <span className="text-slate-600 font-medium flex items-center gap-1">
+                      <Cpu className="w-3.5 h-3.5 text-amber-600" /> Host CPU ({telemetry.cpu_count} Cores)
+                    </span>
+                    <span className="font-mono font-bold text-slate-900">{telemetry.cpu_percent}%</span>
+                  </div>
+                  <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-amber-500 transition-all duration-500"
+                      style={{ width: `${Math.min(telemetry.cpu_percent, 100)}%` }}
+                    />
+                  </div>
+                </div>
+
+                {/* Active Containers Stat */}
+                <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs text-slate-600">
+                  <span className="font-medium">Active Containers:</span>
+                  <span className="font-mono font-bold text-slate-800 bg-slate-100 px-2 py-0.5 rounded text-[11px]">
+                    {telemetry.active_containers_count} running ({telemetry.allocated_ram_gb} GB allocated)
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <div className="py-4 text-center text-xs text-slate-400">
+                Loading telemetry...
+              </div>
+            )}
           </div>
 
-          {telemetry ? (
-            <div className="space-y-4">
-              {/* RAM Usage Gauge */}
-              <div>
-                <div className="flex justify-between text-xs mb-1.5">
-                  <span className="text-slate-600 font-medium flex items-center gap-1">
-                    <HardDrive className="w-3.5 h-3.5 text-sky-600" /> Host Memory
-                  </span>
-                  <span className="font-mono font-bold text-slate-900">
-                    {telemetry.ram_used_gb} / {telemetry.total_ram_gb} GB ({telemetry.ram_percent_used}%)
-                  </span>
-                </div>
-                <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
-                  <div
-                    className={`h-full rounded-full transition-all duration-500 ${
-                      telemetry.ram_percent_used > 85
-                        ? 'bg-red-500'
-                        : telemetry.ram_percent_used > 65
-                          ? 'bg-amber-500'
-                          : 'bg-sky-600'
-                    }`}
-                    style={{ width: `${Math.min(telemetry.ram_percent_used, 100)}%` }}
-                  />
-                </div>
-                <p className="text-[10px] text-slate-400 mt-1">
-                  Safe memory allocation ceiling: {telemetry.max_safe_allocation_gb} GB
-                </p>
+          {/* Card 2: Lakehouse Storage & Engine Health */}
+          <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <Database className="w-4 h-4 text-emerald-600" />
+                <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                  Lakehouse Storage
+                </h3>
               </div>
+              <span className="text-[10px] font-mono text-slate-600 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-md font-semibold">
+                Parquet Native
+              </span>
+            </div>
 
-              {/* CPU Load Gauge */}
-              <div>
-                <div className="flex justify-between text-xs mb-1.5">
-                  <span className="text-slate-600 font-medium flex items-center gap-1">
-                    <Cpu className="w-3.5 h-3.5 text-amber-600" /> Host CPU ({telemetry.cpu_count} Cores)
-                  </span>
-                  <span className="font-mono font-bold text-slate-900">{telemetry.cpu_percent}%</span>
+            <div className="grid grid-cols-2 gap-3">
+              {/* Storage Footprint */}
+              <div className="p-3 rounded-lg bg-slate-50/70 border border-slate-200/70">
+                <div className="flex items-center gap-1.5 text-[11px] text-slate-500 font-medium mb-1">
+                  <Archive className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Data Size</span>
                 </div>
-                <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-amber-500 transition-all duration-500"
-                    style={{ width: `${Math.min(telemetry.cpu_percent, 100)}%` }}
-                  />
+                <div className="text-base font-bold font-mono text-slate-900">
+                  {formatBytes(diagnostics?.total_data_bytes) ?? '0 B'}
                 </div>
               </div>
 
-              {/* Active Containers Stat */}
-              <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs text-slate-600">
-                <span className="font-medium">Active Containers:</span>
-                <span className="font-mono font-bold text-slate-800 bg-slate-100 px-2 py-0.5 rounded text-[11px]">
-                  {telemetry.active_containers_count} running ({telemetry.allocated_ram_gb} GB allocated)
-                </span>
+              {/* Data Files */}
+              <div className="p-3 rounded-lg bg-slate-50/70 border border-slate-200/70">
+                <div className="flex items-center gap-1.5 text-[11px] text-slate-500 font-medium mb-1">
+                  <Files className="w-3.5 h-3.5 text-sky-600" />
+                  <span>Data Files</span>
+                </div>
+                <div className="text-base font-bold font-mono text-slate-900">
+                  {diagnostics?.active_data_files ?? 0}
+                </div>
+              </div>
+
+              {/* Memory Spill Ceiling */}
+              <div className="p-3 rounded-lg bg-slate-50/70 border border-slate-200/70">
+                <div className="text-[11px] text-slate-500 font-medium mb-1 truncate">
+                  Spill Ceiling
+                </div>
+                <div className="text-sm font-bold font-mono text-slate-800">
+                  {telemetry ? `${telemetry.max_safe_allocation_gb} GB` : '85%'}
+                </div>
+              </div>
+
+              {/* Lakehouse Tables */}
+              <div className="p-3 rounded-lg bg-slate-50/70 border border-slate-200/70">
+                <div className="text-[11px] text-slate-500 font-medium mb-1 truncate">
+                  Active Tables
+                </div>
+                <div className="text-sm font-bold font-mono text-slate-800">
+                  {diagnostics?.active_table_count ?? catalogNodes.filter((n) => n.type === 'lakehouse').length}
+                </div>
               </div>
             </div>
-          ) : (
-            <div className="py-8 text-center text-xs text-slate-400">
-              Loading system telemetry...
-            </div>
-          )}
 
-          <button
-            onClick={() => onNavigate('settings')}
-            className="w-full text-center text-xs font-semibold text-sky-600 hover:text-sky-700 pt-2 border-t border-slate-100 flex items-center justify-center gap-1 transition-colors"
-          >
-            <span>View System Diagnostics & Sizing</span>
-            <ArrowUpRight className="w-3.5 h-3.5" />
-          </button>
+            <button
+              onClick={() => onNavigate('settings')}
+              className="w-full text-center text-xs font-semibold text-sky-600 hover:text-sky-700 pt-2 border-t border-slate-100 flex items-center justify-center gap-1 transition-colors"
+            >
+              <span>Lakehouse Diagnostics & Maintenance</span>
+              <ArrowUpRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
       </div>
     </div>
