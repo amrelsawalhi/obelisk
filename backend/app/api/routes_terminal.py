@@ -241,20 +241,6 @@ def create_terminal_session(cwd: str) -> BaseTerminalSession:
 _active_sessions = 0
 MAX_MESSAGE_CHARS = 65_536
 
-
-def _clamp(value: object, low: int, high: int, default: int) -> int:
-    try:
-        number = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return default
-    return max(low, min(high, number))
-
-
-# One shell per open tab is the intent; the cap is what keeps a forgotten tab from
-# turning into an unbounded number of processes on the host.
-_active_sessions = 0
-MAX_MESSAGE_CHARS = 65_536
-
 CRLF = chr(13) + chr(10)
 RED = chr(27) + "[31m"
 YELLOW = chr(27) + "[33m"
