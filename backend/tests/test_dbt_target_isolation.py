@@ -12,8 +12,10 @@ offline.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -48,6 +50,11 @@ def _scratch_dirs() -> set[Path]:
 def _shared_manifest_stamp() -> int | None:
     manifest = SHARED_TARGET / "manifest.json"
     return manifest.stat().st_mtime_ns if manifest.exists() else None
+
+
+def _target_env() -> dict:
+    """The env every production caller passes to ``run_dbt`` (see routes_dbt)."""
+    return dbt_runner._get_target_env(dbt_runner.default_target())
 
 
 def test_run_scoped_dbt_writes_artifacts_to_the_given_target_path(tmp_path):
@@ -111,3 +118,53 @@ def test_compile_model_compiles_a_real_model_and_cleans_its_scratch_dir():
     assert _shared_manifest_stamp() == shared_before, (
         "compiling one model must not rewrite the project's shared target/"
     )
+
+
+def test_run_dbt_opens_its_own_duckdb_file_and_cleans_it_up():
+    """Every dbt process gets its own DuckDB file, and leaves none behind.
+
+    The lakehouse target opens ``DBT_DUCKDB_PATH`` as a real DuckDB database, and DuckDB
+    locks a file to one writer. Two runs sharing one file — a pipeline build while a
+    preview compiled — failed with "Could not set lock on file". ``dbt debug`` prints the
+    connection it would open, which is how this sees what dbt actually received without
+    mocking the subprocess.
+    """
+    shared_scratch = (Path(settings.lakehouse_root_path) / "dbt_scratch.duckdb").as_posix()
+
+    result = dbt_runner.run_dbt("debug", env_vars=_target_env())
+    printed = re.search(r"path:\s*(\S*\.duckdb)", result["output"])
+    assert printed, result["output"][-2000:]
+    opened = printed.group(1).replace("\\", "/")
+    assert opened != shared_scratch, "the run opened the shared scratch file"
+    assert "dbt_scratch_" in opened and "dbt_scratch.duckdb" not in opened
+    assert not Path(opened).exists(), f"the per-run scratch file survived the run: {opened}"
+
+
+def test_run_dbt_publishes_its_artifacts_into_the_shared_target():
+    """Readers still find target/manifest.json, written by whoever ran last."""
+    scratch_before = _scratch_dirs()
+    shared_before = _shared_manifest_stamp()
+
+    result = dbt_runner.run_dbt("parse", env_vars=_target_env())
+
+    assert result["success"], result["output"][-3000:]
+    manifest = SHARED_TARGET / "manifest.json"
+    assert manifest.exists(), "a run's manifest must be published where the readers look"
+    assert _shared_manifest_stamp() != shared_before
+    assert _scratch_dirs() == scratch_before, "per-run target directories must be removed"
+    leftovers = list(Path(settings.duckdb_temp_path).glob("dbt_scratch_*"))
+    assert leftovers == [], f"per-run DuckDB files must be removed: {leftovers}"
+
+
+def test_two_concurrent_dbt_runs_both_succeed():
+    """Two dbt runs at once used to collide on one target dir and one DuckDB file."""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(lambda _: dbt_runner.run_dbt("parse", env_vars=_target_env()), range(2))
+        )
+
+    for result in results:
+        assert result["success"], result["output"][-3000:]
+        assert "Could not set lock" not in result["output"]
+    assert _scratch_dirs() == set()
+

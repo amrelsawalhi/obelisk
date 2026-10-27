@@ -45,6 +45,45 @@ from app.services.state import task_history
 # leaving every source and model to resolve against an empty database.
 DBT_SCRATCH_DB = "dbt_scratch.duckdb"
 
+# Prefix of the per-invocation target directory. Every dbt process gets its own.
+DBT_RUN_TARGET_PREFIX = "dbt_run_"
+
+# dbt subcommands that accept ``--target-path``. ``deps``, ``debug``, ``clean`` and
+# ``version`` do not, and dbt exits with "No such option" when the flag is passed, so the
+# isolation flag is only added where dbt understands it.
+DBT_TARGET_PATH_COMMANDS = frozenset(
+    {
+        "build",
+        "clone",
+        "compile",
+        "docs",
+        "freshness",
+        "list",
+        "ls",
+        "parse",
+        "retry",
+        "run",
+        "run-operation",
+        "seed",
+        "show",
+        "snapshot",
+        "source",
+        "test",
+    }
+)
+
+# Artifacts copied back into the project's shared ``target/`` when a run finishes, so the
+# readers that look there (lineage, run summaries, the DAG) see the newest complete run.
+DBT_PUBLISHED_ARTIFACTS = (
+    "manifest.json",
+    "run_results.json",
+    "catalog.json",
+    "sources.json",
+    "semantic_manifest.json",
+    "partial_parse.msgpack",
+    "graph_summary.json",
+)
+
 
 class NoSourceData(RuntimeError):
     """A build was asked to run while the folder it reads holds no table at all.
@@ -415,6 +454,74 @@ class DbtRunner:
             "tables": synced_info,
         }
 
+    # ------------------------------------------------------------ dbt scratch space
+    def _scratch_paths(self) -> tuple[Path, Path]:
+        """A private target directory and DuckDB file for one dbt invocation.
+
+        Both used to be shared by every caller. ``dbt_scratch.duckdb`` is a real DuckDB
+        file, and DuckDB allows one writing process, so a second dbt run started while
+        the first was open failed with "Could not set lock on file" — a pipeline build
+        colliding with a Query Studio compile, for instance. The project's ``target/``
+        collided the same way, only silently: two runs overwrote one ``manifest.json``
+        and whichever finished first was read by the next lineage lookup.
+        """
+        suffix = uuid.uuid4().hex[:8]
+        root = Path(settings.duckdb_temp_path)
+        return (
+            root / f"{DBT_RUN_TARGET_PREFIX}{suffix}",
+            root / f"dbt_scratch_{suffix}.duckdb",
+        )
+
+    @staticmethod
+    def _publish_dbt_artifacts(scratch_target: Path, shared_target: Path) -> List[str]:
+        """Moves this run's artifacts into the project's shared ``target/``, atomically.
+
+        A per-run target path is what makes concurrent runs safe, but every reader in
+        the app reads ``target/manifest.json``. Copying the artifacts back when the run
+        finishes keeps that contract: each file appears in one ``os.replace``, so a
+        reader sees either the previous complete artifact or this run's complete one,
+        never the half-written file concurrent writers produced.
+        """
+        published: List[str] = []
+        if not scratch_target.exists():
+            return published
+        shared_target.mkdir(parents=True, exist_ok=True)
+        for name in DBT_PUBLISHED_ARTIFACTS:
+            artifact = scratch_target / name
+            if not artifact.is_file():
+                continue
+            destination = shared_target / name
+            try:
+                os.replace(artifact, destination)
+            except OSError:
+                # A different filesystem (temp and checkout on separate volumes, or a
+                # container with /tmp on its own mount): stage beside the destination
+                # and swap, which is still atomic for readers.
+                staged = destination.with_name(f".{destination.name}.{uuid.uuid4().hex[:6]}.tmp")
+                try:
+                    shutil.copyfile(artifact, staged)
+                    os.replace(staged, destination)
+                except OSError:
+                    staged.unlink(missing_ok=True)
+                    continue
+            published.append(name)
+        return published
+
+    @staticmethod
+    def _discard_scratch(scratch_target: Optional[Path], scratch_db: Path) -> None:
+        """Removes a run's scratch directory and DuckDB file, including its WAL.
+
+        ``scratch_target`` is ``None`` when the caller owns the target directory (a
+        compile passes its own): this run must still drop the DuckDB file it created.
+        """
+        if scratch_target is not None:
+            shutil.rmtree(scratch_target, ignore_errors=True)
+        for leftover in (scratch_db, scratch_db.with_name(scratch_db.name + ".wal")):
+            try:
+                leftover.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def run_dbt(
         self,
         command: str = "run",
@@ -430,6 +537,11 @@ class DbtRunner:
         ``dbt_vars`` carries the layer → schema mapping, so the project never has to
         know which schema a layer resolves to.
         """
+        scratch_target, scratch_db = self._scratch_paths()
+        isolates_artifacts = command in DBT_TARGET_PATH_COMMANDS
+        if isolates_artifacts:
+            scratch_target.mkdir(parents=True, exist_ok=True)
+
         cmd = [
             sys.executable,
             "-m",
@@ -440,6 +552,10 @@ class DbtRunner:
             "--profiles-dir",
             str(self.dbt_project_dir),
         ]
+        if isolates_artifacts:
+            # This run's artifacts land here, not in the shared target/. They are copied
+            # back atomically when it finishes (see _publish_dbt_artifacts).
+            cmd.extend(["--target-path", str(scratch_target)])
         if select:
             cmd.extend(["--select", select])
         if dbt_vars:
@@ -448,48 +564,58 @@ class DbtRunner:
         env = os.environ.copy()
         if env_vars:
             env.update(env_vars)
+        # The lakehouse output opens DBT_DUCKDB_PATH; this run's own file means a second
+        # dbt process is not locked out by the first one holding the shared scratch file.
+        env["DBT_DUCKDB_PATH"] = scratch_db.as_posix()
 
         start_time = time.time()
-        if on_line is None:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                env=env,
-                cwd=str(self.dbt_project_dir),
-            )
-            output = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
-            # Filter out noisy runpy import warnings
-            clean_lines = [l for l in output.splitlines() if "RuntimeWarning: 'dbt.cli.main'" not in l]
-            output = "\n".join(clean_lines).strip()
-            exit_code = proc.returncode
-        else:
-            # Streaming mode: hand each line to the caller as dbt writes it, so a step's
-            # log is readable while the step runs instead of appearing all at once at the
-            # end. ``output`` is rebuilt from the same kept lines, so callers that only
-            # want the text see no difference.
-            kept: List[str] = []
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                env=env,
-                cwd=str(self.dbt_project_dir),
-            )
-            assert proc.stdout is not None
-            for raw_line in proc.stdout:
-                line = raw_line.rstrip("\n")
-                if "RuntimeWarning: 'dbt.cli.main'" in line:
-                    continue
-                kept.append(line)
-                on_line(line)
-            proc.wait()
-            output = "\n".join(kept).strip()
-            exit_code = proc.returncode
+        try:
+            if on_line is None:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    cwd=str(self.dbt_project_dir),
+                )
+                output = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
+                # Filter out noisy runpy import warnings
+                clean_lines = [l for l in output.splitlines() if "RuntimeWarning: 'dbt.cli.main'" not in l]
+                output = "\n".join(clean_lines).strip()
+                exit_code = proc.returncode
+            else:
+                # Streaming mode: hand each line to the caller as dbt writes it, so a step's
+                # log is readable while the step runs instead of appearing all at once at the
+                # end. ``output`` is rebuilt from the same kept lines, so callers that only
+                # want the text see no difference.
+                kept: List[str] = []
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    env=env,
+                    cwd=str(self.dbt_project_dir),
+                )
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    line = raw_line.rstrip("\n")
+                    if "RuntimeWarning: 'dbt.cli.main'" in line:
+                        continue
+                    kept.append(line)
+                    on_line(line)
+                proc.wait()
+                output = "\n".join(kept).strip()
+                exit_code = proc.returncode
+        finally:
+            # Even a failed or interrupted run leaves a usable manifest behind; dbt writes
+            # it before it starts executing models.
+            if isolates_artifacts:
+                self._publish_dbt_artifacts(scratch_target, self.dbt_project_dir / "target")
+            self._discard_scratch(scratch_target if isolates_artifacts else None, scratch_db)
 
         duration = round(time.time() - start_time, 2)
         success = exit_code == 0
@@ -1142,6 +1268,14 @@ class DbtRunner:
                 pass
 
         env_vars = self._get_target_env(clean_target, connection_id=connection_id)
+        scratch_target, scratch_db = self._scratch_paths()
+        owns_target = target_path is None
+        # A caller that passed target_path (compile_model) owns that directory and cleans
+        # it up itself; everyone else gets a private one whose artifacts are published back.
+        effective_target = scratch_target if owns_target else Path(target_path)
+        if owns_target:
+            scratch_target.mkdir(parents=True, exist_ok=True)
+
         cmd = [
             sys.executable,
             "-m",
@@ -1153,9 +1287,9 @@ class DbtRunner:
             str(self.dbt_project_dir),
             "--target",
             clean_target,
+            "--target-path",
+            str(effective_target),
         ]
-        if target_path is not None:
-            cmd.extend(["--target-path", str(target_path)])
         if selector and selector != "*":
             clean_sel = selector.strip()
             cmd.extend(["--select", clean_sel])
@@ -1164,15 +1298,22 @@ class DbtRunner:
         env = os.environ.copy()
         if env_vars:
             env.update(env_vars)
+        # This run's own DuckDB file: the shared one locked out every other dbt process.
+        env["DBT_DUCKDB_PATH"] = scratch_db.as_posix()
 
         start_time = time.time()
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=str(self.dbt_project_dir),
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(self.dbt_project_dir),
+            )
+        finally:
+            if owns_target:
+                self._publish_dbt_artifacts(scratch_target, self.dbt_project_dir / "target")
+            self._discard_scratch(scratch_target if owns_target else None, scratch_db)
         duration_sec = round(time.time() - start_time, 2)
         duration_ms = int(duration_sec * 1000)
 
@@ -1532,43 +1673,76 @@ class DbtRunner:
                         "path": target_path,
                     })
 
-                    # Upstream Parents
-                    upstreams = parent_map.get(matching_id, [])
-                    for up_id in upstreams:
-                        if up_id.startswith("macro."):
-                            continue
-                        up_name = up_id.split(".")[-1]
-                        is_source = up_id.startswith("source.")
-                        up_path = manifest_nodes.get(up_id, {}).get("original_file_path", "")
-                        up_folder = "staging" if "staging" in up_path else "marts"
-                        up_schema = staging_folder if is_source or up_folder == "staging" else marts_folder
-                        nodes.append({
-                            "id": up_id,
-                            "name": up_name,
-                            "type": "source" if is_source else "model",
-                            "schema": up_schema,
-                            "folder": "landing" if is_source else up_folder,
+                    def describe(node_id: str) -> Dict[str, Any]:
+                        """One graph node, from the manifest record the id names."""
+                        record = manifest_nodes.get(node_id, {})
+                        path = record.get("original_file_path", "")
+                        folder = "staging" if "staging" in path else "marts"
+                        is_source = node_id.startswith("source.")
+                        is_test = node_id.startswith("test.")
+                        if is_test:
+                            display = node_id.split(".")[2] if len(node_id.split(".")) > 2 else node_id
+                        else:
+                            display = node_id.split(".")[-1]
+                        return {
+                            "id": node_id,
+                            "name": display,
+                            "type": "test" if is_test else ("source" if is_source else "model"),
+                            "schema": "test" if is_test else (
+                                staging_folder if is_source or folder == "staging" else marts_folder
+                            ),
+                            "folder": "landing" if is_source else folder,
                             "is_current": False,
-                        })
-                        edges.append({"source": up_id, "target": matching_id})
+                        }
 
-                    # Downstream Children
-                    downstreams = child_map.get(matching_id, [])
-                    for down_id in downstreams:
-                        down_name = down_id.split(".")[-1]
-                        is_test = down_id.startswith("test.")
-                        down_path = manifest_nodes.get(down_id, {}).get("original_file_path", "")
-                        down_folder = "staging" if "staging" in down_path else "marts"
-                        down_schema = staging_folder if down_folder == "staging" else marts_folder
-                        nodes.append({
-                            "id": down_id,
-                            "name": down_name if not is_test else down_id.split(".")[2],
-                            "type": "test" if is_test else "model",
-                            "schema": down_schema if not is_test else "test",
-                            "folder": down_folder,
-                            "is_current": False,
-                        })
-                        edges.append({"source": matching_id, "target": down_id})
+                    def upstream_edges(start: str) -> List[tuple[str, str]]:
+                        """Every ancestor, not just the immediate parents.
+
+                        One hop is not a lineage: a mart built on a staging model that reads a
+                        source showed the staging model and stopped, so the graph could not
+                        answer "where does this number come from".
+                        """
+                        seen = {start}
+                        pairs: List[tuple[str, str]] = []
+                        frontier = [start]
+                        while frontier:
+                            child = frontier.pop(0)
+                            for parent in parent_map.get(child, []) or []:
+                                if parent.startswith("macro.") or parent in seen:
+                                    continue
+                                seen.add(parent)
+                                pairs.append((parent, child))
+                                frontier.append(parent)
+                        return pairs
+
+                    def downstream_edges(start: str) -> List[tuple[str, str]]:
+                        """Every descendant. Tests are leaves: their children are nobody."""
+                        seen = {start}
+                        pairs: List[tuple[str, str]] = []
+                        frontier = [start]
+                        while frontier:
+                            parent = frontier.pop(0)
+                            for child in child_map.get(parent, []) or []:
+                                if child in seen:
+                                    continue
+                                seen.add(child)
+                                pairs.append((parent, child))
+                                if not child.startswith("test."):
+                                    frontier.append(child)
+                        return pairs
+
+                    known = {matching_id}
+                    for parent_id, child_id in upstream_edges(matching_id):
+                        if parent_id not in known:
+                            known.add(parent_id)
+                            nodes.append(describe(parent_id))
+                        edges.append({"source": parent_id, "target": child_id})
+
+                    for parent_id, child_id in downstream_edges(matching_id):
+                        if child_id not in known:
+                            known.add(child_id)
+                            nodes.append(describe(child_id))
+                        edges.append({"source": parent_id, "target": child_id})
             except Exception:
                 pass
 
