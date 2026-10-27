@@ -8,6 +8,7 @@ import {
   Server,
 } from 'lucide-react';
 import { api } from '../../lib/api';
+import { serviceUrl } from '../../lib/urls';
 import { ServiceDetailPanel } from './ServiceDetailPanel';
 import { SERVICE_ICONS } from './serviceIcons';
 import type {
@@ -181,7 +182,7 @@ export const ServicesView: React.FC = () => {
 
                   {isRunning && entry.web_ui && (
                     <a
-                      href={entry.web_ui_path || `http://localhost:${status?.host_port || status?.port || entry.default_host_port}`}
+                      href={serviceUrl(status?.host_port || status?.port || entry.default_host_port, entry.web_ui_path)}
                       target="_blank"
                       rel="noopener noreferrer"
                       onClick={(e) => e.stopPropagation()}

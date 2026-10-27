@@ -254,7 +254,15 @@ if __name__ == "__main__":
           {status?.is_running ? (
             <>
               <button
-                onClick={handleStop}
+                onClick={() =>
+                  setConfirmRequest({
+                    title: 'Stop the Marimo server?',
+                    body: 'One Marimo server hosts every notebook, so this stops them all — open tabs lose their kernel and unsaved cell state. Notebook files on disk are untouched.',
+                    confirmLabel: 'Stop for everyone',
+                    destructive: true,
+                    onConfirm: handleStop,
+                  })
+                }
                 disabled={actionLoading}
                 className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
               >
@@ -262,7 +270,15 @@ if __name__ == "__main__":
                 <span>Stop Server</span>
               </button>
               <button
-                onClick={handleRestart}
+                onClick={() =>
+                  setConfirmRequest({
+                    title: 'Restart the Marimo server?',
+                    body: 'The server is shared by every notebook, so restarting reloads all of them — open tabs reconnect and any unsaved cell state is lost. Files on disk are untouched.',
+                    confirmLabel: 'Restart for everyone',
+                    destructive: true,
+                    onConfirm: handleRestart,
+                  })
+                }
                 disabled={actionLoading}
                 className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
                 title="Restart Marimo server to reload all notebooks from disk"

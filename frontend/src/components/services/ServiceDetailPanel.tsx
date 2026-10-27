@@ -12,6 +12,7 @@ import {
   Server,
 } from 'lucide-react';
 import { api } from '../../lib/api';
+import { serviceUrl } from '../../lib/urls';
 import { DeployModal } from './DeployModal';
 import { SERVICE_ICONS } from './serviceIcons';
 import { ConfirmDialog } from '../common/ConfirmDialog';
@@ -256,7 +257,7 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
                 </span>
               )}
               {isRunning && service.web_ui && (
-                <a href={service.web_ui_path || `http://localhost:${status?.host_port || status?.port || service.default_host_port}`} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-sky-50 text-sky-700 hover:bg-sky-100 border border-sky-200 transition-colors">
+                <a href={serviceUrl(status?.host_port || status?.port || service.default_host_port, service.web_ui_path)} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-sky-50 text-sky-700 hover:bg-sky-100 border border-sky-200 transition-colors">
                   <ExternalLink className="w-3 h-3" />
                   <span>Open UI</span>
                 </a>

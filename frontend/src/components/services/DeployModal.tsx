@@ -17,6 +17,7 @@ import type {
   DeployProgressResponse,
   ServiceCatalogEntry,
 } from '../../lib/types';
+import { serviceUrl } from '../../lib/urls';
 
 interface DeployModalProps {
   isOpen: boolean;
@@ -104,7 +105,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({
 
   const displayName = catalogEntry?.display_name || serviceId;
   const hostPort = deployResult?.port || catalogEntry?.default_host_port || 3000;
-  const webUiUrl = `http://localhost:${hostPort}`;
+  const webUiUrl = serviceUrl(hostPort);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4 animate-in fade-in duration-150">

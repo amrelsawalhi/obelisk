@@ -5,7 +5,7 @@ import socket
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -43,6 +43,34 @@ def _sync_summary(report: Dict[str, Any]) -> str:
     """'2 created, 1 skipped' — the one line a deploy log has room for."""
     parts = [f"{count} {action}" for action, count in report.get("counts", {}).items() if count]
     return ", ".join(parts) or "nothing to do"
+
+
+def _origin_from_request(request: Request) -> str:
+    """The browser-facing origin of this request, for links a human will click.
+
+    ``public_url`` is the caller's explicit answer and wins. Without it, the host the
+    browser actually used is the only correct one: the server's own idea of its hostname
+    was ``localhost``, so a LAN deployment handed out links that pointed at whichever
+    machine was reading the page.
+
+    Behind a reverse proxy, ``Origin`` (or the ``X-Forwarded-*`` pair) is what the browser
+    saw, so those win over ``Host``, which the proxy rewrites.
+    """
+    origin = (request.headers.get("origin") or "").strip()
+    if origin and origin != "null":
+        return origin
+
+    proto = (
+        request.headers.get("x-forwarded-proto") or request.url.scheme or "http"
+    ).split(",")[0].strip()
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.netloc
+    )
+    host = (host or "").split(",")[0].strip()
+    return f"{proto}://{host}" if host else "http://localhost"
+
 
 # Request / Response Schemas
 class DeployLocalRequest(BaseModel):
@@ -373,6 +401,7 @@ async def _deploy_process_mode(svc_name: str, bp, req, db) -> DeployLocalRespons
 @router.post("/deploy-local", response_model=DeployLocalResponse)
 async def deploy_local_service(
     req: DeployLocalRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -502,7 +531,10 @@ async def deploy_local_service(
         # Expand gateway-relative placeholders (e.g. Gitea ROOT_URL) using the browser
         # origin that reached Obelisk — correct in local dev (:5173) and behind a
         # remote gateway alike, so subpath links resolve without hardcoding a host.
-        public_url = (req.public_url or "http://localhost").rstrip("/")
+        # ``localhost`` used to be the fallback, which silently produced links that only
+        # work on the server itself: on a LAN deployment every "Open UI" pointed at the
+        # operator's own machine.
+        public_url = (req.public_url or _origin_from_request(request)).rstrip("/")
         for env_key, env_val in bp.env.items():
             if env_val and "{public_url}" in env_val:
                 env_override[env_key] = env_val.replace("{public_url}", public_url)

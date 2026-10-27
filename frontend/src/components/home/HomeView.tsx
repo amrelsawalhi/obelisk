@@ -26,6 +26,7 @@ import { useTelemetry } from '../../lib/useTelemetry';
 import { usePolling } from '../../lib/viewActivity';
 import { api } from '../../lib/api';
 import { formatBytes } from '../../lib/format';
+import { serviceUrl } from '../../lib/urls';
 import type {
   ServiceStatus,
   CatalogNode,
@@ -545,7 +546,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                     <div className="flex items-center gap-1.5">
                       {isRunning && entry.web_ui && (
                         <a
-                          href={entry.web_ui_path || `http://localhost:${port}`}
+                          href={serviceUrl(port, entry.web_ui_path)}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-50 text-sky-700 hover:bg-sky-100 font-semibold text-xs border border-sky-200 transition-colors"
