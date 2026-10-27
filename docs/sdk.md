@@ -28,15 +28,32 @@ A handle, not a copy: nothing is read until you ask for a representation.
 ```python
 tbl = obelisk.table("lakehouse.raw.orders")
 
-tbl.exists()        # is there a file behind this address?
-tbl.to_polars()     # Polars DataFrame
-tbl.to_arrow()      # PyArrow Table (zero copy)
-tbl.to_df()         # pandas DataFrame
-tbl.to_duckdb()     # DuckDB relation (optionally pass a connection)
-tbl.to_spark()      # Spark DataFrame via Arrow, when a JVM is available
+tbl.exists()            # is there a file behind this address?
+lazy = tbl.to_lazy_polars()   # Polars LazyFrame: nothing is read until .collect()
+tbl.to_polars()         # Polars DataFrame   (eager)
+tbl.to_arrow()          # PyArrow Table      (eager)
+tbl.to_df()             # pandas DataFrame   (eager)
+tbl.to_duckdb()         # DuckDB relation (optionally pass a connection)
+tbl.to_spark()          # Spark DataFrame via Arrow, when a JVM is available
 ```
 
-## `query(sql) -> polars.DataFrame` / `query_arrow(sql) -> pyarrow.Table`
+The eager three load the whole table into memory, so they are guarded: a warning at 2 GB of
+Parquet, and a refusal above `max(8 GB, 25% of RAM)`. Both thresholds are settings
+(`OBELISK_SDK_EAGER_WARN_BYTES`, `OBELISK_SDK_EAGER_REFUSE_BYTES`) and the refusal names
+`to_lazy_polars()` as the way out. Use the lazy form for anything that might not fit:
+
+```python
+top = (
+    obelisk.table("lakehouse.marts.events")
+    .to_lazy_polars()
+    .filter(pl.col("region") == "emea")
+    .group_by("day")
+    .agg(pl.len().alias("events"))
+    .collect()          # only this much is ever in memory
+)
+```
+
+## `query(sql) -> polars.DataFrame` / `lazy_query(sql) -> polars.LazyFrame` / `query_arrow(sql)`
 
 Runs SQL on the in-process DuckDB. Table names resolve the same way they do in the
 editor, and **Postgres sources referenced in the SQL are attached automatically** --

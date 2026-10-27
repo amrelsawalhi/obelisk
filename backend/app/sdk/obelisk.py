@@ -40,17 +40,94 @@ __all__ = [
     "table",
     "query",
     "query_arrow",
+    "lazy_query",
     "save",
     "materialize_sql",
     "spark",
     "var",
     "TableWrapper",
+    "EagerReadTooLarge",
 ]
 
 # One shared connection for SDK helpers that do not receive an explicit one.
 # Creating a fresh in-memory connection per call leaked a DuckDB instance every
 # time to_duckdb()/to_arrow() was used (audit M4).
 _IMPLICIT_DUCKDB_CONN = None
+
+
+class EagerReadTooLarge(RuntimeError):
+    """An eager read was refused because the table is bigger than this machine can hold.
+
+    ``to_polars()``, ``to_df()`` and ``to_arrow()`` materialise the whole table. Past a
+    threshold that is not a slow cell, it is the notebook kernel dying — and the guard
+    says so *before* it happens, naming the lazy alternative instead.
+    """
+
+
+def _human_bytes(size: float) -> str:
+    """A byte count a person can read, without pulling in a formatter dependency."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size) < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"  # unreachable, kept for type checkers
+
+
+def _eager_refuse_bytes() -> int:
+    """The refusal threshold: configured, or a quarter of RAM — never under 8 GiB."""
+    configured = int(settings.SDK_EAGER_REFUSE_BYTES or 0)
+    if configured > 0:
+        return configured
+    try:
+        import psutil
+
+        total_ram = int(psutil.virtual_memory().total)
+    except Exception:
+        total_ram = 0
+    return max(8 * 1024 ** 3, int(total_ram * 0.25))
+
+
+def _guard_eager_read(
+    identifier: str,
+    files: list[Path],
+    what: str,
+    warn_bytes: Optional[int] = None,
+    refuse_bytes: Optional[int] = None,
+) -> None:
+    """Warns — or refuses — before an eager read pulls a table into memory.
+
+    ``files`` is what the table actually occupies on disk, which is a lower bound on the
+    memory the dataframe needs (Parquet is compressed). The point is not precision: it is
+    that a 40 GB table read by accident fails with a sentence instead of an OOM kill.
+
+    The thresholds default to :mod:`app.config`; they are parameters so the rule can be
+    tested at a size a test can actually write.
+    """
+    try:
+        on_disk = sum(path.stat().st_size for path in files if path.exists())
+    except OSError:
+        return
+    if on_disk <= 0:
+        return
+
+    limit = refuse_bytes if refuse_bytes is not None else _eager_refuse_bytes()
+    warn_at = warn_bytes if warn_bytes is not None else int(settings.SDK_EAGER_WARN_BYTES)
+
+    if limit > 0 and on_disk > limit:
+        raise EagerReadTooLarge(
+            f"{what} on '{identifier}' reads {_human_bytes(on_disk)} of Parquet into memory, "
+            f"above this install's {_human_bytes(limit)} guard. Use "
+            "`.to_lazy_polars()` (or `obelisk.lazy_query(sql)`) and collect only the "
+            "columns and rows you need; set OBELISK_SDK_EAGER_REFUSE_BYTES to change the "
+            "limit."
+        )
+    if warn_at > 0 and on_disk > warn_at:
+        logger.warning(
+            "%s on '%s' is loading %s into memory; .to_lazy_polars() avoids the copy.",
+            what,
+            identifier,
+            _human_bytes(on_disk),
+        )
 
 
 def _implicit_connection():
@@ -84,6 +161,23 @@ class TableWrapper:
             return None
         return path if path.is_file() and path.suffix.lower() == ".parquet" else None
 
+    def _parquet_files(self) -> list[Path]:
+        """The Parquet files this table's data lives in, for size estimation.
+
+        A lakehouse table is a directory, and a directory can still hold the files of a
+        snapshot DuckLake has not reclaimed yet. That makes this an upper bound on the size
+        of the *current* table, which is the safe direction for a guard — and the reason
+        reads go through the catalog (SQL) rather than globbing this list.
+        """
+        path = self.file_path
+        if path is None:
+            return []
+        if self._readable_file:
+            return [path]
+        if path.is_dir():
+            return [p for p in path.rglob("*.parquet") if p.is_file()]
+        return []
+
     def exists(self) -> bool:
         if self._readable_file:
             return True
@@ -96,6 +190,7 @@ class TableWrapper:
     def to_arrow(self) -> pa.Table:
         """Reads the table into a PyArrow Table, or queries an external database table."""
         if self._readable_file:
+            _guard_eager_read(self.full_identifier, [self._readable_file], "to_arrow()")
             return pq.read_table(str(self._readable_file))
         try:
             res = query_arrow(f"SELECT * FROM {self.full_identifier}")
@@ -109,10 +204,18 @@ class TableWrapper:
             ) from e
 
     def to_polars(self) -> pl.DataFrame:
-        """Reads the table into a Polars DataFrame, or queries an external database table."""
+        """Reads the table into a Polars DataFrame, or queries an external database table.
+
+        Eager: the whole table lands in memory. On a large table use
+        :meth:`to_lazy_polars` and ``collect()`` only what you need — the guard here warns
+        at 2 GB of Parquet and refuses above a quarter of RAM.
+        """
+        _guard_eager_read(self.full_identifier, self._parquet_files(), "to_polars()")
         if self._readable_file:
             return pl.read_parquet(str(self._readable_file))
         try:
+            # The catalog decides which Parquet files are current; a directory glob would
+            # also see files from snapshots DuckLake has not cleaned up yet.
             return query(f"SELECT * FROM {self.full_identifier}")
         except Exception as e:
             raise FileNotFoundError(
@@ -120,8 +223,24 @@ class TableWrapper:
                 f"attached external sources: {e}"
             ) from e
 
+    def to_lazy_polars(self) -> pl.LazyFrame:
+        """A Polars ``LazyFrame`` over this table: nothing is read until ``collect()``.
+
+        This is the answer to "the table is too big for a DataFrame". Polars pushes the
+        projection and filter into the scan, so ``.select("a").filter(...).collect()`` reads
+        only the columns it needs — the difference between a notebook cell that returns and
+        one that gets the kernel killed.
+
+        A lakehouse table is scanned through DuckDB (the catalog knows which files are
+        current, and small tables may be inlined in the catalog with no Parquet file to
+        scan at all); a loose ``.parquet`` file goes through Polars directly.
+        """
+        if self._readable_file:
+            return pl.scan_parquet(str(self._readable_file))
+        return lazy_query(f"SELECT * FROM {self.full_identifier}")
+
     def to_df(self) -> Any:
-        """Reads dataset into a Pandas DataFrame."""
+        """Reads dataset into a Pandas DataFrame (eager — see :meth:`to_polars`)."""
         arrow_obj = self.to_arrow()
         if hasattr(arrow_obj, "read_all"):
             arrow_obj = arrow_obj.read_all()
@@ -394,6 +513,30 @@ def query(sql: str) -> pl.DataFrame:
         return pl.from_arrow(arrow_table)
     finally:
         conn.close()
+
+
+def lazy_query(sql: str) -> pl.LazyFrame:
+    """``query()`` without materialising: a ``LazyFrame`` you ``collect()`` when you need it.
+
+    ``query()`` loads the whole result into a DataFrame. On a large table that is the same
+    trap as ``to_polars()`` — a cell that takes the kernel with it. This hands back a plan
+    instead: DuckDB keeps the scan until ``collect()``, and Polars/column pruning mean
+    ``obelisk.lazy_query("SELECT a FROM marts.orders").filter(...).collect()`` reads only
+    the column it needs.
+
+    The frame runs on the SDK's shared DuckDB connection, so it stays valid until collected.
+    """
+    if not (sql or "").strip():
+        raise ValueError("lazy_query() needs a SQL statement.")
+    conn = _implicit_connection()
+    storage_path = duckdb_engine._ensure_storage()
+    for attachment in _attachments_for_sql(sql):
+        duckdb_engine.attach(conn, attachment)
+    exec_sql = duckdb_engine._prepare_sql_and_views(conn, sql, storage_path)
+    rel = conn.sql(exec_sql)
+    if rel is None:
+        return pl.LazyFrame()
+    return rel.pl(lazy=True)
 
 
 def query_arrow(sql: str) -> pa.Table:

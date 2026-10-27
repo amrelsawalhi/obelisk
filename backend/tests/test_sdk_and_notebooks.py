@@ -76,6 +76,87 @@ def test_obelisk_query():
     assert df["engine"][0] == "obelisk_engine"
 
 
+def test_lazy_query_returns_a_frame_that_runs_on_collect():
+    """The lazy door into the same engine: a plan now, rows only when asked."""
+    lazy = obelisk.lazy_query("SELECT g AS n FROM range(1, 6) AS t(g)")
+
+    assert isinstance(lazy, pl.LazyFrame), "lazy_query must not materialise the result"
+    collected = lazy.collect()
+    assert isinstance(collected, pl.DataFrame)
+    assert collected["n"].to_list() == [1, 2, 3, 4, 5]
+
+
+def test_lazy_query_rejects_an_empty_statement():
+    """An empty string is a mistake, not a query that returns nothing."""
+    with pytest.raises(ValueError):
+        obelisk.lazy_query("   ")
+
+
+def test_a_table_scans_lazily_without_reading_it(sample_bronze_dataset):
+    """``to_lazy_polars()`` is lazy: the frame exists before any Parquet is touched."""
+    table_name, _path = sample_bronze_dataset
+    tbl = obelisk.table(f"bronze.{table_name}")
+
+    lazy = tbl.to_lazy_polars()
+
+    assert isinstance(lazy, pl.LazyFrame)
+    collected = lazy.select("customer").collect()
+    assert collected.height == 3
+    assert collected.columns == ["customer"]
+
+
+def test_the_eager_guard_refuses_a_table_above_the_limit(tmp_path):
+    """An eager read past the threshold names the lazy alternative instead of OOM-ing."""
+    from app.sdk.obelisk import EagerReadTooLarge, _guard_eager_read
+
+    heavy = tmp_path / "heavy.parquet"
+    heavy.write_bytes(b"\0" * 4096)
+
+    with pytest.raises(EagerReadTooLarge) as raised:
+        _guard_eager_read(
+            "marts.heavy", [heavy], "to_polars()", warn_bytes=1024, refuse_bytes=2048
+        )
+
+    message = str(raised.value)
+    assert "to_lazy_polars()" in message, "the error must say what to do instead"
+    assert "marts.heavy" in message
+
+
+def test_the_eager_guard_warns_between_its_two_thresholds(tmp_path, caplog):
+    """Below the refusal but above the warning: the read happens, loudly."""
+    import logging
+
+    from app.sdk.obelisk import _guard_eager_read
+
+    moderate = tmp_path / "moderate.parquet"
+    moderate.write_bytes(b"\0" * 2048)
+
+    with caplog.at_level(logging.WARNING, logger="app.sdk.obelisk"):
+        _guard_eager_read(
+            "marts.moderate", [moderate], "to_polars()", warn_bytes=1024, refuse_bytes=65536
+        )
+
+    assert any("marts.moderate" in record.getMessage() for record in caplog.records)
+
+
+def test_the_eager_guard_leaves_a_small_table_alone(tmp_path, caplog):
+    """The normal case must stay silent — a guard that always fires is a guard nobody reads."""
+    import logging
+
+    from app.sdk.obelisk import _guard_eager_read
+
+    small = tmp_path / "small.parquet"
+    small.write_bytes(b"\0" * 16)
+
+    with caplog.at_level(logging.WARNING, logger="app.sdk.obelisk"):
+        _guard_eager_read(
+            "marts.small", [small], "to_polars()", warn_bytes=1024, refuse_bytes=4096
+        )
+
+    assert caplog.records == []
+
+
+
 @pytest.mark.asyncio
 async def test_obelisk_save_writes_a_file_the_catalog_can_see():
     """``save`` writes the table; the catalog finds it because the file exists."""

@@ -100,7 +100,7 @@ print(f"Running in {env_mode} with batch size {batch_chunk}")`,
       category: 'table',
       icon: Database,
       badge: 'Lakehouse & Remote Tables',
-      desc: 'Resolves any Lakehouse Parquet dataset or registered external database table (PostgreSQL, Supabase, MySQL). Returns a TableWrapper with zero-copy conversion methods.',
+      desc: 'Resolves any Lakehouse Parquet dataset or registered external database table (PostgreSQL, Supabase, MySQL). Returns a TableWrapper whose eager conversions materialise the table, and whose lazy ones do not.',
       snippetTitle: 'DATA ACCESS: LOAD LAKEHOUSE & EXTERNAL TABLES',
       code: `import obelisk
 
@@ -113,12 +113,18 @@ tbl_remote = obelisk.table("supabase.public.audit_log_entries")
 # 3. Access flat or bare 1-tier table (auto-discovered across lakehouse root & subfolders):
 tbl_flat = obelisk.table("orders")
 
-# Zero-Copy Engine Conversions:
-df_polars = tbl_orders.to_polars()   # Lightning-fast Polars DataFrame
-df_arrow  = tbl_orders.to_arrow()    # Apache Arrow Table (zero-copy memory)
-df_pandas = tbl_orders.to_df()       # Standard Pandas DataFrame
+# Eager conversions — the whole table becomes an in-memory object:
+df_polars = tbl_orders.to_polars()   # Polars DataFrame
+df_arrow  = tbl_orders.to_arrow()    # PyArrow Table
+df_pandas = tbl_orders.to_df()       # Pandas DataFrame
 duck_rel  = tbl_orders.to_duckdb()   # DuckDB PyRelation for chaining queries
 
+# Lazy — nothing is read until collect(), so a 100 GB table is fine:
+lazy = tbl_orders.to_lazy_polars()   # Polars LazyFrame, prunes columns and row groups
+top  = lazy.select("region", "amount").group_by("region").sum().collect()
+
+# Eager reads are guarded: a warning at 2 GB of Parquet, a refusal above a quarter of
+# RAM (OBELISK_SDK_EAGER_WARN_BYTES / OBELISK_SDK_EAGER_REFUSE_BYTES).
 print(f"Loaded {len(df_polars):,} rows across {len(df_polars.columns)} columns.")`,
     },
     {
@@ -149,6 +155,9 @@ LIMIT 50;
 # Returns a Polars DataFrame
 df_result = obelisk.query(sql)
 
+# Same SQL, but lazy: nothing runs until collect(), and the projection is pushed down
+lazy_result = obelisk.lazy_query("SELECT region, amount FROM lakehouse.marts.orders")
+
 # Or return Apache Arrow table for streaming pipelines
 arrow_result = obelisk.query_arrow("SELECT * FROM lakehouse.marts.daily_revenue LIMIT 500")
 
@@ -165,11 +174,17 @@ display(df_result)`,
       code: `import obelisk
 import polars as pl
 
-# 1. Transform or aggregate your analytical dataset:
-df_summary = obelisk.table("lakehouse.raw.orders").to_polars().group_by("region").agg([
-    pl.col("amount").sum().alias("total_revenue"),
-    pl.col("order_id").count().alias("order_count")
-])
+# 1. Transform or aggregate your analytical dataset (lazy: the scan stays in DuckDB):
+df_summary = (
+    obelisk.table("lakehouse.raw.orders")
+    .to_lazy_polars()
+    .group_by("region")
+    .agg([
+        pl.col("amount").sum().alias("total_revenue"),
+        pl.col("order_id").count().alias("order_count")
+    ])
+    .collect()
+)
 
 # 2. Persist it as lakehouse.marts.daily_revenue
 res = obelisk.save(df_summary, "marts.daily_revenue")
