@@ -37,6 +37,14 @@ from app.core.storage import warehouse_storage
 from app.core.warehouse_resolver import resolve_write_warehouse_postgres_params
 from app.services.state import task_history
 
+# dbt needs a DuckDB file to open, but on the lakehouse target that file is only a
+# scratch pad: every model and source lives in the attached DuckLake catalog. It must
+# therefore not be called ``lakehouse.duckdb`` — a DuckDB file takes its database name
+# from its stem, so a file by that name would own the ``lakehouse`` identifier and the
+# ``ATTACH ... AS lakehouse`` below would quietly no-op (``ATTACH IF NOT EXISTS``),
+# leaving every source and model to resolve against an empty database.
+DBT_SCRATCH_DB = "dbt_scratch.duckdb"
+
 
 class NoSourceData(RuntimeError):
     """A build was asked to run while the folder it reads holds no table at all.
@@ -732,26 +740,6 @@ class DbtRunner:
                         "target": node_id,
                     })
 
-        # 3. Dynamically scan custom DAG assets from git_repo/dags/
-        custom_dag_nodes = []
-        try:
-            from app.engines.dag_loader import dag_loader
-            custom_dag_nodes = dag_loader.introspect_dag_nodes()
-            for cnode in custom_dag_nodes:
-                c_name = cnode["name"]
-                c_id = cnode["id"]
-                node_map[c_name] = c_id
-                for dep in cnode.get("deps", []):
-                    upstream_id = node_map.get(dep)
-                    if not upstream_id:
-                        # A dependency may name a model without its layer prefix.
-                        matches = [n["id"] for n in nodes if n["name"] == dep]
-                        upstream_id = matches[0] if matches else None
-                    if upstream_id:
-                        edges.append({"source": upstream_id, "target": c_id})
-        except Exception as e:
-            print(f"[DbtRunner] Warning: Custom DAG introspection failed: {e}")
-
         # Deduplicate edges
         unique_edges = []
         seen = set()
@@ -761,7 +749,7 @@ class DbtRunner:
                 seen.add(key)
                 unique_edges.append(e)
 
-        all_nodes = nodes + custom_dag_nodes
+        all_nodes = nodes
 
         # Selector active node calculation
         active_ids = set()
@@ -819,8 +807,6 @@ class DbtRunner:
             n["is_in_pipeline"] = n["id"] in active_ids
 
         schemas = {n["schema"] for n in all_nodes if n.get("schema")}
-        if custom_dag_nodes:
-            schemas.add("custom")
         schemas = sorted(schemas)
 
         return {
@@ -971,7 +957,7 @@ class DbtRunner:
             detail: Dict[str, Any] = {}
             if adapter == "duckdb":
                 detail = {
-                    "path": (settings.lakehouse_root_path / "lakehouse.duckdb")
+                    "path": (settings.lakehouse_root_path / DBT_SCRATCH_DB)
                     .resolve()
                     .as_posix(),
                     "source": "local file",
@@ -1038,11 +1024,14 @@ class DbtRunner:
             )
         elif adapter == "duckdb":
             env["DBT_DUCKDB_PATH"] = (
-                settings.lakehouse_root_path / "lakehouse.duckdb"
+                settings.lakehouse_root_path / DBT_SCRATCH_DB
             ).resolve().as_posix()
             # The lakehouse output attaches the DuckLake catalog; give dbt its path so
             # `dbt run` writes tables into the lake instead of a file.
             env["DBT_LAKEHOUSE_CATALOG"] = settings.lakehouse_catalog_path.as_posix()
+            # The lake's data path is where its Parquet goes; the profile passes it on
+            # attach so a fresh install lands in the same directory as ingestion does.
+            env["DBT_LAKEHOUSE_DATA_PATH"] = settings.duckdb_storage_path
 
         return env
 
