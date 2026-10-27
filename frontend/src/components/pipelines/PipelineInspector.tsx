@@ -161,6 +161,46 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
   const [newOutput, setNewOutput] = useState("");
   const targetRef = useRef<HTMLTextAreaElement | null>(null);
   const [copiedToken, setCopiedToken] = useState<string | null>(null);
+  const [catalogNodes, setCatalogNodes] = useState<CatalogNode[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    api.getCatalogTree().then((nodes) => {
+      if (active) setCatalogNodes(nodes.filter((n) => n.type !== "lakehouse"));
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
+
+  const connectionOptions = useMemo(() => {
+    const list: Array<{ id: string; name: string; source_type: string }> = [];
+    const seen = new Set<string>();
+    for (const c of targets?.connections ?? []) {
+      if (!seen.has(c.id)) {
+        seen.add(c.id);
+        list.push({ id: c.id, name: c.name, source_type: c.source_type });
+      }
+    }
+    for (const node of catalogNodes) {
+      if (!seen.has(node.id)) {
+        seen.add(node.id);
+        list.push({ id: node.id, name: node.name, source_type: node.type });
+      }
+    }
+    return list;
+  }, [targets?.connections, catalogNodes]);
+
+  const stepArgs = step?.args ?? {};
+  const currentConnectionId = (stepArgs.connection_id as string) || (stepArgs.connection as string) || "";
+  const matchedNode = useMemo(() => {
+    return catalogNodes.find(
+      (n) => n.id === currentConnectionId || n.name === currentConnectionId
+    );
+  }, [catalogNodes, currentConnectionId]);
+
+  const availableTables = useMemo(() => {
+    if (!matchedNode?.tables) return [];
+    return matchedNode.tables.map((t) => (t.schema ? `${t.schema}.${t.name}` : t.name));
+  }, [matchedNode]);
 
   const copyToken = async (value: string) => {
     try {
@@ -225,42 +265,6 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
   const isDbt = step.step_type === "dbt_run" || step.step_type === "dbt_test";
   const isProcess = step.step_type === "script" || step.step_type === "notebook";
   const style = statusStyle(runtime?.status);
-
-  const [catalogNodes, setCatalogNodes] = useState<CatalogNode[]>([]);
-  useEffect(() => {
-    let active = true;
-    api.getCatalogTree().then((nodes) => {
-      if (active) setCatalogNodes(nodes.filter((n) => n.type !== "lakehouse"));
-    }).catch(() => {});
-    return () => { active = false; };
-  }, []);
-
-  const connectionOptions = useMemo(() => {
-    const list: Array<{ id: string; name: string; source_type: string }> = [];
-    const seen = new Set<string>();
-    for (const c of targets?.connections ?? []) {
-      if (!seen.has(c.id)) {
-        seen.add(c.id);
-        list.push({ id: c.id, name: c.name, source_type: c.source_type });
-      }
-    }
-    for (const node of catalogNodes) {
-      if (!seen.has(node.id)) {
-        seen.add(node.id);
-        list.push({ id: node.id, name: node.name, source_type: node.type });
-      }
-    }
-    return list;
-  }, [targets?.connections, catalogNodes]);
-
-  const currentConnectionId = (args.connection_id as string) || (args.connection as string) || "";
-  const matchedNode = catalogNodes.find(
-    (n) => n.id === currentConnectionId || n.name === currentConnectionId
-  );
-  const availableTables = useMemo(() => {
-    if (!matchedNode?.tables) return [];
-    return matchedNode.tables.map((t) => (t.schema ? `${t.schema}.${t.name}` : t.name));
-  }, [matchedNode]);
 
   const isPipeline = step.step_type === "pipeline";
   const targetOptions =
