@@ -30,6 +30,15 @@ def _preview_payload(
     }
 
 
+def _mysql_ident(value: object) -> str:
+    """MySQL quotes identifiers with backticks, and a backtick inside is doubled.
+
+    ``sql_ident`` emits double quotes, which MySQL only accepts when ANSI_QUOTES is on,
+    so the MySQL paths keep their own quoting.
+    """
+    return "`" + str(value).replace("`", "``") + "`"
+
+
 def format_bytes(num_bytes: Optional[int]) -> Optional[str]:
     """Formats a byte count as ``B``/``KB``/``MB``/``GB``/``TB`` (binary units).
 
@@ -450,9 +459,21 @@ class Introspector:
         password: str,
         table: str,
         limit: int = 50,
+        schema: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Fetches up to `limit` rows from a live MySQL table."""
+        """Fetches up to `limit` rows from a live MySQL table.
+
+        ``schema`` is MySQL's word for a database, so it is only honoured when it names a
+        database other than the one the connection is opened on: qualifying with the
+        connection's own database would change nothing and add a failure mode.
+        """
         start = time.perf_counter()
+        cross_database = bool(schema) and str(schema).lower() != str(database).lower()
+        target = (
+            f"{_mysql_ident(schema)}.{_mysql_ident(table)}"
+            if cross_database
+            else _mysql_ident(table)
+        )
         resolved_host = resolve_connection_host(host, port)
         conn = pymysql.connect(
             host=resolved_host,
@@ -466,7 +487,7 @@ class Introspector:
         )
         try:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT * FROM `{table}` LIMIT %s", (limit,))
+                cur.execute(f"SELECT * FROM {target} LIMIT %s", (limit,))
                 rows = cur.fetchall()
                 columns = [desc[0] for desc in cur.description] if cur.description else []
                 clean_rows = []
@@ -554,16 +575,25 @@ class Introspector:
         password: str,
         table: str,
         limit: int = 50,
+        schema: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Fetches up to `limit` rows from a live Oracle table."""
+        """Fetches up to `limit` rows from a live Oracle table.
+
+        An unqualified name resolves in the connected user's schema, so ``schema`` only
+        qualifies when the caller names a different owner.
+        """
         start = time.perf_counter()
+        cross_schema = bool(schema) and str(schema).upper() != str(username).upper()
+        target = (
+            f"{sql_ident(schema)}.{sql_ident(table)}" if cross_schema else sql_ident(table)
+        )
         resolved_host = resolve_connection_host(host, port)
         dsn = f"{resolved_host}:{port}/{database}"
         conn = oracledb.connect(user=username, password=password, dsn=dsn, tcp_connect_timeout=3.0)
         try:
             cur = conn.cursor()
             cur.execute(
-                f"SELECT * FROM {sql_ident(table)} FETCH FIRST :limit ROWS ONLY", [limit]
+                f"SELECT * FROM {target} FETCH FIRST :limit ROWS ONLY", [limit]
             )
             columns = [desc[0] for desc in cur.description] if cur.description else []
             rows = []

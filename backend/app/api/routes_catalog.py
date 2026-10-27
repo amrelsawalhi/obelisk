@@ -6,7 +6,7 @@ import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -28,6 +28,10 @@ from app.core.sources import (
     resolve_source,
 )
 from app.services.catalog import catalog_service
+from app.services.superset import (
+    remove_connection_quietly,
+    sync_connection_quietly,
+)
 from app.core.catalog import (
     SOURCE,
     LOAD_TABLE_SUFFIX,
@@ -378,6 +382,7 @@ def _resolve_driver_or_400(source_type: str, driver: Optional[str]) -> str:
 @router.post("/connections", response_model=ConnectionResponse)
 async def create_connection(
     req: CreateConnectionRequest,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """Registers an enterprise source connection in the encrypted vault."""
@@ -421,6 +426,10 @@ async def create_connection(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Failed to register connection: {str(e)}"
         )
+
+    # Superset keeps its own copy of the source list; a fire-and-forget push keeps it
+    # honest without making a vault write depend on Superset being reachable.
+    background.add_task(sync_connection_quietly, new_conn.name)
 
     return _connection_response(new_conn)
 
@@ -575,6 +584,7 @@ async def test_connection(
 async def update_connection(
     conn_id: str,
     req: UpdateConnectionRequest,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """Updates an existing connection in the SQLite vault."""
@@ -586,6 +596,9 @@ async def update_connection(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Connection '{conn_id}' not found."
         )
+
+    # A rename must delete the old datasource, not leave it behind pointing at nothing.
+    previous_name = conn.name
 
     if req.name is not None:
         conn.name = req.name.strip()
@@ -628,11 +641,18 @@ async def update_connection(
     await db.refresh(conn)
     invalidate_catalog_cache()
 
+    # Fire-and-forget drift control: Superset is corrected in the background, and an
+    # unreachable Superset never fails the vault write.
+    if previous_name != conn.name:
+        background.add_task(remove_connection_quietly, previous_name)
+    background.add_task(sync_connection_quietly, conn.name)
+
     return _connection_response(conn)
 
 @router.delete("/connections/{conn_id}")
 async def delete_connection(
     conn_id: str,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """Deletes a connection from the SQLite vault."""
@@ -648,9 +668,12 @@ async def delete_connection(
     # Remove the connection's catalogued objects in one statement, then the row:
     # a detached shortcut would otherwise outlive the connection it points at (M7).
     await catalog_service.delete_for_connection(db, conn_id)
+    removed_name = conn.name
     await db.delete(conn)
     await db.commit()
     invalidate_catalog_cache()
+    # The datasource in Superset is keyed on this name, so it goes with it.
+    background.add_task(remove_connection_quietly, removed_name)
     return {"status": "deleted", "id": conn_id}
 
 
@@ -1283,9 +1306,15 @@ async def get_catalog_tree(
 @router.get("/preview/{path_or_source:path}")
 async def get_table_preview(
     path_or_source: str,
+    schema: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """Returns live 50-row preview from Lakehouse Parquet (any directory/subfolder) or external source database."""
+    """Returns live 50-row preview from Lakehouse Parquet (any directory/subfolder) or external source database.
+
+    ``schema`` is the namespace the table lives in. The catalog always has it — a table is
+    only unique inside one — and without it an external preview reads ``public.<name>``,
+    which is how a healthy table in ``sales`` answered "relation does not exist".
+    """
     parts = path_or_source.rsplit("/", 1)
     if len(parts) == 2:
         source_id, table_name = parts[0], parts[1]
@@ -1369,8 +1398,23 @@ async def get_table_preview(
         )
 
     plaintext_pw = decrypt(conn.encrypted_credentials)
+    st = conn.source_type.lower()
+
+    # The schema travels with the request, because a table name alone is only unique inside
+    # one. The catalog hands out the pair (`sales.sales_order_line` is schema `sales`, table
+    # `sales_order_line`); `schema` is the explicit form of that, and a dotted name in the
+    # path is the older spelling of the same thing. Query Studio was never affected because
+    # it is given the fully-qualified name.
+    table_schema = (schema or "").strip() or None
+    if table_schema is None and "." in table_name:
+        table_schema, table_name = table_name.split(".", 1)
+        if not table_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid table name.",
+            )
+
     try:
-        st = conn.source_type.lower()
         if st == "postgres":
             sslmode = (conn.options or {}).get("sslmode", "disable")
             preview = await asyncio.to_thread(
@@ -1381,6 +1425,7 @@ async def get_table_preview(
                 username=conn.username,
                 password=plaintext_pw,
                 table=table_name,
+                schema=table_schema or "public",
                 sslmode=sslmode,
             )
             return preview
@@ -1406,6 +1451,7 @@ async def get_table_preview(
                 username=conn.username,
                 password=plaintext_pw,
                 table=table_name,
+                schema=table_schema,
             )
             return preview
         elif st == "oracle":
@@ -1417,6 +1463,7 @@ async def get_table_preview(
                 username=conn.username,
                 password=plaintext_pw,
                 table=table_name,
+                schema=table_schema,
             )
             return preview
         elif st in ("api", "rest", "rest_api", "erp"):
@@ -1434,10 +1481,15 @@ async def get_table_preview(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unsupported source type '{conn.source_type}' for preview."
             )
+    except HTTPException:
+        raise
     except Exception as e:
+        # The source answered with a refusal (a missing table, a permission, a dead port):
+        # that is the upstream's verdict, not an Obelisk bug, so it is reported as 502 and
+        # the driver's own words are handed to the UI instead of a bare "status code 500".
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch preview from source: {str(e)}"
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"{conn.name} could not answer the preview: {str(e)}",
         )
 
 

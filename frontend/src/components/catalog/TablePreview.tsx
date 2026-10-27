@@ -57,11 +57,20 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
     try {
       setLoading(true);
       setError(null);
-      const data = await api.getTablePreview(sourceId, table.name);
+      // A lakehouse table is addressed by folder, not by schema; an external table lives in
+      // one, and the catalog already knows which. Sending it is what makes a preview of
+      // `sales.sales_order_line` ask for `sales` instead of `public`.
+      const data = await api.getTablePreview(
+        sourceId,
+        table.name,
+        isLakehouse ? null : table.schema_name,
+      );
       setPreview(data);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Failed to fetch table preview';
-      setError(msg);
+      // The API explains which source refused the preview and why (a missing table, a
+      // permission, a dead port). Falling back to axios' "status code 500" would hide it.
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setError(detail || (e instanceof Error ? e.message : 'Failed to fetch table preview'));
     } finally {
       setLoading(false);
     }
@@ -69,7 +78,7 @@ export const TablePreview: React.FC<TablePreviewProps> = ({
 
   useEffect(() => {
     fetchPreview();
-  }, [sourceId, table.name]);
+  }, [sourceId, table.name, table.schema_name]);
 
   const directoryName = propDirectoryName || (isLakehouse
     ? table.schema_name || sourceId.replace(/^lakehouse:/, '')

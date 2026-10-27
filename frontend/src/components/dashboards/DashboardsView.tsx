@@ -36,10 +36,17 @@ export const DashboardsView: React.FC = () => {
   const handleDeployLocal = async () => {
     try {
       setDeploying(true);
-      await api.deployLocalService({
-        service_name: 'superset',
-        memory_mb: 2048,
-      });
+      setError(null);
+      if (supersetStatus?.container_exists) {
+        // Already deployed and merely stopped: bring the same container back. Deploying
+        // again is refused (and would be wrong — its data volume already exists).
+        await api.startService('superset');
+      } else {
+        await api.deployLocalService({
+          service_name: 'superset',
+          memory_mb: 2048,
+        });
+      }
       await fetchStatus();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to deploy Superset');
@@ -85,7 +92,7 @@ export const DashboardsView: React.FC = () => {
               ) : (
                 <>
                   <Play className="w-3.5 h-3.5 fill-current" />
-                  <span>Deploy Superset Locally</span>
+                  <span>{supersetStatus?.container_exists ? 'Start Superset' : 'Deploy Superset Locally'}</span>
                 </>
               )}
             </button>

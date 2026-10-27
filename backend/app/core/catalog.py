@@ -17,6 +17,7 @@ which table at which version.
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Iterable, Optional, Sequence
@@ -131,12 +132,48 @@ class LakehouseUnavailable(RuntimeError):
     """The lakehouse catalog cannot be reached, so no table can be read or written."""
 
 
+# The first attach against a catalog is the one that creates DuckLake's metadata tables,
+# and SQLite takes a single writer: two threads arriving together meant the loser died with
+# "database is locked". The catalog tree attaches twice at once (its scan and its folder
+# list), so it was the tree that fell over on a fresh warehouse while everything after it
+# ran fine — a race that showed only on the very first read of a data path.
+#
+# Only that initialising attach is serialised. Attaching an existing catalog is read-only
+# and takes ~160 ms, so keeping every attach behind this lock would queue each query behind
+# the previous one; once a catalog is known to exist in this process, attaches overlap
+# again exactly as before. A second *process* (the maintenance CLI, a dbt run) is not
+# covered by this lock.
+_ATTACH_LOCK = threading.Lock()
+_initialised_catalogs: set[str] = set()
+
+
 def attach_lakehouse(conn) -> None:
     """Attaches the DuckLake catalog under the name ``lakehouse``.
 
     The address people already type — ``lakehouse.raw.orders`` — does not change; only
     who owns the metadata does. The catalog is created on first attach, which is what
     makes a fresh install work without a migration step.
+
+    That first attach is serialised against every other first attach in this process,
+    because two of them creating the metadata tables at once is what "database is locked"
+    was; see :data:`_ATTACH_LOCK`.
+    """
+    from app.config import settings
+
+    catalog = settings.lakehouse_catalog_path
+    key = str(catalog)
+    if key in _initialised_catalogs:
+        _attach_catalog(conn, catalog)
+        return
+    with _ATTACH_LOCK:
+        # A thread that waited on the lock attaches to a catalog someone else created,
+        # which is the cheap, read-only path again — but it still needs its own ATTACH.
+        _attach_catalog(conn, catalog)
+        _initialised_catalogs.add(key)
+
+
+def _attach_catalog(conn, catalog: Path) -> None:
+    """Loads the DuckLake extension and attaches ``catalog``.
 
     Loading is tried before installing: DuckDB 2.0 refuses an ``INSTALL`` whose recorded
     origin differs from the one it would download from, and an extension is often already
@@ -166,7 +203,6 @@ def attach_lakehouse(conn) -> None:
                 f"The ducklake extension is installed but cannot be loaded: {exc}"
             ) from exc
 
-    catalog = settings.lakehouse_catalog_path
     catalog.parent.mkdir(parents=True, exist_ok=True)
     conn.execute(
         f"ATTACH 'ducklake:sqlite:{catalog.as_posix()}' AS {SOURCE} "

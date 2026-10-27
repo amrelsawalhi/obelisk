@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import {
   X,
   Zap,
+  Play,
   StopCircle,
   ExternalLink,
   Terminal,
@@ -79,11 +80,22 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
   const isLocalRunning = status?.status === 'running' && status?.deployment_type === 'local';
   const isRunning = isLocalRunning;
   const engineDown = engineStatus ? !engineStatus.docker.available : false;
+  // A container that exists — running or stopped — is deployed, full stop. It can be
+  // started again exactly as it was, or destroyed (which deletes its data); only the
+  // absence of a container allows a fresh deploy with new credentials. Postgres applies
+  // POSTGRES_USER/PASSWORD/DB on first boot only, so "redeploying" over a stopped
+  // container is how a service ends up advertising credentials its volume never had.
+  const containerExists = status?.container_exists === true;
+  const canDeploy = !containerExists && !isLocalRunning;
   // Services that accept user-supplied credentials at deploy time.
   const acceptsCredentials = service.needs_credentials || service.name === 'postgres' || service.name === 'superset';
   const acceptsDatabase = service.name === 'postgres' || service.name === 'clickhouse';
 
   const handleDeploy = async () => {
+    if (containerExists) {
+      setError(`${service.display_name} is already deployed. Start it to keep its credentials and data, or destroy it before deploying again.`);
+      return;
+    }
     setDeployOpen(true);
     setDeployError(null);
     setOperating(true);
@@ -145,6 +157,22 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
       onChanged();
     } catch (e: unknown) {
       setError(extractErrorMessage(e, `Failed to stop ${service.name}`));
+    } finally {
+      setOperating(false);
+    }
+  };
+
+  const handleStart = async () => {
+    setOperating(true);
+    setError(null);
+    try {
+      const res = await api.startService(service.name);
+      if (!res.ready) {
+        setError(`${service.display_name} started, but it is not answering yet: ${res.message || 'no detail'}`);
+      }
+      onChanged();
+    } catch (e: unknown) {
+      setError(extractErrorMessage(e, `Failed to start ${service.name}`));
     } finally {
       setOperating(false);
     }
@@ -265,6 +293,11 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
                       <StopCircle className="w-3.5 h-3.5" />
                       <span>{operating ? 'Stopping...' : isProcess ? 'Stop Engine' : 'Stop Container'}</span>
                     </button>
+                  ) : containerExists ? (
+                    <button onClick={handleStart} disabled={operating || (engineDown && !isProcess)} className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-all disabled:opacity-50" title="Start this container exactly as it was deployed — same credentials, same data">
+                      <Play className="w-3.5 h-3.5" />
+                      <span>{operating ? 'Starting...' : 'Start Container'}</span>
+                    </button>
                   ) : (
                     <button onClick={handleDeploy} disabled={operating || !service.deployable || (engineDown && !isProcess)} className="px-3.5 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-all disabled:opacity-50">
                       <Zap className="w-3.5 h-3.5" />
@@ -272,20 +305,20 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
                     </button>
                   )}
 
-                  {!isProcess && (
+                  {!isProcess && canDeploy && (
                     <button onClick={() => setExpanded((v) => !v)} className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-semibold flex items-center gap-1.5 transition-all" title={expanded ? 'Hide configuration' : 'Configure memory, port, and image'}>
                       <ChevronDown className={`w-3.5 h-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`} />
                       <span>Configure</span>
                     </button>
                   )}
 
-                  {isLocalRunning && (
+                  {(isLocalRunning || containerExists) && (
                     <>
                       <button onClick={handleShowLogs} className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-semibold flex items-center gap-1.5 transition-all" title="View logs">
                         <Terminal className="w-3.5 h-3.5" />
                         <span>Logs</span>
                       </button>
-                      <button onClick={handleDestroy} className="px-2.5 py-1.5 rounded-lg border border-red-200 bg-white hover:bg-red-50 text-red-600 text-xs font-semibold flex items-center gap-1.5 transition-all" title={isProcess ? 'Stop processes and delete its home directory' : 'Stop container and permanently delete its data volume'}>
+                      <button onClick={handleDestroy} className="px-2.5 py-1.5 rounded-lg border border-red-200 bg-white hover:bg-red-50 text-red-600 text-xs font-semibold flex items-center gap-1.5 transition-all" title={isProcess ? 'Stop processes and delete its home directory' : 'Remove the container and permanently delete its data volume'}>
                         <Trash2 className="w-3.5 h-3.5" />
                         <span>Destroy</span>
                       </button>
@@ -293,7 +326,16 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
                   )}
                 </div>
 
-                {expanded && !isProcess && (
+                {containerExists && (
+                  <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200/80 text-[11px] text-slate-600 leading-relaxed">
+                    Deployed and fixed: this container keeps the credentials and configuration it was
+                    created with. <span className="font-semibold text-slate-700">Start</span> resumes it
+                    exactly as it was; <span className="font-semibold text-slate-700">Destroy</span> removes
+                    it and its data, after which you can deploy again with different settings.
+                  </div>
+                )}
+
+                {expanded && !isProcess && canDeploy && (
                   <div className="space-y-3 border-t border-slate-100 pt-3">
                     {recommendation && (
                       <div className="flex items-center justify-between text-xs text-slate-500 font-mono bg-amber-50/60 border border-amber-100 px-3 py-1.5 rounded-md">

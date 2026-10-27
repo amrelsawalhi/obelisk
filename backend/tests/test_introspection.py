@@ -240,6 +240,7 @@ async def test_catalog_api_flow(source_postgres_params):
         assert len(matched_conn) == 1
         assert matched_conn[0]["type"] == "postgres"
 
-        # 2. Test preview of missing table
+        # 2. Test preview of missing table. The source refusing the lookup is reported as a
+        # 502 (upstream), not a 500 that reads like an Obelisk bug.
         res_missing = await client.get(f"/api/catalog/preview/{connection_id}/non_existent_table")
-        assert res_missing.status_code in [404, 500]
+        assert res_missing.status_code in [404, 502]

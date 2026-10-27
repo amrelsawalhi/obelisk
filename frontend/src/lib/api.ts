@@ -128,6 +128,15 @@ export const api = {
     return res.data;
   },
 
+  /**
+   * Starts a stopped service exactly as it was deployed — same container, same
+   * credentials, same data. New credentials are only accepted by a fresh deploy.
+   */
+  startService: async (serviceName: string): Promise<{ service_name: string; status: string; ready: boolean; message?: string | null }> => {
+    const res = await apiClient.post<{ service_name: string; status: string; ready: boolean; message?: string | null }>(`/services/${serviceName}/start`);
+    return res.data;
+  },
+
   // Catalog & Connections
   // `refresh` bypasses the backend's tree cache. An ingest writes into the catalog
   // behind the view's back, so a copy taken before it must not be served afterwards.
@@ -137,8 +146,18 @@ export const api = {
     });
     return res.data;
   },
-  getTablePreview: async (sourceId: string, tableName: string): Promise<TablePreviewResponse> => {
-    const res = await apiClient.get<TablePreviewResponse>(`/catalog/preview/${sourceId}/${tableName}`);
+  getTablePreview: async (
+    sourceId: string,
+    tableName: string,
+    schema?: string | null,
+  ): Promise<TablePreviewResponse> => {
+    // The schema travels with the name: a table is only unique inside one, and a preview
+    // without it reads `public.<name>` — which is how a healthy table in `sales` used to
+    // answer "relation does not exist".
+    const res = await apiClient.get<TablePreviewResponse>(
+      `/catalog/preview/${sourceId}/${encodeURIComponent(tableName)}`,
+      { params: schema ? { schema } : undefined },
+    );
     return res.data;
   },
   createLakehouseDirectory: async (path: string): Promise<{ status: string; name: string; path: string }> => {

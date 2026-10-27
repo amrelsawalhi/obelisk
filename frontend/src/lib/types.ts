@@ -43,6 +43,8 @@ export interface ServiceStatus {
   container_id?: string | null;
   live_docker_status?: string | null;
   host_port?: number;
+  /** A stopped container still exists: it can be started, but not redeployed. */
+  container_exists?: boolean;
 }
 
 export interface DeployedCredentials {
