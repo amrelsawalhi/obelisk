@@ -1585,7 +1585,9 @@ def _lakehouse_diagnostics_sync() -> Dict[str, Any]:
         "obelisk_db_bytes": _file_bytes(Path(settings.sqlite_db_path)),
         "obelisk_db_journal_mode": _sqlite_journal_mode(Path(settings.sqlite_db_path)),
         "duckdb_tmp_bytes": _directory_bytes(settings.duckdb_temp_path),
-        "duckdb_tmp_limit": settings.DUCKDB_TEMP_SIZE_LIMIT,
+        "duckdb_tmp_limit": advisor.get_duckdb_temp_limit(
+            settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT
+        ),
         "duckdb_memory_limit_per_slot": advisor.get_duckdb_memory_limit(
             settings.DUCKDB_MAX_CONCURRENT_HEAVY
         ),

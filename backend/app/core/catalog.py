@@ -16,13 +16,17 @@ which table at which version.
 """
 from __future__ import annotations
 
+import logging
 import re
+import sqlite3
 import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Iterable, Optional, Sequence
 
 from app.core.storage import FileInfo, WarehouseStorage, normalize_rel, warehouse_storage
+
+logger = logging.getLogger(__name__)
 
 SOURCE = "lakehouse"
 PARQUET_SUFFIX = ".parquet"
@@ -146,6 +150,51 @@ class LakehouseUnavailable(RuntimeError):
 _ATTACH_LOCK = threading.Lock()
 _initialised_catalogs: set[str] = set()
 
+# Catalogs already put into WAL mode by this process. The mode is stored in the file, so
+# doing it more than once buys nothing.
+_prepared_catalogs: set[str] = set()
+
+# How long the sqlite catalog waits for a competing writer before giving up. The catalog is
+# written by every dbt run and every ingest, and read by every Query Studio attach, so the
+# default (fail immediately) is the difference between "one query waited" and "database is
+# locked" surfacing in the UI.
+CATALOG_BUSY_TIMEOUT_MS = 15_000
+
+
+def _prepare_catalog_file(catalog: Path) -> None:
+    """Puts the DuckLake metadata file in WAL mode, once per process.
+
+    DuckLake opens that sqlite file with its own connection, so the journal mode is
+    whatever the file itself says — and WAL is persistent in the header. WAL lets a reader
+    (an attach for a query) and a writer (a dbt run, an ingest) proceed at the same time
+    instead of serialising every catalog access behind one lock.
+
+    Best effort: if the file is busy or the filesystem refuses WAL (a network share), the
+    catalog keeps working exactly as before.
+    """
+    key = str(catalog)
+    if key in _prepared_catalogs:
+        return
+    try:
+        con = sqlite3.connect(catalog, timeout=CATALOG_BUSY_TIMEOUT_MS / 1000)
+        try:
+            mode = con.execute("PRAGMA journal_mode=WAL;").fetchone()
+            con.execute(f"PRAGMA busy_timeout={CATALOG_BUSY_TIMEOUT_MS};")
+        finally:
+            con.close()
+    except Exception as exc:
+        logger.debug("Could not put the DuckLake catalog in WAL mode: %s", exc)
+        _prepared_catalogs.add(key)  # do not retry on every attach
+        return
+    _prepared_catalogs.add(key)
+    if mode and str(mode[0]).lower() != "wal":
+        logger.info(
+            "DuckLake catalog %s is in %s mode (WAL unavailable here); concurrent writers "
+            "will serialise.",
+            catalog,
+            mode[0],
+        )
+
 
 def attach_lakehouse(conn) -> None:
     """Attaches the DuckLake catalog under the name ``lakehouse``.
@@ -204,9 +253,13 @@ def _attach_catalog(conn, catalog: Path) -> None:
             ) from exc
 
     catalog.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_catalog_file(catalog)
+    # BUSY_TIMEOUT is DuckLake's own sqlite-catalog option: a second writer waits instead of
+    # failing with "database is locked" the moment two things touch the catalog at once
+    # (a dbt run and an ingest are enough).
     conn.execute(
         f"ATTACH 'ducklake:sqlite:{catalog.as_posix()}' AS {SOURCE} "
-        f"(DATA_PATH '{settings.duckdb_storage_path}');"
+        f"(DATA_PATH '{settings.duckdb_storage_path}', BUSY_TIMEOUT {CATALOG_BUSY_TIMEOUT_MS});"
     )
 
 

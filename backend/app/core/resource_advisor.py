@@ -1,6 +1,21 @@
 import os
+import re
 import psutil
 from typing import Dict, Any, List
+
+# Multipliers to megabytes, so a configured "50GB" and a computed byte count can be compared.
+_SIZE_UNITS_MB = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
+
+
+def _parse_size_to_mb(value: object) -> int | None:
+    """'50GB' / '512MB' / '2T' -> megabytes. ``None`` when the text is not a size."""
+    text = str(value or "").strip().upper().replace(" ", "")
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)([KMGT]?)I?B?(?:YTES?)?$", text)
+    if not match:
+        return None
+    number = float(match.group(1))
+    return int(number * _SIZE_UNITS_MB[match.group(2)])
+
 
 class ResourceAdvisor:
     """
@@ -138,6 +153,24 @@ class ResourceAdvisor:
         # Allocate at most 50% of remaining safe host RAM across concurrent DuckDB slots
         per_slot_gb = max(1, min(12, int((remaining_safe_gb * 0.50) / slots)))
         return f"{per_slot_gb}GB"
+
+    def get_duckdb_temp_limit(self, path: str, configured: str = "50GB") -> str:
+        """How much DuckDB may spill into its temp directory, given what is actually free.
+
+        ``DUCKDB_TEMP_SIZE_LIMIT`` is a fixed string, so it was right for exactly one disk.
+        On a 40 GB volume DuckDB believed it had 50 GB to spill into and died mid-query with
+        "could not write to file"; on a 4 TB volume it stopped at 50 GB for no reason. The
+        budget is now the configured ceiling *or* half the free space, whichever is smaller,
+        so a spill can always leave room for the lakehouse's own Parquet and the catalog.
+        """
+        wanted = _parse_size_to_mb(configured) or 50 * 1024
+        try:
+            free_bytes = int(psutil.disk_usage(path).free)
+        except Exception:
+            return configured
+        # Half of what is free, never below the 1 GB DuckDB needs to be useful at all.
+        allowed_mb = max(1024, free_bytes // (1024 * 1024) // 2)
+        return f"{min(wanted, allowed_mb)}MB"
 
     def get_spark_memory_limit(self) -> str:
         """Returns safe memory limit string for PySpark driver initialization (e.g. '2g', '4g')."""

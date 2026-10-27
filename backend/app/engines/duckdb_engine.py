@@ -70,7 +70,10 @@ class DuckDBEngine:
         statements = [
             f"SET memory_limit = '{advisor.get_duckdb_memory_limit(settings.DUCKDB_MAX_CONCURRENT_HEAVY)}';",
             f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
-            f"SET max_temp_directory_size = '{settings.DUCKDB_TEMP_SIZE_LIMIT}';",
+            # The spill budget follows the free space on the volume that holds it, so a
+            # 50 GB ceiling on a 40 GB disk cannot promise space the disk does not have.
+            "SET max_temp_directory_size = '"
+            f"{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT)}';",
             "SET preserve_insertion_order = false;",
             f"SET storage_directory = '{self._ensure_storage()}';",
         ]

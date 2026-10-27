@@ -56,6 +56,30 @@ def test_duckdb_memory_limit_is_shared_between_concurrent_slots():
     # A nonsensical slot count is clamped to 1 rather than dividing by zero.
     assert advisor.get_duckdb_memory_limit(0) == single_slot
 
+
+def test_the_spill_budget_never_promises_more_than_the_disk_has():
+    """``DUCKDB_TEMP_SIZE_LIMIT=50GB`` on a 40 GB volume was a promise DuckDB could not keep.
+
+    The budget is the configured ceiling or half the free space, whichever is smaller.
+    """
+    budget = advisor.get_duckdb_temp_limit(".", "50GB")
+
+    assert budget.endswith("MB")
+    assert int(budget.replace("MB", "")) >= 1024, "a spill budget under 1 GB is useless"
+
+
+def test_a_low_configured_ceiling_still_wins():
+    """The setting is a ceiling, not a floor: a small limit is honoured on a large disk."""
+    assert advisor.get_duckdb_temp_limit(".", "1MB") == "1MB"
+
+
+def test_an_unparseable_limit_falls_back_to_the_default_ceiling():
+    """A typo must not remove the cap entirely."""
+    budget = advisor.get_duckdb_temp_limit(".", "fifty gigabytes")
+
+    assert budget.endswith("MB")
+    assert int(budget.replace("MB", "")) >= 1024
+
 def test_vault_encryption_and_decryption():
     """Verifies AES-128 Fernet encryption and decryption."""
     secret = "super_confidential_db_token_999"
