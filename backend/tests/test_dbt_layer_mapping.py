@@ -104,8 +104,17 @@ def test_asset_graph_nodes_are_keyed_by_the_schema_each_folder_declares() -> Non
     assert len(graph["schemas"]) == len(set(graph["schemas"]))
     assert {"bronze", "silver", "gold"}.isdisjoint(graph["schemas"])
 
+    # Every model node is keyed by the schema its folder declares — never by a tier.
+    # The models themselves are local demo content (git-excluded), so the expectation
+    # comes from the files on disk rather than from fixed model names.
+    for node in graph["nodes"]:
+        folder = node.get("folder")
+        if folder:
+            assert node["id"] == f"{folders[folder]}.{node['name']}", node
+
     ids = {node["id"] for node in graph["nodes"]}
-    assert f"{folders['staging']}.stg_orders" in ids
-    assert f"{folders['marts']}.fct_revenue" in ids
+    for folder, schema in folders.items():
+        for model_file in (PROJECT_DIR / "models" / folder).glob("*.sql"):
+            assert f"{schema}.{model_file.stem}" in ids, model_file.name
 
 

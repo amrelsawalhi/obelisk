@@ -97,36 +97,44 @@ async def test_dbt_studio_file_lifecycle_and_compile(source_postgres_params, bou
         )
 
         # 1. Create / Write File
-        save_res = await client.post("/api/dbt/file", json={"path": rel_path, "content": content})
-        assert save_res.status_code == 200
-        assert save_res.json()["status"] == "success"
+        created = True
+        try:
+            save_res = await client.post("/api/dbt/file", json={"path": rel_path, "content": content})
+            assert save_res.status_code == 200
+            assert save_res.json()["status"] == "success"
 
-        # 2. Read File Back
-        read_res = await client.get(f"/api/dbt/file?path={rel_path}")
-        assert read_res.status_code == 200
-        file_data = read_res.json()
-        assert file_data["path"] == rel_path
-        assert "amount > 0" in file_data["content"]
+            # 2. Read File Back
+            read_res = await client.get(f"/api/dbt/file?path={rel_path}")
+            assert read_res.status_code == 200
+            file_data = read_res.json()
+            assert file_data["path"] == rel_path
+            assert "amount > 0" in file_data["content"]
 
-        # 3. Real dbt compile
-        comp_res = await client.post("/api/dbt/compile", json={"model_name": "stg_test_unit", "target": "postgres"})
-        assert comp_res.status_code == 200
-        comp_data = comp_res.json()
-        assert comp_data["success"] is True
-        assert "compiled_sql" in comp_data
-        assert "amount > 0" in comp_data["compiled_sql"]
-        assert comp_data["duration_ms"] >= 0
+            # 3. Real dbt compile
+            comp_res = await client.post("/api/dbt/compile", json={"model_name": "stg_test_unit", "target": "postgres"})
+            assert comp_res.status_code == 200
+            comp_data = comp_res.json()
+            assert comp_data["success"] is True
+            assert "compiled_sql" in comp_data
+            assert "amount > 0" in comp_data["compiled_sql"]
+            assert comp_data["duration_ms"] >= 0
 
-        # 4. Lineage DAG for stg_test_unit
-        lineage_res = await client.get("/api/dbt/lineage?model=stg_test_unit")
-        assert lineage_res.status_code == 200
-        lin_data = lineage_res.json()
-        assert lin_data["model_name"] == "stg_test_unit"
-        assert len(lin_data["nodes"]) >= 1
+            # 4. Lineage DAG for stg_test_unit
+            lineage_res = await client.get("/api/dbt/lineage?model=stg_test_unit")
+            assert lineage_res.status_code == 200
+            lin_data = lineage_res.json()
+            assert lin_data["model_name"] == "stg_test_unit"
+            assert len(lin_data["nodes"]) >= 1
 
-        # 5. Clean up created file
-        del_res = await client.delete(f"/api/dbt/file?path={rel_path}")
-        assert del_res.status_code == 200
+            # 5. Clean up created file
+            del_res = await client.delete(f"/api/dbt/file?path={rel_path}")
+            assert del_res.status_code == 200
+            created = False
+        finally:
+            # A model file left behind makes every later `dbt parse` of the real
+            # project fail, so cleanup must not depend on the happy path.
+            if created:
+                await client.delete(f"/api/dbt/file?path={rel_path}")
 
 
 @pytest.mark.asyncio

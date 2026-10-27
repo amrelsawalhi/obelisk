@@ -16,11 +16,27 @@ import shutil
 import uuid
 from pathlib import Path
 
+import pytest
+
 from app.config import settings
 from app.engines.dbt_runner import dbt_runner
 
 SHARED_TARGET = Path(dbt_runner.dbt_project_dir) / "target"
 SCRATCH_PREFIX = "dbt_compile_"
+
+
+def _a_real_model() -> str | None:
+    """A model that exists in the project on disk.
+
+    The project's models are local demo content and are not in the repo, so the model
+    is discovered rather than named — a hardcoded name goes stale the moment the demo
+    workspace changes.
+    """
+    for folder in ("staging", "marts"):
+        models = sorted((Path(dbt_runner.dbt_project_dir) / "models" / folder).glob("*.sql"))
+        if models:
+            return models[0].stem
+    return None
 
 
 def _scratch_dirs() -> set[Path]:
@@ -77,14 +93,20 @@ def test_compile_model_ignores_artifacts_left_in_the_shared_target():
 
 def test_compile_model_compiles_a_real_model_and_cleans_its_scratch_dir():
     """The happy path: real compiled SQL, and no scratch directory left behind."""
+    model = _a_real_model()
+    if model is None:
+        pytest.skip("the project on disk ships no models (the demo models are local content)")
+
     shared_before = _shared_manifest_stamp()
     scratch_before = _scratch_dirs()
 
-    result = dbt_runner.compile_model("stg_orders", target=dbt_runner.default_target())
+    result = dbt_runner.compile_model(model, target=dbt_runner.default_target())
 
     assert result["success"], result["logs"][-3000:]
-    assert result["compiled_sql"].strip().lower().startswith("select")
-    assert "order_id" in result["compiled_sql"]
+    compiled = result["compiled_sql"].strip().lower()
+    # Any real model compiles to SQL that reads something; only a stub would not.
+    assert "select" in compiled, compiled[:200]
+    assert "from" in compiled, compiled[:200]
     assert _scratch_dirs() == scratch_before, "the scratch target directory must be removed"
     assert _shared_manifest_stamp() == shared_before, (
         "compiling one model must not rewrite the project's shared target/"
