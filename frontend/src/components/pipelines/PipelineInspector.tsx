@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Copy,
@@ -10,7 +10,9 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { api } from '../../lib/api';
 import type {
+  CatalogNode,
   EdgeCondition,
   PipelineStepDef,
   PipelineSummary,
@@ -22,6 +24,7 @@ import { statusStyle, stepTypeLabel } from './PipelineCanvas';
 import type { StepRuntime } from './PipelineCanvas';
 
 const TYPE_OPTIONS: StepType[] = [
+  'ingest',
   'dbt_run',
   'dbt_test',
   'script',
@@ -217,10 +220,47 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
 
   const declared = (args.outputs as Record<string, { type?: string; sensitive?: boolean }>) ?? {};
   const materialize = args.materialize as { folder?: string; name?: string } | undefined;
+  const isIngest = step.step_type === "ingest";
   const isRawSql = step.step_type === "raw_sql";
   const isDbt = step.step_type === "dbt_run" || step.step_type === "dbt_test";
   const isProcess = step.step_type === "script" || step.step_type === "notebook";
   const style = statusStyle(runtime?.status);
+
+  const [catalogNodes, setCatalogNodes] = useState<CatalogNode[]>([]);
+  useEffect(() => {
+    let active = true;
+    api.getCatalogTree().then((nodes) => {
+      if (active) setCatalogNodes(nodes.filter((n) => n.type !== "lakehouse"));
+    }).catch(() => {});
+    return () => { active = false; };
+  }, []);
+
+  const connectionOptions = useMemo(() => {
+    const list: Array<{ id: string; name: string; source_type: string }> = [];
+    const seen = new Set<string>();
+    for (const c of targets?.connections ?? []) {
+      if (!seen.has(c.id)) {
+        seen.add(c.id);
+        list.push({ id: c.id, name: c.name, source_type: c.source_type });
+      }
+    }
+    for (const node of catalogNodes) {
+      if (!seen.has(node.id)) {
+        seen.add(node.id);
+        list.push({ id: node.id, name: node.name, source_type: node.type });
+      }
+    }
+    return list;
+  }, [targets?.connections, catalogNodes]);
+
+  const currentConnectionId = (args.connection_id as string) || (args.connection as string) || "";
+  const matchedNode = catalogNodes.find(
+    (n) => n.id === currentConnectionId || n.name === currentConnectionId
+  );
+  const availableTables = useMemo(() => {
+    if (!matchedNode?.tables) return [];
+    return matchedNode.tables.map((t) => (t.schema ? `${t.schema}.${t.name}` : t.name));
+  }, [matchedNode]);
 
   const isPipeline = step.step_type === "pipeline";
   const targetOptions =
@@ -244,6 +284,10 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
       derived: false,
     })),
     ...(isRawSql ? [{ name: "rows", type: "scalar", derived: true }] : []),
+    ...(isIngest ? [
+      { name: "table", type: "table", derived: true },
+      { name: "rows", type: "scalar", derived: true },
+    ] : []),
     ...(materialize ? [{ name: "table", type: "table", derived: true }] : []),
     ...(isDbt ? [{ name: "dbt_summary", type: "scalar", derived: true }] : []),
   ];
@@ -287,7 +331,14 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
               <select
                 className={inputClass}
                 value={step.step_type}
-                onChange={(event) => onChange({ step_type: event.target.value as StepType })}
+                onChange={(event) => {
+                  const nextType = event.target.value as StepType;
+                  const patch: Partial<PipelineStepDef> = { step_type: nextType };
+                  if (nextType === "ingest" && !args.target_folder) {
+                    patch.args = { ...args, target_folder: "raw", mode: "snapshot", write_strategy: "append" };
+                  }
+                  onChange(patch);
+                }}
               >
                 {TYPE_OPTIONS.map((type) => (
                   <option key={type} value={type}>
@@ -296,65 +347,260 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                 ))}
               </select>
             </Field>
-            <Field
-              label="Target"
-              hint={
-                step.step_type === "webhook"
-                  ? "Full URL. {param} and {steps.name.output} are substituted at run time."
-                  : isRawSql
-                    ? "DuckDB SQL. {{param}} for parameters, {{steps.name.table}} for a parent table, {{steps.name.output}} for a parent value."
-                    : isDbt
-                      ? "dbt selector: *, model name, model+ or models/folder"
-                      : "File name inside git_repo/"
-              }
-            >
-              {isPipeline ? (
-                <select
-                  className={inputClass}
-                  value={step.target}
-                  onChange={(event) => onChange({ target: event.target.value })}
+
+            {isIngest ? (
+              <>
+                <Field
+                  label="Source connection"
+                  hint="Select the external database or data source to ingest from."
                 >
-                  <option value="">Choose a pipeline?</option>
-                  {!pipelineOptions.some((option) => option.id === step.target) &&
-                    step.target && (
+                  <select
+                    className={inputClass}
+                    value={currentConnectionId}
+                    onChange={(event) => {
+                      const connId = event.target.value;
+                      const found = connectionOptions.find((c) => c.id === connId);
+                      setArgs({
+                        connection_id: connId,
+                        connection: found ? found.name : connId,
+                      });
+                    }}
+                  >
+                    <option value="">Select a source connection...</option>
+                    {connectionOptions.map((conn) => (
+                      <option key={conn.id} value={conn.id}>
+                        {conn.name} ({conn.source_type})
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+
+                <Field
+                  label="Source Table / Entity"
+                  hint="Table, view, or collection to extract from the source."
+                >
+                  {availableTables.length > 0 ? (
+                    <div className="space-y-1.5">
+                      <select
+                        className={inputClass}
+                        value={step.target}
+                        onChange={(event) => {
+                          const val = event.target.value;
+                          const cleanStem = val.includes(".") ? val.split(".").slice(-1)[0] : val;
+                          onChange({ target: val });
+                          setArgs({
+                            entity: val,
+                            ...(!args.target_name ? { target_name: cleanStem } : {}),
+                          });
+                        }}
+                      >
+                        <option value="">Choose discovered table or type below...</option>
+                        {!availableTables.includes(step.target) && step.target && (
+                          <option value={step.target}>{step.target} (custom)</option>
+                        )}
+                        {availableTables.map((tbl) => (
+                          <option key={tbl} value={tbl}>
+                            {tbl}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        className={inputClass}
+                        placeholder="Or custom: schema.table_name"
+                        value={step.target}
+                        onChange={(event) => {
+                          const val = event.target.value;
+                          const cleanStem = val.includes(".") ? val.split(".").slice(-1)[0] : val;
+                          onChange({ target: val });
+                          setArgs({
+                            entity: val,
+                            ...(!args.target_name ? { target_name: cleanStem } : {}),
+                          });
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    <input
+                      className={inputClass}
+                      placeholder="e.g. sales.sales_order or public.customers"
+                      value={step.target}
+                      onChange={(event) => {
+                        const val = event.target.value;
+                        const cleanStem = val.includes(".") ? val.split(".").slice(-1)[0] : val;
+                        onChange({ target: val });
+                        setArgs({
+                          entity: val,
+                          ...(!args.target_name ? { target_name: cleanStem } : {}),
+                        });
+                      }}
+                    />
+                  )}
+                </Field>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <Field label="Lakehouse folder" hint="e.g. raw, bronze">
+                    <input
+                      className={inputClass}
+                      value={(args.target_folder as string) ?? "raw"}
+                      placeholder="raw"
+                      onChange={(event) => setArgs({ target_folder: event.target.value })}
+                    />
+                  </Field>
+                  <Field label="Table name stem" hint="Parquet table stem">
+                    <input
+                      className={`${inputClass} font-mono`}
+                      value={(args.target_name as string) ?? ""}
+                      placeholder={
+                        step.target
+                          ? step.target.includes(".")
+                            ? step.target.split(".").slice(-1)[0]
+                            : step.target
+                          : "table_name"
+                      }
+                      onChange={(event) => setArgs({ target_name: event.target.value })}
+                    />
+                  </Field>
+                </div>
+
+                <Field label="Ingestion mode">
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setArgs({ mode: "snapshot" })}
+                      className={`flex-1 rounded-lg border py-1.5 text-xs font-semibold transition-all ${
+                        (args.mode ?? "snapshot") === "snapshot"
+                          ? "border-sky-500 bg-sky-50 text-sky-700 shadow-xs"
+                          : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      Snapshot (Full)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setArgs({ mode: "incremental" })}
+                      className={`flex-1 rounded-lg border py-1.5 text-xs font-semibold transition-all ${
+                        args.mode === "incremental"
+                          ? "border-sky-500 bg-sky-50 text-sky-700 shadow-xs"
+                          : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      Incremental (Delta)
+                    </button>
+                  </div>
+                </Field>
+
+                {args.mode === "incremental" && (
+                  <div className="space-y-2 rounded-lg border border-slate-200 bg-slate-50/70 p-2.5">
+                    <Field
+                      label="Watermark column"
+                      hint="Timestamp or incremental column (e.g. updated_at, order_date)"
+                    >
+                      <input
+                        className={inputClass}
+                        placeholder="updated_at"
+                        value={(args.watermark_column as string) ?? ""}
+                        onChange={(event) => setArgs({ watermark_column: event.target.value })}
+                      />
+                    </Field>
+                    <div className="grid grid-cols-2 gap-2">
+                      <Field label="Write strategy">
+                        <select
+                          className={inputClass}
+                          value={(args.write_strategy as string) ?? "append"}
+                          onChange={(event) => setArgs({ write_strategy: event.target.value })}
+                        >
+                          <option value="append">Append</option>
+                          <option value="upsert">Upsert (Merge)</option>
+                        </select>
+                      </Field>
+                      {args.write_strategy === "upsert" && (
+                        <Field label="Primary key" hint="Unique key for merge">
+                          <input
+                            className={inputClass}
+                            placeholder="id"
+                            value={(args.primary_key as string) ?? ""}
+                            onChange={(event) => setArgs({ primary_key: event.target.value })}
+                          />
+                        </Field>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <Field label="Row limit (optional)" hint="Sample / cap rows during extraction. Blank = all.">
+                  <input
+                    type="number"
+                    min={1}
+                    className={inputClass}
+                    placeholder="e.g. 10000"
+                    value={(args.limit as number) ?? ""}
+                    onChange={(event) =>
+                      setArgs({ limit: event.target.value ? Number(event.target.value) : null })
+                    }
+                  />
+                </Field>
+              </>
+            ) : (
+              <Field
+                label="Target"
+                hint={
+                  step.step_type === "webhook"
+                    ? "Full URL. {param} and {steps.name.output} are substituted at run time."
+                    : isRawSql
+                      ? "DuckDB SQL. {{param}} for parameters, {{steps.name.table}} for a parent table, {{steps.name.output}} for a parent value."
+                      : isDbt
+                        ? "dbt selector: *, model name, model+ or models/folder"
+                        : "File name inside git_repo/"
+                }
+              >
+                {isPipeline ? (
+                  <select
+                    className={inputClass}
+                    value={step.target}
+                    onChange={(event) => onChange({ target: event.target.value })}
+                  >
+                    <option value="">Choose a pipeline?</option>
+                    {!pipelineOptions.some((option) => option.id === step.target) &&
+                      step.target && (
+                        <option value={step.target}>{step.target} (missing)</option>
+                      )}
+                    {pipelineOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : isRawSql ? (
+                  <textarea
+                    ref={targetRef}
+                    className={`${inputClass} h-32 font-mono`}
+                    value={step.target}
+                    onChange={(event) => onChange({ target: event.target.value })}
+                  />
+                ) : targetOptions.length && step.step_type !== "webhook" ? (
+                  <select
+                    className={inputClass}
+                    value={step.target}
+                    onChange={(event) => onChange({ target: event.target.value })}
+                  >
+                    {!targetOptions.includes(step.target) && step.target && (
                       <option value={step.target}>{step.target} (missing)</option>
                     )}
-                  {pipelineOptions.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              ) : isRawSql ? (
-                <textarea
-                  ref={targetRef}
-                  className={`${inputClass} h-32 font-mono`}
-                  value={step.target}
-                  onChange={(event) => onChange({ target: event.target.value })}
-                />
-              ) : targetOptions.length && step.step_type !== "webhook" ? (
-                <select
-                  className={inputClass}
-                  value={step.target}
-                  onChange={(event) => onChange({ target: event.target.value })}
-                >
-                  {!targetOptions.includes(step.target) && step.target && (
-                    <option value={step.target}>{step.target} (missing)</option>
-                  )}
-                  {targetOptions.map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <input
-                  className={inputClass}
-                  value={step.target}
-                  onChange={(event) => onChange({ target: event.target.value })}
-                />
-              )}
-            </Field>
+                    {targetOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    className={inputClass}
+                    value={step.target}
+                    onChange={(event) => onChange({ target: event.target.value })}
+                  />
+                )}
+              </Field>
+            )}
 
             {isPipeline && (
               <div className="space-y-1 rounded-lg bg-slate-50 px-2 py-1.5">

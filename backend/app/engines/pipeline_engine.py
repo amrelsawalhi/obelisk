@@ -59,6 +59,7 @@ MAX_DEPENDENCY_WAIT_SECONDS = 24 * 3600
 MAX_LOG_CHARS = 2_000_000
 
 STEP_TYPES = (
+    "ingest",
     "dbt_run",
     "dbt_test",
     "script",
@@ -160,6 +161,9 @@ def declared_outputs(step_type: str, args: Dict[str, Any]) -> Dict[str, str]:
         declared.setdefault("table", "table")
     if step_type == "raw_sql":
         # Every SQL step knows how many rows it touched; no declaration needed.
+        declared.setdefault("rows", "scalar")
+    if step_type == "ingest":
+        declared.setdefault("table", "table")
         declared.setdefault("rows", "scalar")
     if step_type in ("dbt_run", "dbt_test"):
         declared.setdefault("dbt_summary", "scalar")
@@ -1221,7 +1225,8 @@ class PipelineEngine:
         timeout: int,
         run: PipelineRun,
     ) -> Dict[str, Dict[str, Any]]:
-        """Runs the step and returns the outputs the engine derived itself."""
+        if step.step_type == "ingest":
+            return await self._run_ingest(step, args, params, log, timeout)
         if step.step_type in ("dbt_run", "dbt_test"):
             return await self._run_dbt(step, args, params, log, timeout, step_run_id)
         if step.step_type == "script":
@@ -1243,6 +1248,99 @@ class PipelineEngine:
         else:
             raise ValueError(f"Unsupported step type '{step.step_type}'.")
         return {}
+
+    async def _run_ingest(
+        self,
+        step: PipelineStep,
+        args: Dict[str, Any],
+        params: Dict[str, Any],
+        log: List[str],
+        timeout: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Ingests from an external connection into the lakehouse and publishes table & rows."""
+        from app.models.connection import Connection
+        from app.core.vault import decrypt
+        from app.engines.ingest_runner import trigger_ingest
+
+        connection_id = str(args.get("connection_id") or args.get("connection") or "").strip()
+        if not connection_id:
+            raise ValueError(f"Ingest step '{step.name}' has no connection specified.")
+
+        async with AsyncSessionLocal() as session:
+            conn = await session.get(Connection, connection_id)
+            if not conn:
+                conn = (
+                    await session.execute(
+                        select(Connection).where(Connection.name == connection_id)
+                    )
+                ).scalars().first()
+
+        if not conn:
+            raise ValueError(f"Connection '{connection_id}' not found.")
+
+        entity = (step.target or args.get("entity") or args.get("table") or "").strip()
+        if not entity:
+            raise ValueError(f"Ingest step '{step.name}' has no entity or table specified.")
+
+        mode = str(args.get("mode") or "snapshot").strip().lower()
+        watermark_column = args.get("watermark_column") or None
+        target_folder = str(args.get("target_folder") or "raw").strip().strip("/") or "raw"
+        target_name = (args.get("target_name") or "").strip() or None
+        limit = args.get("limit")
+        if limit is not None:
+            try:
+                limit = int(limit)
+            except (ValueError, TypeError):
+                limit = None
+        write_strategy = str(args.get("write_strategy") or "append").strip().lower()
+        primary_key = args.get("primary_key") or None
+
+        plaintext_pw = decrypt(conn.encrypted_credentials)
+        connection_params = {
+            "host": conn.host,
+            "port": conn.port,
+            "database": conn.database,
+            "username": conn.username,
+            "password": plaintext_pw,
+            **(conn.options or {}),
+        }
+
+        log.append(f"Ingesting '{entity}' from {conn.source_type} source '{conn.name}' (mode={mode})")
+
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                trigger_ingest,
+                source_type=conn.source_type,
+                connection_params=connection_params,
+                entity=entity,
+                mode=mode,
+                watermark_column=watermark_column,
+                target_name=target_name,
+                target_folder=target_folder,
+                limit=limit,
+                write_strategy=write_strategy,
+                primary_key=primary_key,
+            ),
+            timeout=timeout,
+        )
+
+        for line in result.get("logs", []):
+            log.append(line)
+
+        if not result.get("success"):
+            raise RuntimeError(f"Ingest failed for '{entity}'. See step log for details.")
+
+        meta = result.get("metadata", {})
+        stem = target_name or (entity.split(".", 1)[-1] if "." in entity else entity)
+        clean_stem = stem.replace(".", "_").replace("/", "_").replace("\\", "_")
+        table_name = meta.get("table_name") or f"{target_folder}.{clean_stem}"
+        rows = meta.get("num_rows", 0)
+
+        log.append(f"Ingest complete: {rows} row(s) published as table '{table_name}'")
+        return {
+            "table": {"type": "table", "value": table_name},
+            "rows": {"type": "scalar", "value": rows},
+        }
 
     async def _run_dbt(
         self,

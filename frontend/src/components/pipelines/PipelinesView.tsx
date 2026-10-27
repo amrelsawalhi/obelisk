@@ -55,6 +55,7 @@ const CRON_PRESETS: Array<{ label: string; expr: string }> = [
 ];
 
 const STEP_TEMPLATES: Array<{ type: StepType; name: string; target: string }> = [
+  { type: 'ingest', name: 'Ingest (Lakehouse)', target: '' },
   { type: 'dbt_run', name: 'dbt run', target: '*' },
   { type: 'dbt_test', name: 'dbt test', target: '*' },
   { type: 'script', name: 'Script', target: '' },
@@ -834,7 +835,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       name: `${template.name}${duplicate ? ` ${index + 1}` : ""}`,
       step_type: type,
       target: template.target,
-      args: {},
+      args: type === 'ingest' ? { target_folder: 'raw', mode: 'snapshot', write_strategy: 'append' } : {},
       timeout_seconds: null,
       max_retries: null,
       retry_delay_seconds: null,

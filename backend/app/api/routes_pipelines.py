@@ -330,12 +330,18 @@ async def _validate_graph(graph: GraphIn, pipeline_id: Optional[str] = None) -> 
                 f"Expected one of {', '.join(STEP_TYPES)}.",
                 steps=[step.key],
             )
-        if step.step_type in ("script", "notebook", "webhook", "raw_sql", "pipeline") and not (
-            step.target or ""
+        if step.step_type in ("script", "notebook", "webhook", "raw_sql", "pipeline", "ingest") and not (
+            step.target or (step.args or {}).get("entity") or ""
         ).strip():
             raise _invalid(
                 f"Step '{clean_name}' ({step.step_type}) needs a target.", steps=[step.key]
             )
+        if step.step_type == "ingest":
+            conn_ref = str((step.args or {}).get("connection_id") or (step.args or {}).get("connection") or "").strip()
+            if not conn_ref:
+                raise _invalid(
+                    f"Step '{clean_name}' (ingest) requires a connection.", steps=[step.key]
+                )
         for limit_name, value in (
             ("timeout_seconds", step.timeout_seconds),
             ("max_retries", step.max_retries),
@@ -791,8 +797,21 @@ def _collect_targets() -> Dict[str, Any]:
 
 @router.get("/pipelines/targets")
 async def list_targets():
-    """Runnable targets for the step pickers (scripts, notebooks, dbt models)."""
-    return await asyncio.to_thread(_collect_targets)
+    """Runnable targets for the step pickers (scripts, notebooks, dbt models, connections)."""
+    targets = await asyncio.to_thread(_collect_targets)
+    async with AsyncSessionLocal() as session:
+        from app.models.connection import Connection
+        conns = (
+            await session.execute(
+                select(Connection.id, Connection.name, Connection.source_type, Connection.database)
+                .order_by(Connection.name.asc())
+            )
+        ).all()
+        targets["connections"] = [
+            {"id": c.id, "name": c.name, "source_type": c.source_type, "database": c.database}
+            for c in conns
+        ]
+    return targets
 
 
 

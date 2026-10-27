@@ -40,6 +40,7 @@ def _graph(steps, edges=None):
 
 def test_declared_outputs_includes_derived_ones():
     assert declared_outputs("dbt_run", {}) == {"dbt_summary": "scalar"}
+    assert declared_outputs("ingest", {}) == {"table": "table", "rows": "scalar"}
     # raw SQL always knows its row count; materialising adds the table name.
     assert declared_outputs(
         "raw_sql", {"materialize": {"folder": "bronze", "name": "orders"}}

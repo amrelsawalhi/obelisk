@@ -337,6 +337,7 @@ async def test_targets_lists_real_workspace_files():
         assert "daily_kpi_summary.py" in targets["scripts"]
         assert targets["notebooks"], "shipped notebooks must be offered as targets"
         assert set(targets["step_types"]) == {
+            "ingest",
             "dbt_run",
             "dbt_test",
             "script",
@@ -345,6 +346,7 @@ async def test_targets_lists_real_workspace_files():
             "pipeline",
             "raw_sql",
         }
+        assert "connections" in targets
         assert set(targets["edge_conditions"]) == {
             "success",
             "failure",
@@ -400,3 +402,91 @@ async def test_node_positions_save_without_touching_the_graph():
         assert missing.status_code == 404
 
         await client.delete(f"/api/pipelines/{created['id']}")
+
+
+@pytest.mark.asyncio
+async def test_ingest_step_validation_and_creation():
+    async with _client() as client:
+        # 1. Missing connection should fail validation
+        res = await client.post(
+            "/api/pipelines",
+            json={
+                "name": f"test-ingest-fail-{uuid.uuid4().hex[:6]}",
+                "graph": {
+                    "steps": [
+                        {
+                            "key": "ingest1",
+                            "name": "Ingest Orders",
+                            "step_type": "ingest",
+                            "target": "sales.sales_order",
+                            "args": {},
+                        }
+                    ],
+                    "edges": [],
+                    "params": [],
+                },
+            },
+        )
+        assert res.status_code == 400
+        assert "requires a connection" in res.json()["detail"]["message"]
+
+        # 2. Missing target entity should fail validation
+        res = await client.post(
+            "/api/pipelines",
+            json={
+                "name": f"test-ingest-fail-target-{uuid.uuid4().hex[:6]}",
+                "graph": {
+                    "steps": [
+                        {
+                            "key": "ingest1",
+                            "name": "Ingest Orders",
+                            "step_type": "ingest",
+                            "target": "",
+                            "args": {"connection_id": "postgres_source"},
+                        }
+                    ],
+                    "edges": [],
+                    "params": [],
+                },
+            },
+        )
+        assert res.status_code == 400
+        assert "needs a target" in res.json()["detail"]["message"]
+
+        # 3. Valid ingest step saves successfully
+        res = await client.post(
+            "/api/pipelines",
+            json={
+                "name": f"test-ingest-ok-{uuid.uuid4().hex[:6]}",
+                "graph": {
+                    "steps": [
+                        {
+                            "key": "ingest1",
+                            "name": "Ingest Orders",
+                            "step_type": "ingest",
+                            "target": "sales.sales_order",
+                            "args": {
+                                "connection_id": "postgres_source",
+                                "target_folder": "raw",
+                                "target_name": "sales_order",
+                                "mode": "snapshot",
+                            },
+                        }
+                    ],
+                    "edges": [],
+                    "params": [],
+                },
+            },
+        )
+        assert res.status_code == 201
+        created = res.json()
+        assert created["step_count"] == 1
+
+        detail = (await client.get(f"/api/pipelines/{created['id']}")).json()
+        assert len(detail["steps"]) == 1
+        assert detail["steps"][0]["step_type"] == "ingest"
+        assert detail["steps"][0]["target"] == "sales.sales_order"
+        assert detail["steps"][0]["args"]["connection_id"] == "postgres_source"
+
+        await client.delete(f"/api/pipelines/{created['id']}")
+

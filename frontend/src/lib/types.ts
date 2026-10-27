@@ -646,6 +646,7 @@ export interface SaveQueryTabPayload {
 // ==========================================
 
 export type StepType =
+  | 'ingest'
   | 'dbt_run'
   | 'dbt_test'
   | 'script'
@@ -854,6 +855,7 @@ export interface PipelineTargets {
   dbt_directories: string[];
   step_types: StepType[];
   edge_conditions: EdgeCondition[];
+  connections?: Array<{ id: string; name: string; source_type: string; database?: string }>;
 }
 
 export interface StepPayload {

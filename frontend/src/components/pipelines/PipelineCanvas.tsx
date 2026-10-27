@@ -20,6 +20,7 @@ import 'reactflow/dist/style.css';
 import {
   Activity,
   AlertTriangle,
+  ArrowDownToLine,
   Code2,
   Database,
   FlaskConical,
@@ -56,6 +57,7 @@ export interface CanvasEdge {
 }
 
 const STEP_ICONS: Record<StepType, React.ElementType> = {
+  ingest: ArrowDownToLine,
   dbt_run: Play,
   dbt_test: FlaskConical,
   script: Code2,
@@ -66,6 +68,7 @@ const STEP_ICONS: Record<StepType, React.ElementType> = {
 };
 
 const STEP_LABELS: Record<StepType, string> = {
+  ingest: 'Ingest',
   dbt_run: 'dbt run',
   dbt_test: 'dbt test',
   script: 'Python script',
