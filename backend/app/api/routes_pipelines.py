@@ -997,6 +997,23 @@ async def update_pipeline(pipeline_id: str, req: PipelinePatch):
             )
         ).scalar_one()
 
+        active = (
+            await session.execute(
+                select(func.count())
+                .select_from(PipelineRun)
+                .where(
+                    PipelineRun.pipeline_id == pipeline_id,
+                    PipelineRun.status.in_(tuple(RUN_ACTIVE)),
+                )
+            )
+        ).scalar_one()
+
+        # The caller needs the pipeline it just edited, not ``null``. The body of this
+        # endpoint used to end here: it counted the steps and returned nothing, so the UI
+        # was handed an empty response after every save.
+        return _pipeline_out(pipeline, int(step_count), bool(active))
+
+
 @router.put("/pipelines/{pipeline_id}/graph")
 async def replace_graph(pipeline_id: str, graph: GraphIn):
     """Replaces the whole graph (steps, edges, params) in one shot.
@@ -1017,11 +1034,6 @@ async def replace_graph(pipeline_id: str, graph: GraphIn):
             "step_count": len(graph.steps),
             "edge_count": len(graph.edges),
         }
-
-
-
-        return _pipeline_out(pipeline, int(step_count), False)
-
 
 
 @router.post("/pipelines/{pipeline_id}/run", status_code=202)

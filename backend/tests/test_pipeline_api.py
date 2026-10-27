@@ -34,6 +34,50 @@ def _step(key, name, step_type="script", target="zz_test_echo", **extra):
 
 
 @pytest.mark.asyncio
+async def test_patching_a_pipeline_returns_the_pipeline():
+    """A save must answer with the object it saved.
+
+    ``PATCH /api/pipelines/{id}`` applied the change, committed, counted its steps — and
+    then returned nothing at all. The UI's type says ``PipelineSummary``, so it received
+    ``null`` and re-rendered an empty pipeline after every rename or schedule change.
+    """
+    name = f"patch-{uuid.uuid4().hex[:8]}"
+    async with _client() as client:
+        created = await client.post(
+            "/api/pipelines",
+            json={
+                "name": name,
+                "cron_expression": "*/15 * * * *",
+                "graph": _graph([_step("a", "extract"), _step("b", "load")]),
+            },
+        )
+        assert created.status_code == 201, created.text
+        pipeline_id = created.json()["id"]
+        try:
+            renamed = f"{name}-renamed"
+            res = await client.patch(
+                f"/api/pipelines/{pipeline_id}",
+                json={"name": renamed, "cron_expression": "0 6 * * *", "is_enabled": False},
+            )
+
+            assert res.status_code == 200, res.text
+            body = res.json()
+            assert body is not None, "the PATCH body must not be null"
+            assert body["id"] == pipeline_id
+            assert body["name"] == renamed
+            assert body["cron_expression"] == "0 6 * * *"
+            assert body["is_enabled"] is False
+            assert body["next_run_at"] is None, "a disabled pipeline has no next run"
+            assert body["step_count"] == 2
+            assert body["is_running"] is False
+
+            stored = (await client.get(f"/api/pipelines/{pipeline_id}")).json()
+            assert stored["name"] == renamed
+        finally:
+            await client.delete(f"/api/pipelines/{pipeline_id}")
+
+
+@pytest.mark.asyncio
 async def test_create_pipeline_with_graph_and_read_it_back():
     name = f"api-{uuid.uuid4().hex[:8]}"
     async with _client() as client:
