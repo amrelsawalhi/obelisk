@@ -2,7 +2,7 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -25,6 +25,52 @@ IGNORED_NAMES = {
 
 
 MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB safety limit for web editor
+
+# Two writes are "the same instant" within this window. It absorbs the loss of sub-ms
+# precision a browser's Date round-trip causes, while still catching a second editor (or a
+# dbt run) that rewrote the file in the seconds or minutes since it was opened.
+MTIME_TOLERANCE_SECONDS = 0.002
+
+
+def _mtime_iso(stat_result) -> str:
+    return datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc).isoformat()
+
+
+def _refuse_a_stale_save(target: Path, norm_rel: str, expected: str) -> None:
+    """Refuses to overwrite a file that changed since this client read it.
+
+    Saves used to be unconditional, so two editors — or one editor and a dbt/pipeline step
+    that rewrote the same model — silently resolved to whichever wrote last, and the other
+    person's work was gone with no trace of what happened. A 409 carries the current
+    ``modified_at`` so the UI can offer a reload instead of guessing.
+    """
+    current = datetime.fromtimestamp(target.stat().st_mtime, tz=timezone.utc)
+    try:
+        expected_dt = datetime.fromisoformat(expected.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"modified_at={expected!r} is not an ISO-8601 timestamp. "
+                "Send back the value GET /api/files/content returned."
+            ),
+        )
+    if expected_dt.tzinfo is None:
+        expected_dt = expected_dt.replace(tzinfo=timezone.utc)
+
+    if abs((current - expected_dt).total_seconds()) > MTIME_TOLERANCE_SECONDS:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "conflict",
+                "path": norm_rel,
+                "message": (
+                    "This file changed on disk since you opened it. Reload it to see the "
+                    "current content before saving."
+                ),
+                "modified_at": current.isoformat(),
+            },
+        )
 
 
 def _resolve_safe_path(rel_path: str) -> tuple[Path, str]:
@@ -97,6 +143,11 @@ def _build_tree(directory: Path, root: Path) -> list[dict]:
 class SaveFileRequest(BaseModel):
     path: str = Field(..., description="Relative path within git_repo")
     content: str = Field(..., description="File content to save")
+    # The ``modified_at`` the client last read, echoed from GET /content. When present the
+    # save is a compare-and-swap; without it the write is unconditional (a brand-new file).
+    modified_at: Optional[str] = Field(
+        None, description="modified_at returned when the client loaded this file"
+    )
 
 
 class CreateFileRequest(BaseModel):
@@ -169,6 +220,10 @@ def get_file_content(path: str = Query(..., description="Relative path within gi
 def save_file(req: SaveFileRequest):
     """
     Saves content to an existing or new file in git_repo/.
+
+    When the request carries the ``modified_at`` the client read, the write only happens if
+    the file still has that timestamp. Otherwise it is refused with 409 and the current
+    timestamp, so a second editor is told rather than silently overwritten.
     """
     target, norm_rel = _resolve_safe_path(req.path)
 
@@ -176,6 +231,9 @@ def save_file(req: SaveFileRequest):
         raise HTTPException(status_code=400, detail="Target path is a directory, not a file")
 
     target.parent.mkdir(parents=True, exist_ok=True)
+
+    if req.modified_at and target.exists():
+        _refuse_a_stale_save(target, norm_rel, req.modified_at)
 
     with open(target, "w", encoding="utf-8") as f:
         f.write(req.content)
@@ -185,7 +243,7 @@ def save_file(req: SaveFileRequest):
         "status": "saved",
         "path": norm_rel,
         "size": stat.st_size,
-        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        "modified_at": _mtime_iso(stat),
     }
 
 

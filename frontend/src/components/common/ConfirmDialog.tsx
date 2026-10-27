@@ -7,6 +7,8 @@ export interface ConfirmRequest {
   confirmLabel?: string;
   destructive?: boolean;
   onConfirm: () => void | Promise<void>;
+  /** Runs when the dialog is dismissed without confirming (Cancel, Escape, backdrop). */
+  onCancel?: () => void;
 }
 
 /**
@@ -19,11 +21,17 @@ export const ConfirmDialog: React.FC<{
 }> = ({ request, onClose }) => {
   const confirmRef = useRef<HTMLButtonElement>(null);
 
+  /** Dismissing without confirming runs ``onCancel`` — the "keep my version" path. */
+  const dismiss = () => {
+    request?.onCancel?.();
+    onClose();
+  };
+
   useEffect(() => {
     if (!request) return undefined;
     confirmRef.current?.focus();
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape') dismiss();
       if (event.key === 'Enter') {
         event.preventDefault();
         void request.onConfirm();
@@ -60,7 +68,7 @@ export const ConfirmDialog: React.FC<{
         <div className="mt-5 flex justify-end gap-2 border-t border-slate-100 bg-slate-50/50 px-5 py-3">
           <button
             type="button"
-            onClick={onClose}
+            onClick={dismiss}
             className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-50 transition-colors shadow-2xs"
           >
             Cancel

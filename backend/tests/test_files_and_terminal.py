@@ -1,5 +1,6 @@
 import pytest
 import os
+import time
 from pathlib import Path
 from httpx import AsyncClient, ASGITransport
 
@@ -67,6 +68,66 @@ async def test_file_manager_crud_and_security():
         # Verify deleted
         resp_after_del = await client.get("/api/files/content", params={"path": renamed_path})
         assert resp_after_del.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_save_onto_a_file_that_moved_on_disk_is_refused():
+    """Two writers must not silently resolve to "whoever saved last".
+
+    The editor sends back the ``modified_at`` it loaded. If the file changed since — another
+    browser tab, a dbt run, an operator on the box — the save is refused with 409 and the
+    current timestamp, so the UI can offer a reload instead of discarding the other version.
+    """
+    path = "scripts/_test_conflict_unit.py"
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post("/api/files/create", json={"path": path, "type": "file"})
+        assert created.status_code == 200
+        try:
+            first = await client.post(
+                "/api/files/save", json={"path": path, "content": "first\n"}
+            )
+            assert first.status_code == 200
+            loaded_stamp = first.json()["modified_at"]
+
+            # A second writer touches the file after this editor read it.
+            on_disk = settings.git_repo_path / "scripts" / "_test_conflict_unit.py"
+            on_disk.write_text("someone else\n", encoding="utf-8")
+            later = time.time() + 5
+            os.utime(on_disk, (later, later))
+
+            stale = await client.post(
+                "/api/files/save",
+                json={"path": path, "content": "mine\n", "modified_at": loaded_stamp},
+            )
+            assert stale.status_code == 409, stale.text
+            conflict = stale.json()["detail"]
+            assert conflict["error"] == "conflict"
+            assert "changed on disk" in conflict["message"]
+            assert conflict["modified_at"], "the client needs the current stamp to retry"
+            assert on_disk.read_text(encoding="utf-8") == "someone else\n", (
+                "a refused save must not have written anything"
+            )
+
+            # Reloading and saving with the current stamp succeeds.
+            current = await client.get("/api/files/content", params={"path": path})
+            retried = await client.post(
+                "/api/files/save",
+                json={
+                    "path": path,
+                    "content": "mine\n",
+                    "modified_at": current.json()["modified_at"],
+                },
+            )
+            assert retried.status_code == 200, retried.text
+
+            # No stamp at all stays unconditional: that is how a new file is written.
+            overwrite = await client.post(
+                "/api/files/save", json={"path": path, "content": "over\n"}
+            )
+            assert overwrite.status_code == 200
+        finally:
+            await client.post("/api/files/delete", json={"path": path})
 
 
 @pytest.mark.asyncio

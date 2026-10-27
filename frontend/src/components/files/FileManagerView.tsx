@@ -187,15 +187,42 @@ export const FileManagerView: React.FC = () => {
     );
   };
 
+  /** Replaces the buffer with what is on disk now, after a save conflict. */
+  const reloadFromDisk = async (path: string) => {
+    try {
+      const res = await api.getFileContent(path);
+      setOpenFiles((prev) =>
+        prev.map((f) =>
+          f.path === path
+            ? {
+                ...f,
+                content: res.content,
+                originalContent: res.content,
+                isDirty: false,
+                size: res.size,
+                modifiedAt: res.modified_at,
+              }
+            : f
+        )
+      );
+      showStatus('success', `Reloaded ${res.name} from disk`);
+    } catch (err: any) {
+      showStatus('error', err?.response?.data?.detail || `Failed to reload ${path}`);
+    }
+  };
+
   // Save current file
   const handleSave = async () => {
     if (!activeFile || saving) return;
+    const path = activeFile.path;
     try {
       setSaving(true);
-      const res = await api.saveFile(activeFile.path, activeFile.content);
+      // The timestamp the editor loaded travels with the write, so a file that changed on
+      // disk since then is refused (409) instead of silently losing the other version.
+      const res = await api.saveFile(path, activeFile.content, activeFile.modifiedAt);
       setOpenFiles((prev) =>
         prev.map((f) => {
-          if (f.path === activeFile.path) {
+          if (f.path === path) {
             return {
               ...f,
               originalContent: f.content,
@@ -209,11 +236,30 @@ export const FileManagerView: React.FC = () => {
       );
       showStatus('success', `Saved ${activeFile.name}`);
     } catch (err: any) {
-      showStatus('error', err?.response?.data?.detail || 'Failed to save file');
+      const status = err?.response?.status;
+      const detail = err?.response?.data?.detail;
+      if (status === 409 && detail && typeof detail === 'object') {
+        // Someone else (another editor tab, a dbt run) wrote this file after it was opened.
+        // Offer the reload; cancelling keeps the buffer and the next save overwrites.
+        setConfirmRequest({
+          title: `"${activeFile.name}" changed on disk`,
+          body: `${detail.message} Reloading discards your edits. If you keep your version instead, the next save overwrites the file.`,
+          confirmLabel: 'Reload from disk',
+          destructive: true,
+          onConfirm: () => reloadFromDisk(path),
+          onCancel: () =>
+            setOpenFiles((prev) =>
+              prev.map((f) => (f.path === path ? { ...f, modifiedAt: undefined } : f))
+            ),
+        });
+        return;
+      }
+      showStatus('error', typeof detail === 'string' ? detail : 'Failed to save file');
     } finally {
       setSaving(false);
     }
   };
+
 
 
   // Keyboard shortcut listener for Ctrl+S / Cmd+S
