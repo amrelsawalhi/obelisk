@@ -20,6 +20,7 @@ from app.engines.duckdb_engine import duckdb_engine
 from app.engines.native_query_engine import native_query_engine
 from app.core.docker_manager import docker_mgr
 from app.services.connections import attachable_attachments
+from app.services.query_registry import query_registry
 from app.core.warehouse_resolver import resolve_warehouse_postgres_params
 
 router = APIRouter(prefix="/api/query", tags=["query"])
@@ -43,6 +44,11 @@ class QueryExecuteRequest(BaseModel):
     timeout_seconds: int = Field(30, description="Query execution timeout in seconds")
     target: Optional[str] = Field("duckdb", description="Execution target ('duckdb', 'service:<name>', 'connection:<id>')")
     schema_name: Optional[str] = Field(None, description="Active schema context for relational engines")
+    # The client's id for this execution. It is what POST /api/query/{id}/cancel addresses,
+    # so a Stop button can reach the statement instead of waiting for the timeout.
+    query_id: Optional[str] = Field(
+        None, description="Client-generated id for this execution, used to cancel it"
+    )
     postgres_attachments: Optional[List[Dict[str, Any]]] = Field(
         None, description="Optional Postgres sources to attach dynamically in DuckDB"
     )
@@ -214,6 +220,10 @@ async def execute_sql(
         target_name = "Database"
         target_engine = "postgres"
 
+        def remember_native(conn) -> None:
+            """Publishes the driver connection so Stop can cancel a native statement."""
+            query_registry.register(req.query_id or "", conn)
+
         try:
             if target_id == "service:postgres":
                 target_name = "PostgreSQL"
@@ -238,6 +248,10 @@ async def execute_sql(
                         sql=req.sql,
                         schema_name=req.schema_name,
                         timeout_seconds=req.timeout_seconds,
+                        # Same cap the DuckDB path uses: without it this path built one
+                        # Python dict per row of the entire result set.
+                        max_rows=settings.DUCKDB_MAX_QUERY_ROWS,
+                        on_connection=remember_native,
                     ),
                     timeout=float(req.timeout_seconds + 2),
                 )
@@ -270,6 +284,8 @@ async def execute_sql(
                             schema_name=req.schema_name,
                             timeout_seconds=req.timeout_seconds,
                             sslmode=sslmode,
+                            max_rows=settings.DUCKDB_MAX_QUERY_ROWS,
+                            on_connection=remember_native,
                         ),
                         timeout=float(req.timeout_seconds + 2),
                     )
@@ -284,6 +300,8 @@ async def execute_sql(
                             password=pw,
                             sql=req.sql,
                             timeout_seconds=req.timeout_seconds,
+                            max_rows=settings.DUCKDB_MAX_QUERY_ROWS,
+                            on_connection=remember_native,
                         ),
                         timeout=float(req.timeout_seconds + 2),
                     )
@@ -312,6 +330,7 @@ async def execute_sql(
                 command_tag=exec_res.get("command_tag"),
                 target_engine=target_engine,
                 target_name=target_name,
+                truncated=bool(exec_res.get("truncated", False)),
             )
         except asyncio.TimeoutError:
             history_entry.status = "timeout"
@@ -329,6 +348,8 @@ async def execute_sql(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Execution error on {target_name}: {str(e)}",
             )
+        finally:
+            query_registry.release(req.query_id or "")
 
     # Route 2: DuckDB In-Process Engine (Default)
     attachments = req.postgres_attachments
@@ -338,13 +359,19 @@ async def execute_sql(
     # Holds the live DuckDB connection so a timeout can interrupt the C++ work instead of
     # leaving the background thread burning CPU and RAM after the response is gone.
     live_conn_holder: list = []
+
+    def remember_connection(conn) -> None:
+        """Publishes the live connection for timeout interruption *and* for Stop."""
+        live_conn_holder.append(conn)
+        query_registry.register(req.query_id or "", conn)
+
     try:
         res = await asyncio.wait_for(
             asyncio.to_thread(
                 duckdb_engine.execute_query,
                 sql=req.sql,
                 attachments=attachments,
-                on_connection=live_conn_holder.append,
+                on_connection=remember_connection,
             ),
             timeout=float(req.timeout_seconds),
         )
@@ -386,6 +413,24 @@ async def execute_sql(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Query execution failed: {str(e)}",
         )
+    finally:
+        # The query is over one way or another; a stale entry would make a later Stop look
+        # like it interrupted something.
+        query_registry.release(req.query_id or "")
+
+
+@router.post("/{query_id}/cancel")
+async def cancel_running_query(query_id: str):
+    """Stops the statement running under ``query_id``, if there is one.
+
+    Query Studio's Stop button. It answers 200 either way: "already finished" is not an
+    error, and the client should not have to distinguish the two to clear its spinner.
+    ``not_stoppable`` says the engine has no client-side cancel (MySQL), so the user knows
+    the click did nothing rather than wondering why rows keep coming.
+    """
+    status_value = query_registry.cancel(query_id)
+    return {"status": status_value, "query_id": query_id}
+
 
 async def _delete_scratch_file(path: Path) -> None:
     """Removes an export scratch file once its response has been sent."""

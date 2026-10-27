@@ -335,6 +335,8 @@ export interface QueryExecuteRequest {
   timeout_seconds?: number;
   target?: string;
   schema_name?: string;
+  /** Client-generated id for this execution; POST /api/query/{id}/cancel addresses it. */
+  query_id?: string;
   postgres_attachments?: Record<string, unknown>[];
 }
 
@@ -481,6 +483,8 @@ export interface FileContentResponse {
 export interface SaveFileRequest {
   path: string;
   content: string;
+  /** The ``modified_at`` this client loaded; the save is refused if the file moved on. */
+  modified_at?: string;
 }
 
 export interface CreateFileRequest {

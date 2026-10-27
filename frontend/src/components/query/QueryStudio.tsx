@@ -22,6 +22,7 @@ import {
   Map,
   CheckCircle2,
   AlertTriangle,
+  Square,
 } from 'lucide-react';
 import { api, apiClient } from '../../lib/api';
 import type { QueryExecuteResponse, QueryHistoryItem, CatalogNode, CatalogTable, QueryTarget } from '../../lib/types';
@@ -47,6 +48,8 @@ export interface QueryTab {
   result: QueryExecuteResponse | null;
   error: string | null;
   loading: boolean;
+  /** The id of the execution in flight, so Stop can address it. */
+  runId?: string;
 }
 
 interface QueryStudioProps {
@@ -347,11 +350,14 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
     if (!queryToRun.trim()) return;
     const tabId = targetTabId || activeTabId;
     const currentTab = tabs.find((t) => t.id === tabId) || activeTab;
+    // A per-run id the Stop button can address. The tab id is not enough: the same tab can
+    // be run twice, and cancelling must hit the statement that is running now.
+    const runId = `${tabId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     // Set loading for this specific tab
     setTabs((prev) =>
       prev.map((t) =>
-        t.id === tabId ? { ...t, loading: true, error: null } : t
+        t.id === tabId ? { ...t, loading: true, error: null, runId } : t
       )
     );
 
@@ -362,11 +368,12 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
         target: currentTab.targetId || 'duckdb',
         schema_name: currentTab.schema,
         timeout_seconds: 30,
+        query_id: runId,
       });
       setTabs((prev) =>
         prev.map((t) =>
           t.id === tabId
-            ? { ...t, result: data, error: null, loading: false }
+            ? { ...t, result: data, error: null, loading: false, runId: undefined }
             : t
         )
       );
@@ -381,11 +388,50 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
       setTabs((prev) =>
         prev.map((t) =>
           t.id === tabId
-            ? { ...t, error: msg, loading: false }
+            ? { ...t, error: msg, loading: false, runId: undefined }
             : t
         )
       );
       fetchHistory();
+    }
+  };
+
+  /**
+   * Stops the query this tab is running.
+   *
+   * Before this existed the only way to end a runaway query was to wait out its 30 s
+   * timeout — or reload the page, which left the statement running on the server.
+   */
+  const handleStop = async () => {
+    const runId = activeTab.runId;
+    if (!runId) return;
+    setTabs((prev) =>
+      prev.map((t) => (t.id === activeTab.id ? { ...t, error: null } : t))
+    );
+    try {
+      const res = await api.cancelQuery(runId);
+      setTabs((prev) =>
+        prev.map((t) => {
+          if (t.id !== activeTab.id) return t;
+          if (res.status === 'not_stoppable') {
+            // Keep the spinner: it really is still running, and saying otherwise would be
+            // a lie the row count contradicts.
+            return {
+              ...t,
+              error:
+                'This engine has no client-side cancel (MySQL), so the query keeps running until it finishes.',
+            };
+          }
+          return { ...t, loading: false, runId: undefined };
+        })
+      );
+    } catch (err: unknown) {
+      const msg = axios.isAxiosError(err)
+        ? err.response?.data?.detail || err.message
+        : 'Could not cancel the query';
+      setTabs((prev) =>
+        prev.map((t) => (t.id === activeTab.id ? { ...t, error: msg } : t))
+      );
     }
   };
 
@@ -941,6 +987,19 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
               </>
             )}
           </button>
+
+          {/* Stop the query that is actually running: without this the only way out was
+              the 30 s timeout, and a page reload left the statement running on the server. */}
+          {activeTab.loading && (
+            <button
+              onClick={handleStop}
+              className="flex items-center gap-1.5 px-3 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg text-xs font-semibold transition-colors"
+              title="Cancel the running query"
+            >
+              <Square className="w-3.5 h-3.5 fill-current" />
+              <span>Stop</span>
+            </button>
+          )}
 
           {/* Format SQL Button */}
           <button

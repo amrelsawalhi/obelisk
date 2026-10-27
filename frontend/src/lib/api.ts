@@ -269,6 +269,18 @@ export const api = {
     const res = await apiClient.post<QueryExecuteResponse>('/query/execute', req);
     return res.data;
   },
+  /**
+   * Stops a running query. Resolves with ``cancelled``, ``not_running`` (it had already
+   * finished) or ``not_stoppable`` (the engine has no client-side cancel).
+   */
+  cancelQuery: async (
+    queryId: string,
+  ): Promise<{ status: 'cancelled' | 'not_running' | 'not_stoppable'; query_id: string }> => {
+    const res = await apiClient.post<{ status: 'cancelled' | 'not_running' | 'not_stoppable'; query_id: string }>(
+      `/query/${encodeURIComponent(queryId)}/cancel`,
+    );
+    return res.data;
+  },
   getQueryHistory: async (): Promise<QueryHistoryItem[]> => {
     const res = await apiClient.get<QueryHistoryItem[]>('/query/history');
     return res.data;
@@ -497,10 +509,20 @@ export const api = {
     });
     return res.data;
   },
-  saveFile: async (path: string, content: string): Promise<{ status: string; path: string; size: number; modified_at?: string }> => {
+  /**
+   * Saves a file. Passing the ``modified_at`` the editor loaded makes the write a
+   * compare-and-swap: the backend answers 409 (instead of overwriting) if the file changed
+   * on disk in the meantime. Omit it to write unconditionally.
+   */
+  saveFile: async (
+    path: string,
+    content: string,
+    modifiedAt?: string,
+  ): Promise<{ status: string; path: string; size: number; modified_at?: string }> => {
     const res = await apiClient.post<{ status: string; path: string; size: number; modified_at?: string }>('/files/save', {
       path,
       content,
+      modified_at: modifiedAt,
     });
     return res.data;
   },
