@@ -24,6 +24,7 @@ from app.core.warehouse_resolver import (
     set_warehouse_connection_id,
 )
 from app.config import settings
+from app.services.superset import SupersetSync
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -36,6 +37,12 @@ SUPPORTED_SERVICES = [
     "redpanda",
     "gitea"
 ]
+
+
+def _sync_summary(report: Dict[str, Any]) -> str:
+    """'2 created, 1 skipped' — the one line a deploy log has room for."""
+    parts = [f"{count} {action}" for action, count in report.get("counts", {}).items() if count]
+    return ", ".join(parts) or "nothing to do"
 
 # Request / Response Schemas
 class DeployLocalRequest(BaseModel):
@@ -58,6 +65,17 @@ class ServiceStatusResponse(BaseModel):
     allocated_memory_mb: int
     container_id: Optional[str] = None
     live_docker_status: Optional[str] = None
+    # A stopped container still exists (with its environment, credentials and data), so the
+    # console offers "Start" for it and "Deploy" only when nothing has been deployed yet.
+    container_exists: bool = False
+
+
+class ServiceLifecycleResponse(BaseModel):
+    """Result of starting or stopping a service that is already deployed."""
+    service_name: str
+    status: str
+    ready: bool
+    message: Optional[str] = None
 
 class DeployedCredentials(BaseModel):
     username: Optional[str] = None
@@ -72,6 +90,15 @@ class DeployLocalResponse(ServiceStatusResponse):
     message: Optional[str] = None
     credentials: Optional[DeployedCredentials] = None
     registered_connection: Optional[str] = None
+    # Superset only: what happened to each registered connection when it was pushed in.
+    synced_sources: Optional[List[Dict[str, Any]]] = None
+
+
+class SupersetSyncResponse(BaseModel):
+    ok: bool
+    detail: str
+    counts: Dict[str, int]
+    sources: List[Dict[str, Any]]
 
 
 class HostSpecsResponse(BaseModel):
@@ -265,6 +292,7 @@ async def list_service_statuses(db: AsyncSession = Depends(get_db)):
                 allocated_memory_mb=mem_mb,
                 container_id=c_id,
                 live_docker_status=live_status,
+                container_exists=live_c is not None,
             )
         )
 
@@ -352,6 +380,11 @@ async def deploy_local_service(
     pre-flight checks -> blueprint-driven deploy (pinned image, named data volume)
     -> per-deploy vaulted credentials -> readiness probing -> Connection auto-register.
 
+    Deploy is first creation only. If a container already exists — running or stopped — the
+    request is refused with 409, because a data volume that has already been initialized can
+    never be re-keyed by a second deploy: postgres reads POSTGRES_USER/PASSWORD/DB on first
+    boot and ignores them afterwards. Start the existing container, or destroy it, instead.
+
     The request stays synchronous (callers await the final result), but every phase
     is recorded in DeployTracker so the UI can poll GET /{name}/deploy-progress:
     pre-flight -> pulling (layer %) -> creating -> initializing -> probing -> ready.
@@ -368,8 +401,35 @@ async def deploy_local_service(
                 detail=f"{bp.display_name} cannot be deployed locally: {bp.reason_not_deployable}")
 
         if bp.run_mode == "process":
+            # A host-process service that is already alive must be stopped first: deploy is
+            # what installs *and* starts it, so re-running it under a live process would
+            # rebuild configuration behind a running service.
+            proc_state = await asyncio.to_thread(process_manager.status, svc_name)
+            if proc_state["alive_pids"]:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(f"{bp.display_name} is already running. Stop it and start it "
+                            f"again to keep everything as it is, or destroy it to deploy fresh."),
+                )
             # Host-process service: no Docker engine, image, or disk needed.
             return await _deploy_process_mode(svc_name, bp, req, db)
+
+        # A deploy always creates a container, and that container's environment is what
+        # initializes a database volume. If one already exists — running or merely stopped —
+        # the operator must choose explicitly: start it again untouched, or destroy it
+        # (which deletes its data) before deploying new credentials/configuration.
+        # Deploying over a stopped container is how a fresh POSTGRES_PASSWORD used to be
+        # written over a volume that had been initialized with a different one, leaving a
+        # service nothing could log into.
+        existing_container = await asyncio.to_thread(docker_mgr.get_service_container, svc_name)
+        if existing_container is not None:
+            state = existing_container.status
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(f"{bp.display_name} is already deployed (container {state}). "
+                        f"Start it to bring it back exactly as it was — same credentials, same data — "
+                        f"or destroy it, which deletes its data, before deploying again."),
+            )
 
         # Pre-flight 1: Docker engine reachable
         deploy_tracker.update(svc_name, phase="pre-flight", detail="checking Docker engine")
@@ -378,10 +438,9 @@ async def deploy_local_service(
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=f"Docker engine is not reachable: {engine['error']}. Start Docker Desktop (or set DOCKER_HOST) and try again.")
 
-        # Pre-flight 2: host port availability (skipped when our own container holds it)
+        # Pre-flight 2: host port availability (nothing of ours holds it — see the guard above)
         host_port = req.host_port or bp.primary_host_port
-        own_container = await asyncio.to_thread(docker_mgr.get_service_container, svc_name)
-        if not own_container and not _is_host_port_free(host_port):
+        if not _is_host_port_free(host_port):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                 detail=f"Host port {host_port} is already in use by another process. Choose a different host_port.")
 
@@ -497,6 +556,32 @@ async def deploy_local_service(
             pull_progress_cb=_on_pull,
         )
 
+        # The credentials live in the volume from this moment on: postgres reads
+        # POSTGRES_USER/PASSWORD/DB only on its first boot, so whichever token was
+        # decided above is now the cluster's superuser. Persist it *before* probing,
+        # registration and post-start commands — every one of which can still raise, and
+        # a rollback would keep the container (and the password baked into its volume)
+        # while discarding config_json. The next deploy would then find no vaulted
+        # password, mint a fresh token the running cluster cannot authenticate, and
+        # quietly register the blueprint defaults instead of what the operator typed.
+        config_json.update({"image": req.image or bp.image, "host_port": host_port,
+                            "volume_name": bp.volume_name})
+        if svc_record is None:
+            svc_record = ServiceConfig(
+                service_name=svc_name, deployment_type="local", status="starting",
+                container_id=container.id, host="localhost", port=host_port,
+                allocated_memory_mb=0, config_json=config_json,
+            )
+            db.add(svc_record)
+        else:
+            svc_record.deployment_type = "local"
+            svc_record.status = "starting"
+            svc_record.container_id = container.id
+            svc_record.host = "localhost"
+            svc_record.port = host_port
+            svc_record.config_json = config_json
+        await db.commit()
+
         # Post-start initialization (e.g. superset db upgrade / admin creation)
         if bp.post_start_commands:
             deploy_tracker.update(svc_name, phase="initializing",
@@ -517,6 +602,7 @@ async def deploy_local_service(
         while time.time() < deadline:
             probe = await asyncio.to_thread(
                 docker_mgr.probe_readiness, svc_name, host_port, username, database,
+                password=credentials.password if credentials else None,
             )
             ready = probe["ready"]
             probe_detail = probe["detail"]
@@ -524,42 +610,60 @@ async def deploy_local_service(
                 break
             await asyncio.sleep(2.0)
         status_value = "ready" if ready else "starting"
-        deploy_tracker.finish(svc_name, status_value, probe_detail)
 
-        config_json.update({"image": req.image or bp.image, "host_port": host_port, "volume_name": bp.volume_name})
-        if not svc_record:
-            svc_record = ServiceConfig(
-                service_name=svc_name, deployment_type="local", status=status_value,
-                container_id=container.id, host="localhost", port=host_port,
-                allocated_memory_mb=0, config_json=config_json,
-            )
-            db.add(svc_record)
-        else:
-            svc_record.deployment_type = "local"
-            svc_record.status = status_value
-            svc_record.container_id = container.id
-            svc_record.host = "localhost"
-            svc_record.port = host_port
-            svc_record.config_json = config_json
+        # Second commit records the probe's verdict; for a database service the
+        # Connection created below lands in the same transaction.
+        svc_record.status = status_value
+        svc_record.deployment_type = "local"
+        svc_record.container_id = container.id
 
         # A service that provides a database owns a Connection row the moment it is
         # ready: one rule, applied by what the blueprint declares rather than by a flag
         # somebody has to remember to set.
         registered_name = None
+        conn_record = None
         if ready and bp.provides and credentials:
             conn_record = await _register_service_connection(db, bp, credentials, host_port)
             registered_name = conn_record.name if conn_record else None
-            # Deploying the warehouse is itself a choice, so adopt it unless the operator
-            # already picked a different one.
-            if (
-                conn_record is not None
-                and bp.provides == "postgres"
-                and get_warehouse_connection_id() is None
-            ):
-                set_warehouse_connection_id(conn_record.id)
 
         await db.commit()
         await db.refresh(svc_record)
+
+        # Deploying the warehouse is itself a choice, so adopt it unless the operator
+        # already picked a different one. Written *after* the commit on purpose: the
+        # setting is stored through its own SQLite connection, and while this session
+        # still holds the deploy's write transaction that write returns "database is
+        # locked" — which used to abort a deploy whose container was already healthy and
+        # roll the Connection row back with it.
+        if (
+            conn_record is not None
+            and bp.provides == "postgres"
+            and get_warehouse_connection_id() is None
+        ):
+            try:
+                set_warehouse_connection_id(conn_record.id)
+            except Exception as exc:
+                # Binding is a convenience; it never fails a running service.
+                probe_detail = f"{probe_detail}; warehouse binding failed: {exc}"
+
+        # Superset is only useful once it knows where the data is: push every registered
+        # connection the moment the webserver answers, so the first login shows sources
+        # instead of an empty dropdown. It runs after the config commit because the syncer
+        # reads the vaulted admin password from that row, and a failure is a warning, not
+        # a failed deploy — the container is already healthy.
+        synced_sources = None
+        if ready and svc_name == "superset":
+            deploy_tracker.update(svc_name, phase="syncing-sources",
+                                  detail="pushing registered connections into Superset")
+            try:
+                report = await SupersetSync().run(db)
+            except Exception as exc:
+                probe_detail = f"{probe_detail}; source sync failed: {exc}"
+            else:
+                synced_sources = report["sources"]
+                probe_detail = f"{probe_detail}; sources: {_sync_summary(report)}"
+
+        deploy_tracker.finish(svc_name, status_value, probe_detail)
 
         mem_bytes = container.attrs.get("HostConfig", {}).get("Memory", 0)
         mem_mb = mem_bytes // (1024 * 1024) if mem_bytes > 0 else (req.memory_mb or 1024)
@@ -574,6 +678,7 @@ async def deploy_local_service(
             host=svc_record.host, port=svc_record.port, allocated_memory_mb=mem_mb,
             container_id=container.id, live_docker_status=container.status,
             ready=ready, message=message, credentials=credentials, registered_connection=registered_name,
+            synced_sources=synced_sources,
         )
     except HTTPException as he:
         deploy_tracker.fail(svc_name, str(he.detail))
@@ -583,12 +688,37 @@ async def deploy_local_service(
         raise
 
 
+@router.get("/superset/sources", response_model=SupersetSyncResponse)
+async def preview_superset_sources(db: AsyncSession = Depends(get_db)):
+    """Dry run of the sync: the URIs it would push, with passwords masked.
+
+    Declared before the ``/{service_name}/...`` routes so ``superset`` here is this
+    endpoint's literal path and not a service name.
+    """
+    return await SupersetSync().plan(db)
+
+
+@router.post("/superset/sync", response_model=SupersetSyncResponse)
+async def sync_superset_sources(db: AsyncSession = Depends(get_db)):
+    """Pushes every registered connection into Superset, upserting by connection name."""
+    report = await SupersetSync().run(db)
+    if not report["ok"]:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=report["detail"])
+    return report
+
+
 @router.post("/{service_name}/stop")
 async def stop_service(
     service_name: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Stops and removes the local container managed by Obelisk. Data volumes are PRESERVED (use /destroy to remove data)."""
+    """Stops a service **in place**, keeping everything it has.
+
+    A container is stopped, not removed: its environment — hence the credentials its data
+    volume was initialized with — its published ports, its configuration and its data all
+    survive, so /start brings back the very same service. Nothing about it can be changed
+    while it sits stopped; use /destroy to remove it and its data, then deploy fresh.
+    """
     svc_name = service_name.lower()
     _bp = get_blueprint(svc_name)
     try:
@@ -606,13 +736,93 @@ async def stop_service(
     result = await db.execute(stmt)
     svc_record = result.scalar_one_or_none()
     if svc_record:
+        # Only the status flips: credentials, ports and container_id stay exactly as they
+        # were, because the container they describe is still there.
         svc_record.status = "stopped"
-        svc_record.container_id = None
         await db.commit()
 
-    
-
     return {"service_name": svc_name, "status": "stopped"}
+
+
+@router.post("/{service_name}/start", response_model=ServiceLifecycleResponse)
+async def start_service(service_name: str, db: AsyncSession = Depends(get_db)):
+    """Starts a stopped service with everything it already had.
+
+    A container start is ``docker start``: same container, same environment (so the same
+    credentials), same data volume. Nothing is rebuilt, and this endpoint accepts no
+    credentials or configuration — those are decided once, at deploy time. Readiness is
+    re-probed with the *stored* credentials, so a container whose volume disagrees with its
+    environment is reported instead of being quietly declared healthy.
+    """
+    svc_name = service_name.lower()
+    bp = get_blueprint(svc_name)
+    if svc_name not in SUPPORTED_SERVICES or bp is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Unknown service '{service_name}'.")
+
+    stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
+    svc_record = (await db.execute(stmt)).scalar_one_or_none()
+    config_json: Dict[str, Any] = dict(svc_record.config_json or {}) if svc_record else {}
+
+    if bp.run_mode == "process":
+        try:
+            await asyncio.to_thread(process_manager.start, svc_name, bp)
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"Failed to start '{svc_name}': {e}")
+        if svc_record:
+            svc_record.status = "running"
+            await db.commit()
+        return ServiceLifecycleResponse(
+            service_name=svc_name, status="running", ready=True,
+            message=f"{bp.display_name} started",
+        )
+
+    try:
+        container = await asyncio.to_thread(docker_mgr.start_service, svc_name)
+    except LookupError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Failed to start '{svc_name}': {e}")
+
+    host_port = get_service_host_port(svc_name, container, config_json.get("host_port"))
+    username = config_json.get("username")
+    database = config_json.get("database")
+    password: Optional[str] = None
+    if config_json.get("encrypted_password"):
+        try:
+            password = decrypt(config_json["encrypted_password"])
+        except Exception:
+            # A vault we cannot open is not a reason to refuse to start the container;
+            # the probe simply cannot authenticate and will say so.
+            password = None
+
+    ready = False
+    probe_detail = "no probe configured"
+    deadline = time.time() + bp.probe_timeout_seconds
+    while time.time() < deadline:
+        probe = await asyncio.to_thread(
+            docker_mgr.probe_readiness, svc_name, host_port, username, database,
+            password=password,
+        )
+        ready = probe["ready"]
+        probe_detail = probe["detail"]
+        if ready:
+            break
+        await asyncio.sleep(2.0)
+
+    if svc_record:
+        svc_record.status = "ready" if ready else "starting"
+        svc_record.deployment_type = "local"
+        svc_record.container_id = container.id
+        svc_record.port = host_port
+        await db.commit()
+
+    return ServiceLifecycleResponse(
+        service_name=svc_name, status="ready" if ready else "starting",
+        ready=ready, message=probe_detail,
+    )
 
 
 @router.get("/engine")
@@ -682,8 +892,9 @@ async def destroy_service(service_name: str, db: AsyncSession = Depends(get_db))
         stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
         svc_record = (await db.execute(stmt)).scalar_one_or_none()
         if svc_record:
-            svc_record.status = "stopped"
-            svc_record.container_id = None
+            # Destroy means "as if never deployed": the home directory, the credentials it
+            # was configured with and its settings all go, so the next deploy starts clean.
+            await db.delete(svc_record)
             await db.commit()
         await _forget_service_connection(db, svc_name)
         return {"service_name": svc_name, "status": "destroyed", "data_removed": True}
@@ -711,8 +922,10 @@ async def destroy_service(service_name: str, db: AsyncSession = Depends(get_db))
     stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
     svc_record = (await db.execute(stmt)).scalar_one_or_none()
     if svc_record:
-        svc_record.status = "stopped"
-        svc_record.container_id = None
+        # Destroy means "as if never deployed": the container, its data volume, its
+        # vaulted credentials and its settings all go, so the next deploy starts clean and
+        # may choose new credentials freely.
+        await db.delete(svc_record)
         await db.commit()
 
     await _forget_service_connection(db, svc_name)

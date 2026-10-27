@@ -22,7 +22,7 @@ def test_docker_manager_deploy_and_out_of_band_verification():
 
     # Clean up any leftover test container first
     try:
-        docker_mgr.stop_service(svc_name)
+        docker_mgr.destroy_service(svc_name)
     except Exception:
         pass
 
@@ -81,12 +81,60 @@ def test_docker_manager_deploy_and_out_of_band_verification():
         assert status_info["container_id"] == container_id
 
     finally:
-        # Clean up container
-        docker_mgr.stop_service(svc_name)
+        # Clean up container and its volume — destroy is the only removal path.
+        docker_mgr.destroy_service(svc_name)
 
         # Verify removal out-of-band
         with pytest.raises(NotFound):
             independent_client.containers.get(container_id)
+
+def test_stop_keeps_the_container_and_start_brings_it_back_unchanged():
+    """
+    Lifecycle invariant:
+    stop is `docker stop`, not a teardown. The container, its id and its environment all
+    survive — the environment *is* the credentials a database volume was initialized with,
+    so losing it would strand the data. Only destroy removes the container.
+    """
+    if docker_mgr.client is None:
+        pytest.skip("Docker daemon not running on localhost")
+
+    svc_name = "test_lifecycle_svc"
+    token = "obelisk-lifecycle-token"
+
+    try:
+        docker_mgr.destroy_service(svc_name)
+    except Exception:
+        pass
+
+    try:
+        created = docker_mgr.deploy_service(
+            service_name=svc_name,
+            image="alpine:latest",
+            command=["tail", "-f", "/dev/null"],
+            environment={"OBELISK_TEST_TOKEN": token},
+            memory_mb=256,
+        )
+        container_id = created.id
+
+        docker_mgr.stop_service(svc_name)
+        stopped = docker_mgr.get_service_container(svc_name)
+        assert stopped is not None, "stop must keep the container, not delete it"
+        stopped.reload()
+        assert stopped.id == container_id
+        assert stopped.status == "exited"
+        assert f"OBELISK_TEST_TOKEN={token}" in stopped.attrs["Config"]["Env"], (
+            "the environment (and therefore the credentials) must survive a stop"
+        )
+
+        started = docker_mgr.start_service(svc_name)
+        assert started.id == container_id, "start must reuse the container, never replace it"
+        started.reload()
+        assert started.status == "running"
+        assert f"OBELISK_TEST_TOKEN={token}" in started.attrs["Config"]["Env"]
+    finally:
+        docker_mgr.destroy_service(svc_name)
+
+    assert docker_mgr.get_service_container(svc_name) is None, "destroy is what removes it"
 
 def test_docker_manager_safety_rule():
     """

@@ -134,11 +134,16 @@ class DockerManager:
         self.ensure_network()
         name = self._get_container_name(service_name)
 
-        # Check existing container (redeploy path) — stop it first, keeping data volumes
+        # Check existing container (redeploy path) — remove it first, keeping data volumes
         existing = self.get_service_container(service_name)
 
         if existing:
-            self.stop_service(service_name)
+            # A deploy always produces a *new* container, and Docker refuses a duplicate
+            # name. remove(v=True) drops only anonymous volumes: the blueprint's NAMED data
+            # volume survives, so the data (and the credentials it was initialized with)
+            # carry over. The API refuses to deploy while a container exists — this branch
+            # keeps the manager itself consistent for direct callers.
+            existing.remove(v=True, force=True)
 
         # Compute dynamic memory allocation
         if memory_mb is None:
@@ -231,9 +236,14 @@ class DockerManager:
 
     def stop_service(self, service_name: str) -> None:
         """
-        Stops and removes a managed container, PRESERVING its named data volume.
-        Enforces safety: never stops containers that lack managed_by=obelisk.
-        Use destroy_service() to permanently delete persisted data.
+        Stops a managed container **in place**, keeping the container itself.
+
+        Everything it was created with survives untouched — image, environment (so the
+        credentials the data volume was initialized with), labels, published ports and the
+        named data volume. ``start_service`` brings it back exactly as it was; nothing is
+        rebuilt and no credentials can drift. Enforces safety: never touches containers
+        that lack managed_by=obelisk. Use destroy_service() to remove the container and
+        its data.
         """
         container = self.get_service_container(service_name)
         if container:
@@ -244,16 +254,37 @@ class DockerManager:
                     f"Refusing to stop container {container.name}: missing {MANAGED_LABEL}={OBELISK_TAG}"
                 )
             container.stop(timeout=5)
-            # v=True removes only ANONYMOUS volumes; blueprint data lives in NAMED
-            # volumes which are preserved here and removed only by destroy_service().
-            container.remove(v=True, force=True)
+
+    def start_service(self, service_name: str) -> Optional[Container]:
+        """
+        Starts a previously stopped managed container, unchanged.
+
+        This is ``docker start``: the same container id, the same environment (including
+        the credentials it was deployed with) and the same named volume. If nothing was
+        ever deployed there is nothing to start — the caller has to deploy instead.
+        """
+        container = self.get_service_container(service_name)
+        if not container:
+            raise LookupError(
+                f"No managed container for '{service_name}' to start. Deploy it first."
+            )
+        if container.status != "running":
+            container.start()
+        return container
 
     def destroy_service(self, service_name: str) -> None:
         """
-        Stops the managed container AND permanently deletes its named data volume.
-        This is the only path that removes persisted service data.
+        Removes the managed container AND permanently deletes its named data volume.
+        This is the only path that removes persisted service data — after it, the service
+        is gone as if never deployed, and the next deploy starts from an empty volume.
         """
-        self.stop_service(service_name)
+        container = self.get_service_container(service_name)
+        if container:
+            # Label check lives in get_service_container (it refuses foreign containers).
+            # force=True removes a running container too, so a running service can be
+            # destroyed in one step. v=True drops only ANONYMOUS volumes; blueprint data
+            # lives in the NAMED volume removed just below.
+            container.remove(v=True, force=True)
         bp = get_blueprint(service_name)
         if bp and bp.volume_name and self.client:
             try:
@@ -378,12 +409,121 @@ class DockerManager:
             return None
         return f"{self._get_container_name(service_name)}:{container_port}"
 
+    def published_port_owner(self, host_port: int) -> Optional[Dict[str, Any]]:
+        """Which running container publishes ``host_port`` on the host, and on which port.
+
+        The platform stores ``127.0.0.1:5434`` because that is how *it* reaches a source
+        from the host. A sibling container cannot use that address — inside a container
+        ``127.0.0.1`` is the container itself — so a consumer living on ``obelisk_net``
+        has to be pointed at the publishing container's name and container port instead.
+        Returns ``{"container": str, "container_port": int}`` or ``None`` when nothing
+        publishes the port (an external host, or a service Obelisk does not manage).
+        """
+        if not self.client:
+            return None
+        try:
+            containers = self.client.containers.list()
+        except Exception:
+            return None
+        wanted = str(int(host_port))
+        for container in containers:
+            try:
+                bindings_map = (container.attrs.get("NetworkSettings", {}) or {}).get("Ports", {}) or {}
+            except Exception:
+                continue
+            for container_port, bindings in (bindings_map or {}).items():
+                for binding in bindings or []:
+                    if str((binding or {}).get("HostPort") or "") != wanted:
+                        continue
+                    try:
+                        port_number = int(str(container_port).split("/")[0])
+                    except (TypeError, ValueError):
+                        continue
+                    return {"container": container.name, "container_port": port_number}
+        return None
+
+    def is_on_network(self, container_name: str, network: Optional[str] = None) -> bool:
+        """Whether ``container_name`` is *already* attached to ``network``. Reads only.
+
+        A preview must be safe to call from a GET: it may report that a sync would attach
+        a container, but it must not attach one to find out.
+        """
+        if not self.client or not container_name:
+            return False
+        net_name = network or settings.OBELISK_NET
+        try:
+            container = self.client.containers.get(container_name)
+            networks = (container.attrs.get("NetworkSettings", {}) or {}).get("Networks", {}) or {}
+            return net_name in networks
+        except Exception:
+            return False
+
+    def ensure_on_network(self, container_name: str, network: Optional[str] = None) -> bool:
+        """Attaches ``container_name`` to ``network`` (default ``obelisk_net``) if absent.
+
+        Containers deployed by compose can land on their project's default network, where
+        a sibling on ``obelisk_net`` cannot resolve them by name. Connecting is additive
+        and needs no restart, so this never disrupts a running service.
+        """
+        if not self.client or not container_name:
+            return False
+        net_name = network or settings.OBELISK_NET
+        try:
+            container = self.client.containers.get(container_name)
+            networks = (container.attrs.get("NetworkSettings", {}) or {}).get("Networks", {}) or {}
+            if net_name in networks:
+                return True
+            self.ensure_network().connect(container)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _container_self_address(container) -> Optional[str]:
+        """The container's own bridge address, or ``None`` when Docker did not say.
+
+        The official postgres image ships ``trust`` for ``local``/``127.0.0.1``/``::1``
+        and ``scram-sha-256`` for everything else, so a login only gets its password
+        checked when it arrives on an interface rather than on loopback.
+        """
+        networks = ((container.attrs or {}).get("NetworkSettings") or {}).get("Networks") or {}
+        for net in networks.values():
+            address = (net or {}).get("IPAddress")
+            if address:
+                return address
+        return None
+
+    def _authenticate(self, container, user: str, db: str, password: str) -> Optional[str]:
+        """Logs in with the credentials the deploy intends to register.
+
+        Returns ``None`` when they work (or when the question cannot be answered — an
+        image without a ``psql`` client, or a container Docker reported no address for;
+        liveness was already proven, so neither is treated as a failure). Otherwise it
+        returns the reason they do not.
+        """
+        address = self._container_self_address(container)
+        if not address:
+            return None
+        args = ["psql", "-h", address, "-U", user, "-d", db, "-tAc", "select 1"]
+        try:
+            exit_code, output = container.exec_run(args, environment={"PGPASSWORD": password})
+        except Exception:
+            # Liveness is already proven; a failed exec is inconclusive, not bad credentials.
+            return None
+        text = (output or b"").decode("utf-8", errors="replace").strip()
+        if exit_code == 0:
+            return None
+        if exit_code == 127 or "command not found" in text:
+            return None
+        return text or f"psql exited {exit_code}"
+
     def probe_readiness(
         self,
         service_name: str,
         host_port: Optional[int] = None,
         user: Optional[str] = None,
         db: Optional[str] = None,
+        password: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Runs the blueprint readiness probe and returns {"ready": bool, "detail": str}.
@@ -412,10 +552,23 @@ class DockerManager:
                 container = self.get_service_container(service_name)
                 if not container or container.status != "running":
                     return {"ready": False, "detail": "container not running"}
-                args = ["pg_isready", "-U", user or probe.user or "postgres", "-d", db or probe.db or "postgres"]
+                user_name = user or probe.user or "postgres"
+                db_name = db or probe.db or "postgres"
+                args = ["pg_isready", "-U", user_name, "-d", db_name]
                 exit_code, output = container.exec_run(args)
                 detail = output.decode("utf-8", errors="replace").strip()
-                return {"ready": exit_code == 0, "detail": detail}
+                if exit_code != 0:
+                    return {"ready": False, "detail": detail}
+                if password:
+                    # pg_isready only proves the socket answers — it never authenticates.
+                    # The image honors POSTGRES_USER/PASSWORD/DB on its first boot alone,
+                    # so a deploy over an initialized volume can advertise credentials the
+                    # cluster does not have. Without this check the deploy would call that
+                    # "ready" and register a Connection nobody can log in with.
+                    auth_error = self._authenticate(container, user_name, db_name, password)
+                    if auth_error:
+                        return {"ready": False, "detail": f"{detail}; auth failed: {auth_error}"}
+                return {"ready": True, "detail": detail}
 
             if probe.kind == "http":
                 import httpx

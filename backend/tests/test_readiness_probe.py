@@ -118,3 +118,116 @@ def test_a_containerised_backend_probes_the_sibling_on_its_container_port():
         os.environ.pop("OBELISK_IN_CONTAINER", None)
 
     assert target == f"obelisk_{service_name}:{container_port}"
+
+
+class _FakePgContainer:
+    """A running postgres container answering ``docker exec``.
+
+    ``replies`` is consumed one entry per exec: ``pg_isready`` first, then ``psql``.
+    """
+
+    status = "running"
+
+    def __init__(self, replies, address="172.18.0.7"):
+        self.replies = list(replies)
+        self.calls = []
+        self.attrs = {"NetworkSettings": {"Networks": {"obelisk_net": {"IPAddress": address}}}}
+
+    def exec_run(self, cmd, environment=None):
+        self.calls.append({"cmd": cmd, "environment": environment})
+        return self.replies.pop(0)
+
+
+@pytest.fixture
+def fake_postgres():
+    """Swaps the container lookup so the probe logic runs without a daemon."""
+    previous = docker_mgr.get_service_container
+
+    def install(replies, address="172.18.0.7"):
+        container = _FakePgContainer(replies, address=address)
+        docker_mgr.get_service_container = lambda name: container
+        return container
+
+    try:
+        yield install
+    finally:
+        docker_mgr.get_service_container = previous
+
+
+def test_the_pg_probe_authenticates_with_the_password_it_will_register(fake_postgres):
+    """``pg_isready`` only checks the socket; the deploy panel's password must be tried."""
+    container = fake_postgres(
+        [(0, b"/var/run/postgresql:5432 - accepting connections"), (0, b"1")]
+    )
+    result = docker_mgr.probe_readiness(
+        "postgres", host_port=5432, user="analytics", db="warehouse",
+        password="Correct-Horse-9",
+    )
+
+    assert result["ready"] is True
+    assert len(container.calls) == 2, "liveness, then one login attempt"
+    login = container.calls[1]
+    assert login["environment"] == {"PGPASSWORD": "Correct-Horse-9"}
+    assert login["cmd"][0] == "psql"
+    assert login["cmd"][1:3] == ["-h", "172.18.0.7"], (
+        "the image trusts loopback, so the login has to arrive on an interface"
+    )
+
+
+def test_a_container_without_an_address_cannot_be_authenticated(fake_postgres):
+    """Docker reported no address: the password stays unverified rather than falsely failed."""
+    container = fake_postgres(
+        [(0, b"/var/run/postgresql:5432 - accepting connections")], address=""
+    )
+    result = docker_mgr.probe_readiness(
+        "postgres", host_port=5432, user="postgres", db="obelisk", password="unverifiable"
+    )
+
+    assert result["ready"] is True
+    assert len(container.calls) == 1, "no address means no login attempt at all"
+
+
+def test_a_password_the_volume_never_got_is_not_ready(fake_postgres):
+    """Redeploying an initialized volume with a new token must fail loudly, not register."""
+    fake_postgres(
+        [
+            (0, b"/var/run/postgresql:5432 - accepting connections"),
+            (
+                2,
+                b'psql: error: connection to server at "127.0.0.1", port 5432 failed: '
+                b'FATAL:  password authentication failed for user "analytics"',
+            ),
+        ]
+    )
+    result = docker_mgr.probe_readiness(
+        "postgres", host_port=5432, user="analytics", db="warehouse", password="stale-token"
+    )
+
+    assert result["ready"] is False
+    assert "auth failed" in result["detail"]
+    assert "password authentication failed" in result["detail"]
+
+
+def test_a_live_socket_without_a_password_is_still_ready(fake_postgres):
+    """Redeploys that reuse the vaulted password need no second exec."""
+    container = fake_postgres([(0, b"/var/run/postgresql:5432 - accepting connections")])
+    result = docker_mgr.probe_readiness("postgres", host_port=5432, user="postgres", db="obelisk")
+
+    assert result["ready"] is True
+    assert len(container.calls) == 1
+
+
+def test_an_image_without_psql_is_not_called_auth_failed(fake_postgres):
+    """Liveness was already proven; a missing client cannot answer the question either way."""
+    fake_postgres(
+        [
+            (0, b"/var/run/postgresql:5432 - accepting connections"),
+            (127, b'OCI runtime exec failed: exec: "psql": executable file not found in $PATH'),
+        ]
+    )
+    result = docker_mgr.probe_readiness(
+        "postgres", host_port=5432, user="postgres", db="obelisk", password="some-token"
+    )
+
+    assert result["ready"] is True
+

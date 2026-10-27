@@ -16,6 +16,8 @@ Hard rules enforced by this module's consumers:
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from app.core.dsn import bi_container_modules, bi_container_packages
+
 
 @dataclass
 class ReadinessProbe:
@@ -158,7 +160,34 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
         primary_host_port=8088,
         volume_name="obelisk_superset_data",
         volume_path="/app/superset_home",
-        env={"SUPERSET_SECRET_KEY": "__GENERATED__", "SUPERSET_WEBSERVER_BASEURL": "/superset/", "APPLICATION_ROOT": "/superset"},
+        # ``pylibs`` lives on the data volume and is on PYTHONPATH so the drivers installed
+        # below are importable by gunicorn: a directory only becomes an import location if
+        # it exists when the interpreter starts, and a fresh volume has no ``pylibs`` yet.
+        env={
+            "SUPERSET_SECRET_KEY": "__GENERATED__",
+            "SUPERSET_WEBSERVER_BASEURL": "/superset/",
+            "APPLICATION_ROOT": "/superset",
+            "PYTHONPATH": "/app/pythonpath:/app/superset_home/pylibs",
+        },
+        # Superset's image ships no database drivers, and it resolves (and caches) an engine
+        # spec the first time it is asked for one — at boot. A server that starts before the
+        # drivers land keeps answering every datasource with "Connection failed, please check
+        # your connection settings" (``Could not load database driver: PostgresEngineSpec``)
+        # until it is restarted, which is exactly what a fresh install must not do. So the
+        # install runs *ahead of* the server instead of from post_start_commands, where it
+        # arrived too late. The import guard keeps a restart of an already-provisioned volume
+        # from paying for pip again (and keeps restarts working on an offline host).
+        # ``--no-deps`` keeps pip from shadowing the urllib3/zstandard/certifi the server
+        # already runs on. ``/usr/bin/run-server.sh`` is this image's own CMD: setting
+        # ``command`` replaces it, so it is exec'd explicitly to get the identical launch.
+        command=[
+            "/bin/sh",
+            "-c",
+            'python -c "import ' + ", ".join(bi_container_modules()) + '" 2>/dev/null || '
+            "pip install --no-cache-dir --no-deps --target /app/superset_home/pylibs "
+            + " ".join(bi_container_packages())
+            + "; exec /usr/bin/run-server.sh",
+        ],
         readiness=ReadinessProbe(kind="http", host_port=8088, path="/health", expected_status=200),
         probe_timeout_seconds=300,
         image_size_gb=3.0,
