@@ -276,23 +276,23 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         {/* Data Sources */}
         <div
           onClick={() => onNavigate('catalog')}
-          className="p-5 rounded-xl border border-slate-200/90 bg-white hover:border-sky-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
+          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-sky-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
               Data Sources
             </span>
-            <span className="p-2 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80 group-hover:scale-105 transition-transform">
-              <Database className="w-4 h-4" />
+            <span className="p-1.5 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80 group-hover:scale-105 transition-transform">
+              <Database className="w-3.5 h-3.5" />
             </span>
           </div>
-          <div className="text-3xl font-extrabold font-mono text-slate-900 mt-2">
+          <div className="text-2xl font-extrabold font-mono text-slate-900 mt-1">
             {externalConnsCount}
           </div>
-          <div className="mt-3 pt-2.5 border-t border-slate-100 text-xs text-slate-500 truncate flex items-center gap-1.5">
+          <div className="mt-2 pt-2 border-t border-slate-100 text-[11px] text-slate-500 truncate flex items-center gap-1.5">
             {externalConnsCount > 0 ? (
               <>
-                <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
                 <span className="font-semibold text-emerald-700 truncate">{sourceTypesSummary}</span>
               </>
             ) : (
@@ -304,22 +304,22 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         {/* Pipelines */}
         <div
           onClick={() => onNavigate('pipelines')}
-          className="p-5 rounded-xl border border-slate-200/90 bg-white hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
+          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
               Pipelines
             </span>
-            <span className="p-2 rounded-lg bg-indigo-50 text-indigo-600 border border-indigo-100/80 group-hover:scale-105 transition-transform">
-              <Clock className="w-4 h-4" />
+            <span className="p-1.5 rounded-lg bg-indigo-50 text-indigo-600 border border-indigo-100/80 group-hover:scale-105 transition-transform">
+              <Clock className="w-3.5 h-3.5" />
             </span>
           </div>
-          <div className="text-3xl font-extrabold font-mono text-slate-900 mt-2">
+          <div className="text-2xl font-extrabold font-mono text-slate-900 mt-1">
             {totalPipelineCount}
           </div>
-          <div className="mt-3 pt-2.5 border-t border-slate-100 text-xs text-slate-500 truncate flex items-center gap-1.5">
+          <div className="mt-2 pt-2 border-t border-slate-100 text-[11px] text-slate-500 truncate flex items-center gap-1.5">
             <span
-              className={`w-2 h-2 rounded-full shrink-0 ${
+              className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                 activePipelineCount > 0 ? 'bg-emerald-500' : 'bg-slate-300'
               }`}
             />
@@ -334,20 +334,20 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         {/* dbt Models */}
         <div
           onClick={() => onNavigate('dbt')}
-          className="p-5 rounded-xl border border-slate-200/90 bg-white hover:border-purple-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
+          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-purple-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
               dbt Models
             </span>
-            <span className="p-2 rounded-lg bg-purple-50 text-purple-600 border border-purple-100/80 group-hover:scale-105 transition-transform">
-              <Layers className="w-4 h-4" />
+            <span className="p-1.5 rounded-lg bg-purple-50 text-purple-600 border border-purple-100/80 group-hover:scale-105 transition-transform">
+              <Layers className="w-3.5 h-3.5" />
             </span>
           </div>
-          <div className="text-3xl font-extrabold font-mono text-slate-900 mt-2">
+          <div className="text-2xl font-extrabold font-mono text-slate-900 mt-1">
             {totalDbtModels}
           </div>
-          <div className="mt-3 pt-2.5 border-t border-slate-100 text-xs text-slate-500 truncate">
+          <div className="mt-2 pt-2 border-t border-slate-100 text-[11px] text-slate-500 truncate">
             {totalDbtModels > 0
               ? `${stagingModels.length} staging • ${martModels.length} marts`
               : 'Zero dbt models defined'}
@@ -357,22 +357,22 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         {/* Notebooks */}
         <div
           onClick={() => onNavigate('notebooks')}
-          className="p-5 rounded-xl border border-slate-200/90 bg-white hover:border-amber-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
+          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-amber-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
               Notebooks
             </span>
-            <span className="p-2 rounded-lg bg-amber-50 text-amber-600 border border-amber-100/80 group-hover:scale-105 transition-transform">
-              <BookOpen className="w-4 h-4" />
+            <span className="p-1.5 rounded-lg bg-amber-50 text-amber-600 border border-amber-100/80 group-hover:scale-105 transition-transform">
+              <BookOpen className="w-3.5 h-3.5" />
             </span>
           </div>
-          <div className="text-3xl font-extrabold font-mono text-slate-900 mt-2">
+          <div className="text-2xl font-extrabold font-mono text-slate-900 mt-1">
             {notebooksCount}
           </div>
-          <div className="mt-3 pt-2.5 border-t border-slate-100 text-xs text-slate-500 truncate flex items-center gap-1.5">
+          <div className="mt-2 pt-2 border-t border-slate-100 text-[11px] text-slate-500 truncate flex items-center gap-1.5">
             <span
-              className={`w-2 h-2 rounded-full shrink-0 ${
+              className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                 isMarimoRunning ? 'bg-emerald-500' : 'bg-slate-300'
               }`}
             />
