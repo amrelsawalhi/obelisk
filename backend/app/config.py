@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from pathlib import Path
@@ -18,6 +19,60 @@ LOCAL_STORAGE_SCHEMES = frozenset({"", "file"})
 # only when the host genuinely has no /data/lakehouse directory, so a real
 # bind mount at that path still wins.
 CONTAINER_LAKEHOUSE_PATH = "/data/lakehouse"
+
+# Where the lakehouse belongs in the image: the target of the ``./data:/app/data``
+# bind mount docker-compose.yml declares. Remapping the container default onto
+# "/data/lakehouse" *inside* the image looked correct and was not — the image root is
+# "/", so the repo candidate resolved to the very path being avoided, ``mkdir`` happily
+# created it in the container's writable layer, and every table written there was lost
+# the next time the container was recreated.
+APP_DATA_LAKEHOUSE_PATH = "/app/data/lakehouse"
+
+logger = logging.getLogger(__name__)
+
+# A silent remap is how the bug above survived: the process wrote somewhere plausible
+# and nothing said so. This warns once per process, on the first path resolution.
+_lakehouse_remap_reported = False
+
+
+def resolve_lakehouse_directory(
+    raw: str, project_root: Path, app_data_available: bool | None = None
+) -> str:
+    """Maps the un-URI'd container default onto a directory that outlives the container.
+
+    Two hosts share this code and they cannot use the same answer:
+
+    * a checkout keeps its lakehouse beside the code, ``<repo>/data/lakehouse``;
+    * the image's project root is ``/``, so that same candidate *is*
+      ``/data/lakehouse`` — the container path being escaped. There the only
+      persistent directory is the ``./data:/app/data`` bind mount.
+
+    ``app_data_available`` exists so the image case is a testable fact rather than a
+    filesystem probe; ``None`` means "look". Returns ``raw`` unchanged when it is not
+    the container default, or when something really is mounted at that path.
+    """
+    normalised = raw.replace("\\", "/").rstrip("/")
+    is_container_default = normalised == CONTAINER_LAKEHOUSE_PATH or normalised.startswith(
+        CONTAINER_LAKEHOUSE_PATH + "/"
+    )
+    if not is_container_default or Path(CONTAINER_LAKEHOUSE_PATH).exists():
+        return raw
+
+    suffix = normalised[len(CONTAINER_LAKEHOUSE_PATH):].strip("/")
+    checkout = Path(os.path.normpath(str(project_root / "data" / "lakehouse")))
+    if app_data_available is None:
+        app_data_available = Path(APP_DATA_LAKEHOUSE_PATH).parent.is_dir()
+
+    if str(checkout).replace("\\", "/") != CONTAINER_LAKEHOUSE_PATH:
+        chosen = checkout
+    elif app_data_available:
+        chosen = Path(APP_DATA_LAKEHOUSE_PATH)
+    else:
+        chosen = checkout
+    # POSIX form: this answer is about a container path, and returning a Windows
+    # `\app\data\lakehouse` for it would be a lie that only tests could notice.
+    chosen_path = chosen / suffix if suffix else chosen
+    return chosen_path.as_posix()
 
 # Shipped defaults, named once so "is this still the default?" is a comparison rather than
 # a string literal repeated in the guard, the login route and the docs.
@@ -157,6 +212,21 @@ class Settings(BaseSettings):
         default_factory=lambda: int(os.getenv("DUCKDB_MAX_CONCURRENT_HEAVY", "4"))
     )
 
+    # The SDK's eager readers (``to_polars``/``to_df``/``to_arrow``) pull a whole table into
+    # memory. Past a point that is not a slow notebook cell, it is the kernel dying with
+    # every other result in it. The guard warns at the first threshold and refuses at the
+    # second; 0 for the refusal means "derive it from the host" (max of 8 GiB and a quarter
+    # of RAM). Sizes are measured from the Parquet files on disk, so they are a lower bound
+    # on what the dataframe will occupy.
+    SDK_EAGER_WARN_BYTES: int = Field(
+        default_factory=lambda: int(
+            os.getenv("OBELISK_SDK_EAGER_WARN_BYTES", str(2 * 1024 ** 3))
+        )
+    )
+    SDK_EAGER_REFUSE_BYTES: int = Field(
+        default_factory=lambda: int(os.getenv("OBELISK_SDK_EAGER_REFUSE_BYTES", "0"))
+    )
+
     @property
     def lakehouse_catalog_path(self) -> Path:
         """DuckLake's metadata database, kept with the data it describes.
@@ -169,8 +239,16 @@ class Settings(BaseSettings):
 
         The dot-folder keeps it out of the table namespace: the warehouse walk skips
         dot-directories, so the catalog is never mistaken for a table.
+
+        The directory is created here, not only in :mod:`app.core.catalog`. A dbt run
+        attaches the same catalog straight from its profile, without going through
+        ``attach_lakehouse``, so on a warehouse whose ``.obelisk/`` did not exist yet
+        DuckDB answered ``unable to open database file`` — a fresh install could not
+        compile a single model until something else happened to create the folder.
         """
-        return Path(self.lakehouse_root_path) / ".obelisk" / "catalog.sqlite"
+        catalog = Path(self.lakehouse_root_path) / ".obelisk" / "catalog.sqlite"
+        catalog.parent.mkdir(parents=True, exist_ok=True)
+        return catalog
 
     @property
     def duckdb_temp_path(self) -> Path:
@@ -256,13 +334,19 @@ class Settings(BaseSettings):
 
         # Container default -> checkout, but only when the host has no such
         # directory (a real bind mount must win).
-        normalised = raw.replace("\\", "/").rstrip("/")
-        if normalised == CONTAINER_LAKEHOUSE_PATH or normalised.startswith(CONTAINER_LAKEHOUSE_PATH + "/"):
-            if not Path(CONTAINER_LAKEHOUSE_PATH).exists():
-                suffix = normalised[len(CONTAINER_LAKEHOUSE_PATH):].strip("/")
-                raw = str(project_root / "data" / "lakehouse")
-                if suffix:
-                    raw = str(Path(raw) / suffix)
+        global _lakehouse_remap_reported
+        remapped = resolve_lakehouse_directory(raw, project_root)
+        if remapped != raw:
+            raw = remapped
+            if not _lakehouse_remap_reported:
+                _lakehouse_remap_reported = True
+                logger.warning(
+                    "STORAGE_URI=%s is the container default and %s does not exist; "
+                    "using %s instead. Set STORAGE_URI explicitly to silence this.",
+                    self.STORAGE_URI,
+                    CONTAINER_LAKEHOUSE_PATH,
+                    raw,
+                )
 
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():

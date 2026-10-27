@@ -15,7 +15,11 @@ services:
     environment:
       - APP_NAME=Obelisk
       - ENVIRONMENT=production
-      - STORAGE_URI=${STORAGE_URI:-file:///data/lakehouse}
+      # Must equal the bind mount above (./data -> /app/data). It is deliberately not
+      # overridable from .env: the old `file:///data/lakehouse` default pointed outside
+      # the mount, so the lakehouse (and its DuckLake catalog) was created in the
+      # container's writable layer and vanished whenever the container was recreated.
+      - STORAGE_URI=file:///app/data/lakehouse
       - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:////app/data/obelisk.db}
       - OBELISK_MASTER_KEY=${OBELISK_MASTER_KEY:-dGhpcy1pcy1hLXNhbXBsZS0zMi1ieXRlLWtleS0xMjM0NTY=}
       - OBELISK_ADMIN_USER=${OBELISK_ADMIN_USER:-admin}
