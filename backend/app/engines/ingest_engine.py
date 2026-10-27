@@ -111,6 +111,16 @@ def _bt(value: object) -> str:
     return "`" + str(value).replace("`", "``") + "`"
 
 
+class IngestCancelled(RuntimeError):
+    """A load stopped because the operator cancelled it.
+
+    Distinct from a failure so the job ends as ``cancelled`` rather than ``failed``, and so
+    callers can tell "the rows never arrived" from "the source broke". A cancelled load
+    commits nothing: staging raises before the swap, and the load table it was filling is
+    dropped by the ``finally`` in :meth:`IngestEngine.ingest_entity`.
+    """
+
+
 class IngestEngine:
     """Stages rows from a source, then writes them to the lakehouse in one statement."""
 
@@ -186,7 +196,69 @@ class IngestEngine:
         return rows[0][0]
 
     @staticmethod
+    def _catalog_row_count(conn, target: str) -> Optional[int]:
+        """Rows in a lakehouse table, from DuckLake's own file statistics.
+
+        ``count(*)`` after a load scans the table a second time: on a 100 M-row load that is
+        a full extra pass paid only to print a number, and the append path paid it twice.
+        DuckLake records each data file's ``record_count``, so summing the live files
+        answers the same question without reading a row.
+
+        Returns ``None`` — meaning "count it properly" — when the table has delete files
+        (whose removed rows are still in the statistics), when the sum is zero (an empty
+        table is indistinguishable from rows DuckLake kept inline in the catalog), and for
+        anything that is not a lakehouse table at all.
+        """
+        parts = target.split(".")
+        if len(parts) != 3:
+            return None
+        _, schema, table = (part.strip('"') for part in parts)
+
+        meta = f"__ducklake_metadata_{SOURCE}"
+        try:
+            deleted = conn.execute(
+                f"""
+                SELECT 1
+                FROM {meta}.ducklake_delete_file AS del
+                JOIN {meta}.ducklake_data_file AS df ON df.data_file_id = del.data_file_id
+                JOIN {meta}.ducklake_table AS t ON t.table_id = df.table_id
+                JOIN {meta}.ducklake_schema AS s ON s.schema_id = t.schema_id
+                WHERE del.end_snapshot IS NULL
+                  AND s.schema_name = ? AND t.table_name = ?
+                LIMIT 1
+                """,
+                [schema, table],
+            ).fetchall()
+            if deleted:
+                return None
+
+            rows = conn.execute(
+                f"""
+                SELECT coalesce(sum(df.record_count), 0)
+                FROM {meta}.ducklake_data_file AS df
+                JOIN {meta}.ducklake_table AS t ON t.table_id = df.table_id
+                JOIN {meta}.ducklake_schema AS s ON s.schema_id = t.schema_id
+                WHERE df.end_snapshot IS NULL
+                  AND t.end_snapshot IS NULL
+                  AND s.schema_name = ?
+                  AND t.table_name = ?
+                """,
+                [schema, table],
+            ).fetchall()
+        except Exception:
+            return None
+
+        if not rows or rows[0][0] is None:
+            return None
+        total = int(rows[0][0])
+        return total if total > 0 else None
+
+    @staticmethod
     def _row_count(conn, target: str) -> int:
+        """Rows in the table: from the catalog when it knows, otherwise counted."""
+        known = IngestEngine._catalog_row_count(conn, target)
+        if known is not None:
+            return known
         return int(conn.execute(f"SELECT count(*) FROM {target}").fetchall()[0][0])
 
     @staticmethod
@@ -203,6 +275,7 @@ class IngestEngine:
         on_batch: Optional[Callable[[int], None]] = None,
         create: bool = False,
         commit_rows: int = STAGE_COMMIT_ROWS,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> int:
         """Writes Arrow batches into ``sink``; returns the rows read.
 
@@ -243,6 +316,12 @@ class IngestEngine:
             execute_with(chunk, f"INSERT INTO {sink} SELECT * FROM _obelisk_batch")
 
         for batch in batches:
+            # Checked per batch, not per table: one table can be hundreds of batches, so a
+            # cancel that only landed between tables could take hours to be noticed.
+            if should_cancel is not None and should_cancel():
+                raise IngestCancelled(
+                    "Ingestion cancelled: stopped staging before the table was committed."
+                )
             if batch.num_rows == 0:
                 continue
             if create and not created:
@@ -357,6 +436,14 @@ class IngestEngine:
                 "that cannot be deduplicated."
             )
 
+    @staticmethod
+    def _raise_if_cancelled(should_cancel: Optional[Callable[[], bool]]) -> None:
+        """The one check every stage of a load shares, so the message stays consistent."""
+        if should_cancel is not None and should_cancel():
+            raise IngestCancelled(
+                "Ingestion cancelled: stopped before the table was committed."
+            )
+
     def _stage(
         self,
         conn,
@@ -371,6 +458,7 @@ class IngestEngine:
         on_batch: Optional[Callable[[int], None]] = None,
         sink: Optional[str] = None,
         create: bool = False,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> int:
         """Lets the driver write into ``sink``; returns the rows extracted.
 
@@ -394,13 +482,13 @@ class IngestEngine:
         if st == "postgres":
             return self._stage_postgres(**common)
         if st in ("mysql", "mariadb"):
-            return self._stage_mysql(**common)
+            return self._stage_mysql(**common, should_cancel=should_cancel)
         if st in ("mongodb", "mongo"):
-            return self._stage_mongodb(**common)
+            return self._stage_mongodb(**common, should_cancel=should_cancel)
         if st == "oracle":
-            return self._stage_oracle(**common)
+            return self._stage_oracle(**common, should_cancel=should_cancel)
         if st in ("api", "rest", "rest_api", "erp"):
-            return self._stage_api(**common)
+            return self._stage_api(**common, should_cancel=should_cancel)
         raise ValueError(f"Unsupported source type '{source_type}' for ingestion.")
 
     # -- writing the staged rows ------------------------------------------
@@ -508,6 +596,8 @@ class IngestEngine:
         write_strategy: str = "append",  # "append" or "upsert"
         primary_key: Optional[str] = None,
         on_batch: Optional[Callable[[int], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        on_connection: Optional[Callable[[Any], None]] = None,
     ) -> Dict[str, Any]:
         """Ingests one entity into the lakehouse.
 
@@ -519,6 +609,12 @@ class IngestEngine:
 
         ``on_batch`` is called with the running row count as rows land, so a caller can
         report progress on a table large enough to look stuck.
+
+        ``should_cancel`` is polled between batches: a load of one large table had no
+        cancellation point at all, so "cancel" only took effect once the table it was
+        writing finished. ``on_connection`` hands the live DuckDB connection to the caller
+        once, which is how a single-statement transfer — the one with no batches to poll —
+        is interrupted instead.
         """
         schema, table_stem = self._address(target_folder, entity, target_name)
         target = self._target_sql(schema, table_stem)
@@ -532,8 +628,11 @@ class IngestEngine:
         self._require_primary_key(write_strategy, primary_key)
 
         conn = duckdb_engine.get_connection()
+        if on_connection is not None:
+            on_connection(conn)
         load_table: Optional[str] = None
         try:
+            self._raise_if_cancelled(should_cancel)
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema)};")
             exists = self._exists(conn, schema, table_stem)
 
@@ -581,7 +680,11 @@ class IngestEngine:
                     on_batch=on_batch,
                     sink=sink,
                     create=create,
+                    should_cancel=should_cancel,
                 )
+                # Nothing published after a cancel: the load table is dropped in `finally`,
+                # and the target keeps exactly the rows it had before the run started.
+                self._raise_if_cancelled(should_cancel)
                 if extracted and load_table is not None:
                     if write_strategy == "upsert":
                         if self._upsert_from_load(
@@ -789,7 +892,7 @@ class IngestEngine:
 
     def _stage_mysql(
         self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, on_batch=None, sink=None, create=False,
+        limit, on_batch=None, sink=None, create=False, should_cancel=None,
     ) -> int:
         """MySQL/MariaDB: an unbuffered cursor, streamed into the sink batch by batch.
 
@@ -836,14 +939,15 @@ class IngestEngine:
                         yield _arrow_batch(columns, [_cells(row) for row in rows])
 
                 return self._stage_batches(
-                    conn, batches(), on_batch=on_batch, sink=sink, create=create
+                    conn, batches(), on_batch=on_batch, sink=sink, create=create,
+                    should_cancel=should_cancel,
                 )
         finally:
             connection.close()
 
     def _stage_mongodb(
         self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, on_batch=None, sink=None, create=False,
+        limit, on_batch=None, sink=None, create=False, should_cancel=None,
     ) -> int:
         """MongoDB: documents in batches, BSON types kept (dates, ints, floats)."""
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
@@ -894,14 +998,15 @@ class IngestEngine:
                     yield _arrow_batch(keys, rows)
 
             return self._stage_batches(
-                conn, batches(), on_batch=on_batch, sink=sink, create=create
+                conn, batches(), on_batch=on_batch, sink=sink, create=create,
+                should_cancel=should_cancel,
             )
         finally:
             client.close()
 
     def _stage_oracle(
         self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, on_batch=None, sink=None, create=False,
+        limit, on_batch=None, sink=None, create=False, should_cancel=None,
     ) -> int:
         """Oracle: cursor batches, column names lowercased as the rest of the platform is."""
         host = resolve_connection_host(connection_params["host"], connection_params["port"])
@@ -940,14 +1045,15 @@ class IngestEngine:
                     yield _arrow_batch(columns, [_cells(row) for row in rows])
 
             return self._stage_batches(
-                conn, batches(), on_batch=on_batch, sink=sink, create=create
+                conn, batches(), on_batch=on_batch, sink=sink, create=create,
+                should_cancel=should_cancel,
             )
         finally:
             connection.close()
 
     def _stage_api(
         self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, on_batch=None, sink=None, create=False,
+        limit, on_batch=None, sink=None, create=False, should_cancel=None,
     ) -> int:
         """A REST endpoint returns one document, so it is staged in one batch."""
         from app.engines.introspector import Introspector
@@ -1006,7 +1112,8 @@ class IngestEngine:
                 values.append(value)
             rows.append(tuple(values))
         return self._stage_batches(
-            conn, [_arrow_batch(columns, rows)], on_batch=on_batch, sink=sink, create=create
+            conn, [_arrow_batch(columns, rows)], on_batch=on_batch, sink=sink, create=create,
+            should_cancel=should_cancel,
         )
 
 

@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import json
+import threading
 import uuid
 import time
 from datetime import datetime, timezone
@@ -56,6 +57,20 @@ class IngestJobManager:
         self._subscribers: Dict[str, List[asyncio.Queue]] = defaultdict(list)
         self._lock = asyncio.Lock()
         self._last_persist: Dict[str, float] = {}
+        # The DuckDB connection each running job is using. A load that is one long
+        # statement (the whole Postgres path) has no batch boundary at which to notice a
+        # cancel flag, so cancelling has to interrupt the statement itself.
+        self._live_connections: Dict[str, Any] = {}
+        self._connection_lock = threading.Lock()
+
+    def _attach_connection(self, job_id: str, conn: Any) -> None:
+        """Remembers a job's live connection. Called from the ingestion thread."""
+        with self._connection_lock:
+            self._live_connections[job_id] = conn
+
+    def _detach_connection(self, job_id: str) -> None:
+        with self._connection_lock:
+            self._live_connections.pop(job_id, None)
 
     def _persist(self, job: IngestJob) -> bool:
         """Mirrors the job into task history (M3).
@@ -241,6 +256,17 @@ class IngestJobManager:
         job.status = "cancelled"
         job.completed_at = datetime.now(timezone.utc).isoformat()
         self._persist(job)
+
+        # Break the statement that is running right now, if any. Without this a cancel
+        # during a single-statement load (the Postgres path) waited for the whole table.
+        with self._connection_lock:
+            live = self._live_connections.get(job_id)
+        if live is not None:
+            try:
+                live.interrupt()
+            except Exception as exc:
+                self.append_log(job_id, f"Could not interrupt the running statement: {exc}")
+
         self.append_log(job_id, "⚠️ Ingestion cancelled by user. Terminating remaining operations...")
 
         event_payload = json.dumps({
@@ -357,6 +383,10 @@ class IngestJobManager:
                 write_strategy=write_strategy,
                 primary_key=primary_key,
                 on_batch=self._batch_progress(job_id),
+                # Polled between batches, and the connection is published so cancel_job can
+                # interrupt a single-statement load.
+                should_cancel=lambda: job.is_cancelled,
+                on_connection=lambda conn: self._attach_connection(job_id, conn),
             )
 
             job.results.append(res)
@@ -376,19 +406,36 @@ class IngestJobManager:
             self.update_progress(job_id, current_phase="Finished", completed_tables=1)
 
         except Exception as e:
-            job.status = "failed"
-            job.failed_tables = 1
-            # Whatever was staged was never committed: nothing is written until the final
-            # statement runs, and that is the statement that just failed.
-            job.staged_rows = 0
-            job.completed_at = datetime.now(timezone.utc).isoformat()
-            job.duration_ms = int((time.time() - start_time) * 1000)
-            err_msg = str(e)
-            job.errors.append({"table": entity, "error": err_msg})
-            self.append_log(job_id, f"✗ Ingestion failed for '{entity}': {err_msg}")
-            self.update_progress(job_id, current_phase="Failed")
+            # A cancel surfaces here as IngestCancelled (raised between batches) or as
+            # DuckDB's interrupt exception (raised inside a single statement). Either way
+            # nothing was committed, so it is not a failure and is not counted as one.
+            if job.is_cancelled:
+                job.status = "cancelled"
+                job.failed_tables = 0
+                job.staged_rows = 0
+                job.completed_at = datetime.now(timezone.utc).isoformat()
+                job.duration_ms = int((time.time() - start_time) * 1000)
+                self.append_log(
+                    job_id,
+                    f"Ingestion of '{entity}' stopped before it was committed; "
+                    "the table was left as it was.",
+                )
+                self.update_progress(job_id, current_phase="Cancelled")
+            else:
+                job.status = "failed"
+                job.failed_tables = 1
+                # Whatever was staged was never committed: nothing is written until the final
+                # statement runs, and that is the statement that just failed.
+                job.staged_rows = 0
+                job.completed_at = datetime.now(timezone.utc).isoformat()
+                job.duration_ms = int((time.time() - start_time) * 1000)
+                err_msg = str(e)
+                job.errors.append({"table": entity, "error": err_msg})
+                self.append_log(job_id, f"✗ Ingestion failed for '{entity}': {err_msg}")
+                self.update_progress(job_id, current_phase="Failed")
 
         finally:
+            self._detach_connection(job_id)
             complete_payload = json.dumps({"type": "complete", "job": job.to_dict()})
             for q in list(self._subscribers.get(job_id, [])):
                 try:
@@ -442,6 +489,8 @@ class IngestJobManager:
                         on_batch=self._batch_progress(
                             job_id, label=f"Extracting ({idx + 1}/{len(tables)})"
                         ),
+                        should_cancel=lambda: job.is_cancelled,
+                        on_connection=lambda conn: self._attach_connection(job_id, conn),
                     )
                     t_duration = int((time.time() - table_start) * 1000)
                     job.results.append(res)
@@ -455,11 +504,21 @@ class IngestJobManager:
                         f"(+{res.get('new_rows_extracted', 0)} new) [{t_duration}ms] → {res.get('file_path')}"
                     )
                 except Exception as table_err:
+                    if job.is_cancelled:
+                        # Not a failure: the operator stopped it, and nothing was committed.
+                        job.staged_rows = 0
+                        self.append_log(
+                            job_id,
+                            f"  ⏹ '{table_name}' stopped before it was committed.",
+                        )
+                        break
                     err_msg = str(table_err)
                     job.failed_tables += 1
                     job.staged_rows = 0
                     job.errors.append({"table": table_name, "error": err_msg})
                     self.append_log(job_id, f"  ✗ Failed '{table_name}': {err_msg}")
+                finally:
+                    self._detach_connection(job_id)
 
                 self.update_progress(
                     job_id,
