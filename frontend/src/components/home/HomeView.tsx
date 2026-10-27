@@ -123,12 +123,6 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const notebooksCount = notebooks.length;
   const isMarimoRunning = notebookStatus?.is_running ?? false;
 
-  const latestPipelineRun =
-    [...pipelines]
-      .filter((p) => p.last_run_at)
-      .sort((a, b) => new Date(b.last_run_at!).getTime() - new Date(a.last_run_at!).getTime())[0] ??
-    null;
-
   const runningServicesCount = services.filter((s) => s.status === 'running' || s.status === 'connected').length;
 
   const handleOpenRunLogs = async (run: PipelineExecution) => {

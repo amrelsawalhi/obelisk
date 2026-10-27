@@ -6,7 +6,6 @@ import {
   FolderOpen,
   Layers,
   RefreshCw,
-  Table2,
 } from 'lucide-react';
 import { tableSizeLabel } from '../../lib/format';
 import { buildDirectoryTree, type DirectoryTreeNode } from '../../lib/catalogTree';
@@ -16,7 +15,6 @@ import {
   TreeGroupLabel,
   TreeMessage,
   TreeRow,
-  treeIndent,
 } from '../common/Tree';
 
 export interface TableSelectionInfo {

@@ -6,7 +6,6 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Server,
   Edit2,
   Trash2,
   Activity,
