@@ -129,6 +129,32 @@ class SupersetSyncResponse(BaseModel):
     sources: List[Dict[str, Any]]
 
 
+class SupersetDashboardSummary(BaseModel):
+    id: Optional[int] = None
+    title: str
+    path: Optional[str] = None
+    changed_on: Optional[str] = None
+    published: bool = False
+
+
+class SupersetInventoryResponse(BaseModel):
+    """What Superset actually holds, read from Superset's own API.
+
+    ``available`` is False when Superset could not be read at all (not deployed, not
+    running, login rejected) — and then ``detail`` says which, because a launcher that
+    shows "0 dashboards" for a container that is still initializing teaches the operator
+    to distrust every number on the page. ``counts`` values are None when that one
+    resource could not be listed; ``detail`` then carries the reason.
+    """
+
+    available: bool
+    detail: Optional[str] = None
+    counts: Dict[str, Optional[int]] = {}
+    dashboards: List[SupersetDashboardSummary] = []
+    checked_at: Optional[str] = None
+
+
+
 class HostSpecsResponse(BaseModel):
     total_ram_bytes: int
     total_ram_gb: float
@@ -641,6 +667,27 @@ async def deploy_local_service(
             if ready:
                 break
             await asyncio.sleep(2.0)
+
+        # Trigger restart after initialization if the blueprint requires it (e.g. Superset
+        # needs a clean process boot after driver installation and migrations).
+        if ready and bp.restart_after_init:
+            deploy_tracker.update(svc_name, phase="initializing",
+                                  detail="restarting container to apply installed drivers and configurations")
+            await asyncio.to_thread(docker_mgr.restart_service, svc_name)
+            deploy_tracker.update(svc_name, phase="probing", detail="waiting for service after restart")
+            ready = False
+            deadline = time.time() + bp.probe_timeout_seconds
+            while time.time() < deadline:
+                probe = await asyncio.to_thread(
+                    docker_mgr.probe_readiness, svc_name, host_port, username, database,
+                    password=credentials.password if credentials else None,
+                )
+                ready = probe["ready"]
+                probe_detail = probe["detail"]
+                if ready:
+                    break
+                await asyncio.sleep(2.0)
+
         status_value = "ready" if ready else "starting"
 
         # Second commit records the probe's verdict; for a database service the
@@ -728,6 +775,18 @@ async def preview_superset_sources(db: AsyncSession = Depends(get_db)):
     endpoint's literal path and not a service name.
     """
     return await SupersetSync().plan(db)
+
+
+@router.get("/superset/inventory", response_model=SupersetInventoryResponse)
+async def get_superset_inventory(db: AsyncSession = Depends(get_db)):
+    """Counts and recent dashboards, straight from Superset's REST API.
+
+    Read-only and never fatal: when Superset is not deployed, not running or refuses the
+    admin login, the payload says so in ``detail`` and the page renders that sentence
+    instead of four zeros. Declared before the ``/{service_name}/...`` routes, like the
+    two below, so ``superset`` here is a literal path and not a service name.
+    """
+    return await SupersetSync().inventory(db)
 
 
 @router.post("/superset/sync", response_model=SupersetSyncResponse)
@@ -828,6 +887,79 @@ async def start_service(service_name: str, db: AsyncSession = Depends(get_db)):
         except Exception:
             # A vault we cannot open is not a reason to refuse to start the container;
             # the probe simply cannot authenticate and will say so.
+            password = None
+
+    ready = False
+    probe_detail = "no probe configured"
+    deadline = time.time() + bp.probe_timeout_seconds
+    while time.time() < deadline:
+        probe = await asyncio.to_thread(
+            docker_mgr.probe_readiness, svc_name, host_port, username, database,
+            password=password,
+        )
+        ready = probe["ready"]
+        probe_detail = probe["detail"]
+        if ready:
+            break
+        await asyncio.sleep(2.0)
+
+    if svc_record:
+        svc_record.status = "ready" if ready else "starting"
+        svc_record.deployment_type = "local"
+        svc_record.container_id = container.id
+        svc_record.port = host_port
+        await db.commit()
+
+    return ServiceLifecycleResponse(
+        service_name=svc_name, status="ready" if ready else "starting",
+        ready=ready, message=probe_detail,
+    )
+
+
+@router.post("/{service_name}/restart", response_model=ServiceLifecycleResponse)
+async def restart_service(service_name: str, db: AsyncSession = Depends(get_db)):
+    """Restarts a running managed container with its existing configuration."""
+    svc_name = service_name.lower()
+    bp = get_blueprint(svc_name)
+    if svc_name not in SUPPORTED_SERVICES or bp is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Unknown service '{service_name}'.")
+
+    stmt = select(ServiceConfig).where(ServiceConfig.service_name == svc_name)
+    svc_record = (await db.execute(stmt)).scalar_one_or_none()
+    config_json: Dict[str, Any] = dict(svc_record.config_json or {}) if svc_record else {}
+
+    if bp.run_mode == "process":
+        try:
+            await asyncio.to_thread(process_manager.stop, svc_name)
+            await asyncio.to_thread(process_manager.start, svc_name, bp)
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"Failed to restart '{svc_name}': {e}")
+        if svc_record:
+            svc_record.status = "running"
+            await db.commit()
+        return ServiceLifecycleResponse(
+            service_name=svc_name, status="running", ready=True,
+            message=f"{bp.display_name} restarted",
+        )
+
+    try:
+        container = await asyncio.to_thread(docker_mgr.restart_service, svc_name)
+    except LookupError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Failed to restart '{svc_name}': {e}")
+
+    host_port = get_service_host_port(svc_name, container, config_json.get("host_port"))
+    username = config_json.get("username")
+    database = config_json.get("database")
+    password: Optional[str] = None
+    if config_json.get("encrypted_password"):
+        try:
+            password = decrypt(config_json["encrypted_password"])
+        except Exception:
             password = None
 
     ready = False

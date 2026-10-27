@@ -49,6 +49,7 @@ interface CatalogTreeProps {
   onOpenBatchIngest?: (connectionId: string, connectionName: string, schemaName?: string, tables?: CatalogTable[]) => void;
   onOpenInQuery?: (sql: string) => void;
   onOpenInNotebook?: (table: CatalogTable, fqn?: string) => void;
+  width?: number;
 }
 
 export const CatalogTree: React.FC<CatalogTreeProps> = ({
@@ -63,6 +64,7 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
   onOpenBatchIngest,
   onOpenInQuery,
   onOpenInNotebook,
+  width,
 }) => {
   const [expandedNodes, setExpandedNodes] = useState<Record<string, boolean>>({
     lakehouse: true,
@@ -341,7 +343,10 @@ export const CatalogTree: React.FC<CatalogTreeProps> = ({
   const availableFolders = (lakehouseNode?.directories || []).map((d) => d.path);
 
   return (
-    <div className="w-80 border-r border-slate-200 bg-white flex flex-col shrink-0 h-full select-none relative">
+    <div
+      style={width != null ? { width: `${width}px` } : undefined}
+      className={`${width != null ? '' : 'w-80'} border-r border-slate-200 bg-white flex flex-col shrink-0 h-full select-none relative`}
+    >
       {/* Search & Actions Bar */}
       <div className="shrink-0 space-y-2 border-b border-slate-200 px-3 py-2">
         <div className="flex items-center justify-between">

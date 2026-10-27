@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Database, Plus } from 'lucide-react';
 import { api } from '../../lib/api';
@@ -40,6 +40,66 @@ export const CatalogView: React.FC = () => {
   const [isAddConnectionOpen, setIsAddConnectionOpen] = useState(false);
   const [editingConnection, setEditingConnection] = useState<Connection | null>(null);
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
+
+  // Resizable Catalog Tree width with localStorage persistence
+  const [treeWidth, setTreeWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('obelisk_catalog_tree_width');
+      if (saved) {
+        const parsed = parseInt(saved, 10);
+        if (!isNaN(parsed) && parsed >= 220 && parsed <= 900) {
+          return parsed;
+        }
+      }
+    } catch {}
+    return 320;
+  });
+
+  const isResizingRef = useRef(false);
+
+  const handleStartTreeResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    isResizingRef.current = true;
+    const startX = e.clientX;
+    const startWidth = treeWidth;
+
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      if (!isResizingRef.current) return;
+      const delta = moveEvent.clientX - startX;
+      const maxAllowed = Math.max(380, Math.min(900, window.innerWidth - 380));
+      const nextWidth = Math.max(220, Math.min(maxAllowed, startWidth + delta));
+      setTreeWidth(nextWidth);
+    };
+
+    const onMouseUp = () => {
+      if (isResizingRef.current) {
+        isResizingRef.current = false;
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        setTreeWidth((finalWidth) => {
+          try {
+            localStorage.setItem('obelisk_catalog_tree_width', String(finalWidth));
+          } catch {}
+          return finalWidth;
+        });
+      }
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  };
+
+  useEffect(() => {
+    return () => {
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, []);
 
   const fetchCatalog = async (force = false) => {
     try {
@@ -144,6 +204,7 @@ export const CatalogView: React.FC = () => {
       <CatalogTree
         nodes={catalogNodes}
         loading={catalogLoading}
+        width={treeWidth}
         onRefresh={() => fetchCatalog(true)}
         selectedTableKey={selectedTableKey}
         onSelectTable={(sourceId, table, isLakehouse, sourceName) => {
@@ -165,6 +226,19 @@ export const CatalogView: React.FC = () => {
         }}
         onOpenInQuery={openInQuery}
         onOpenInNotebook={handleOpenInNotebook}
+      />
+
+      {/* Draggable Catalog Tree Splitter Handle */}
+      <div
+        onMouseDown={handleStartTreeResize}
+        onDoubleClick={() => {
+          setTreeWidth(320);
+          try {
+            localStorage.setItem('obelisk_catalog_tree_width', '320');
+          } catch {}
+        }}
+        className="w-1 -ml-0.5 hover:bg-slate-300 active:bg-slate-400 cursor-col-resize shrink-0 transition-colors select-none z-10"
+        title="Drag to resize Catalog Tree (double-click to reset)"
       />
 
       {/* Right Table Preview / Schema Viewer */}

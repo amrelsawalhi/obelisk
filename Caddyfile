@@ -9,10 +9,10 @@
         reverse_proxy obelisk-core:8000
     }
 
-    # Apache Superset BI & Dashboards (Configured with SUPERSET_WEBSERVER_BASEURL=/superset/)
-    handle /superset/* {
-        reverse_proxy obelisk_superset:8088
-    }
+    # Apache Superset BI runs at its own address (host:8088) and is linked there, not
+    # proxied under a subpath: Superset needs SUPERSET_WEBSERVER_BASEURL *and*
+    # APPLICATION_ROOT to serve under one, and a half-configured subpath answered a
+    # Flask 404 for every page. There is deliberately no /superset route here.
 
     # Reactive Marimo Notebook Server (Configured with --base-url /notebooks)
     handle /notebooks/* {

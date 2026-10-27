@@ -49,6 +49,8 @@ import type { NavigationTab } from './components/layout/Sidebar';
 interface RouteState {
   sql?: string;
   target?: NotebookTarget;
+  /** Service to open on arrival, so /dashboards can hand off to Catalog → Services. */
+  service?: string;
 }
 
 /** Fills the main content area exactly like the previous per-tab wrapper did. */
@@ -67,11 +69,12 @@ const RouteFallback: React.FC<{ label?: string }> = ({ label = 'Loading' }) => (
 );
 
 /**
- * Views that host an iframe: Superset and Marimo keep polling, animating and
- * holding their own render tree behind `visibility: hidden`, so they are the most
- * expensive thing to park - and the first thing to let go of when off screen.
+ * Views that host an iframe: Marimo keeps polling, animating and holding its own
+ * render tree behind `visibility: hidden`, so it is the most expensive thing to park -
+ * and the first thing to let go of when off screen. Dashboards is not on this list any
+ * more: it links to Superset instead of framing it, so it parks like any other view.
  */
-const FRAME_HOSTING_TABS: NavigationTab[] = ['dashboards', 'notebooks'];
+const FRAME_HOSTING_TABS: NavigationTab[] = ['notebooks'];
 
 /** Parked views that hold unsaved work, so they are never evicted for a cheaper one. */
 const STATEFUL_WORKSPACES: NavigationTab[] = ['query', 'dbt', 'pipelines'];
@@ -165,7 +168,11 @@ const AppLayout: React.FC = () => {
           />
         );
       case 'dashboards':
-        return <DashboardsView />;
+        return (
+          <DashboardsView
+            onDeploySuperset={() => navigate('/services', { state: { service: 'superset' } })}
+          />
+        );
       case 'files':
         return <FileManagerView />;
       case 'terminal':

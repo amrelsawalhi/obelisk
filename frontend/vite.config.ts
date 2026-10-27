@@ -37,10 +37,10 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
-      '/superset': {
-        target: 'http://127.0.0.1:8088',
-        changeOrigin: true,
-      },
+      // Superset is deliberately not proxied: it serves at the root of its own port and
+      // the Dashboards page links to http://<this host>:8088 directly. A '/superset'
+      // proxy here forwarded the prefix verbatim to a root-mounted app, so every request
+      // answered a Flask 404.
       '/dagster': {
         target: 'http://127.0.0.1:3000',
         changeOrigin: true,

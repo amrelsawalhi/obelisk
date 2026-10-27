@@ -272,6 +272,25 @@ class DockerManager:
             container.start()
         return container
 
+    def restart_service(self, service_name: str, timeout: int = 10) -> Optional[Container]:
+        """
+        Restarts a running managed container, preserving its configuration and volumes.
+        """
+        container = self.get_service_container(service_name)
+        if not container:
+            raise LookupError(
+                f"No managed container for '{service_name}' to restart. Deploy it first."
+            )
+        # Enforce label check
+        labels = container.attrs.get("Config", {}).get("Labels", {}) or {}
+        if labels.get(MANAGED_LABEL) != OBELISK_TAG:
+            raise ValueError(
+                f"Refusing to restart container {container.name}: missing {MANAGED_LABEL}={OBELISK_TAG}"
+            )
+        container.restart(timeout=timeout)
+        container.reload()
+        return container
+
     def destroy_service(self, service_name: str) -> None:
         """
         Removes the managed container AND permanently deletes its named data volume.

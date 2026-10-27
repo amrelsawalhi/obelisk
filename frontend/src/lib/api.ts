@@ -44,6 +44,8 @@ import type {
   ExecutionStatus,
   LakehouseDiagnostics,
   LakehouseMaintenanceResult,
+  SupersetInventory,
+  SupersetSyncReport,
 } from './types';
 
 const CLIENT_ID_STORAGE_KEY = 'obelisk_client_id';
@@ -134,6 +136,28 @@ export const api = {
    */
   startService: async (serviceName: string): Promise<{ service_name: string; status: string; ready: boolean; message?: string | null }> => {
     const res = await apiClient.post<{ service_name: string; status: string; ready: boolean; message?: string | null }>(`/services/${serviceName}/start`);
+    return res.data;
+  },
+  restartService: async (serviceName: string): Promise<{ service_name: string; status: string; ready: boolean; message?: string | null }> => {
+    const res = await apiClient.post<{ service_name: string; status: string; ready: boolean; message?: string | null }>(`/services/${serviceName}/restart`);
+    return res.data;
+  },
+
+  // Superset (BI)
+  // The inventory is read from Superset's own API, so it is the only place that knows
+  // how many dashboards and charts exist. It degrades to `available: false` instead of
+  // failing, which is why it is safe to call on every visit to the Dashboards page.
+  getSupersetInventory: async (): Promise<SupersetInventory> => {
+    const res = await apiClient.get<SupersetInventory>('/services/superset/inventory');
+    return res.data;
+  },
+  /** Dry run: the datasources a sync would push, with passwords masked. */
+  getSupersetSources: async (): Promise<SupersetSyncReport> => {
+    const res = await apiClient.get<SupersetSyncReport>('/services/superset/sources');
+    return res.data;
+  },
+  syncSupersetSources: async (): Promise<SupersetSyncReport> => {
+    const res = await apiClient.post<SupersetSyncReport>('/services/superset/sync');
     return res.data;
   },
 

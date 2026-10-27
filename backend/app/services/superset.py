@@ -33,6 +33,7 @@ import os
 import re
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -63,6 +64,14 @@ _ENGINE_NAMES = {
 }
 
 _MASK_RE = re.compile(r"://([^/@:]+):([^@]*)@")
+
+# How many dashboards the launcher lists. The page is a starting point, not a browser:
+# Superset itself has the full, searchable list one click away.
+_RECENT_DASHBOARDS = 5
+
+# The four resources counted on the launcher, in the order they are shown.
+_INVENTORY_RESOURCES = ("dashboard", "chart", "dataset", "database")
+
 
 
 def mask_uri(uri: str) -> str:
@@ -487,6 +496,128 @@ class SupersetSync:
             if owned:
                 await client.aclose()
 
+    # -- inventory ----------------------------------------------------------
+    #
+    # The Dashboards page says what Superset actually contains. Every number here comes
+    # from Superset's own REST API, read with the same vaulted admin account the sync
+    # writes with, so nothing is guessed from local state: a zero means an empty
+    # Superset, and a launcher that cannot count says why instead of showing zero.
+    #
+    # It never raises. The page is the first thing an operator opens after a deploy, and
+    # a container that is still running ``superset init`` must produce a sentence, not a
+    # 500 the frontend has to apologise for.
+
+    async def inventory(self, session: AsyncSession) -> Dict[str, Any]:
+        """Counts and the most recent dashboards. Degrades to ``available: False``."""
+        try:
+            username, password, _ = await self._connect(session)
+        except SupersetError as exc:
+            return _inventory_unavailable(str(exc))
+
+        client, owned = await self._open()
+        try:
+            auth = await self._login(client, username, password)
+        except (httpx.HTTPError, SupersetError) as exc:
+            if owned:
+                await client.aclose()
+            return _inventory_unavailable(f"Superset did not answer at {self._base_url}: {exc}")
+
+        try:
+            counts: Dict[str, Optional[int]] = {}
+            detail: Optional[str] = None
+            for resource in _INVENTORY_RESOURCES:
+                counts[resource + "s"], note = await self._count(client, auth, resource)
+                detail = detail or note
+            dashboards, note = await self._recent_dashboards(client, auth, _RECENT_DASHBOARDS)
+            detail = detail or note
+        except Exception as exc:
+            return _inventory_unavailable(f"Could not read Superset inventory: {exc}")
+        finally:
+            if owned:
+                await client.aclose()
+        return {
+            "available": True,
+            "detail": detail,
+            "counts": counts,
+            "dashboards": dashboards,
+            "checked_at": _utc_now(),
+        }
+
+    async def _count(
+        self, client: httpx.AsyncClient, auth: Auth, resource: str
+    ) -> tuple[Optional[int], Optional[str]]:
+        """One resource's ``count``, or None and the reason it could not be read.
+
+        ``page_size=1`` asks Superset to answer with a count instead of a page: the
+        number is exact and the payload stays tiny even on a Superset with thousands of
+        charts. A resource the admin cannot list is left blank rather than failing the
+        other three — a partial inventory is more useful than none.
+        """
+        query = json.dumps({"page": 0, "page_size": 1})
+        try:
+            response = await client.get(
+                f"/api/v1/{resource}/", params={"q": query}, headers=self._auth(auth)
+            )
+        except httpx.HTTPError as exc:
+            return None, f"{resource}s: {exc}"
+        if response.status_code != 200:
+            return None, f"{resource}s: {_brief(response)}"
+        try:
+            data = response.json()
+            if isinstance(data, dict) and "count" in data:
+                return int(data["count"]), None
+            return None, f"{resource}s: no count in the response"
+        except (TypeError, ValueError, AttributeError):
+            return None, f"{resource}s: no count in the response"
+
+    async def _recent_dashboards(
+        self, client: httpx.AsyncClient, auth: Auth, limit: int
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        """The most recently changed dashboards, newest first. Titles and links only."""
+        query = json.dumps(
+            {
+                "page": 0,
+                "page_size": limit,
+                # ``changed_on`` rather than ``id``: the operator wants what somebody
+                # touched last, not the highest primary key.
+                "order_column": "changed_on",
+                "order_direction": "desc",
+            }
+        )
+        try:
+            response = await client.get(
+                "/api/v1/dashboard/", params={"q": query}, headers=self._auth(auth)
+            )
+        except httpx.HTTPError as exc:
+            return [], f"dashboards: {exc}"
+        if response.status_code != 200:
+            return [], f"dashboards: {_brief(response)}"
+
+        try:
+            data = response.json()
+            rows = (data.get("result") if isinstance(data, dict) else []) or []
+        except Exception as exc:
+            return [], f"dashboards: {exc}"
+
+        summaries: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict) or row.get("id") is None:
+                continue
+            changed = row.get("changed_on_utc") or row.get("changed_on")
+            summaries.append(
+                {
+                    "id": row["id"],
+                    "title": row.get("dashboard_title") or f"Dashboard {row['id']}",
+                    # Rebuilt from the id on purpose: Superset's own ``url`` carries
+                    # whatever base path the container was started with, and this page
+                    # links to Superset at its own address instead.
+                    "path": f"/superset/dashboard/{row['id']}/",
+                    "changed_on": changed if isinstance(changed, str) else None,
+                    "published": bool(row.get("published")),
+                }
+            )
+        return summaries, None
+
     @staticmethod
     def _report(ok: bool, detail: str, sources: List[SourceResult]) -> Dict[str, Any]:
         counts = Counter(s.action for s in sources)
@@ -507,6 +638,22 @@ class SupersetSync:
             },
             "sources": [s.as_dict() for s in sources],
         }
+
+
+def _utc_now() -> str:
+    """When the inventory was read, so the UI can say how stale a number is."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _inventory_unavailable(detail: str) -> Dict[str, Any]:
+    """The shape the launcher gets when Superset cannot be read at all."""
+    return {
+        "available": False,
+        "detail": detail,
+        "counts": {},
+        "dashboards": [],
+        "checked_at": _utc_now(),
+    }
 
 
 def _brief(response: httpx.Response) -> str:

@@ -40,7 +40,7 @@ from app.models.connection import Connection
 from app.models.service_config import ServiceConfig
 
 SERVICE = "postgres"
-EXPECTED_NAME = "PostgreSQL 16 (local)"
+EXPECTED_NAME = f"{get_blueprint(SERVICE).display_name} (local)"
 
 
 class _Container:
@@ -86,6 +86,13 @@ class Engine:
         self.started.append(service_name)
         if self.existing is None:
             raise LookupError(f"No managed container for '{service_name}' to start. Deploy it first.")
+        self.existing.status = "running"
+        return self.existing
+
+    def restart_service(self, service_name, timeout=10):
+        self.started.append(service_name)
+        if self.existing is None:
+            raise LookupError(f"No managed container for '{service_name}' to restart. Deploy it first.")
         self.existing.status = "running"
         return self.existing
 
@@ -472,6 +479,28 @@ async def test_starting_something_that_was_never_deployed_is_not_found(
         assert response.status_code == 404, response.text
         # The engine refused, and the route reported it as "nothing deployed here".
         assert "Deploy it first" in response.json()["detail"]
+    finally:
+        await _forget_the_service()
+
+
+@pytest.mark.asyncio
+async def test_restart_route_restarts_container_and_probes(
+    no_binding, engine, free_port
+) -> None:
+    """Restarting invokes docker restart, preserves credentials and probes readiness."""
+    await _forget_the_service()
+    try:
+        deploy_res = await _deploy(5993)
+        assert deploy_res.status_code == 200
+        engine.existing = _Container("fake-postgres")
+
+        response = await _call("restart")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["ready"] is True
+        assert body["service_name"] == SERVICE
+        assert body["status"] == "ready"
+        assert engine.started[-1] == SERVICE
     finally:
         await _forget_the_service()
 

@@ -1128,7 +1128,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
         </aside>
         <div
           {...railHandle}
-          className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-sky-300"
+          className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-slate-300 active:bg-slate-400"
           aria-label="Resize pipeline list"
         />
 
@@ -1296,7 +1296,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 </div>
                 <div
                   {...inspectorHandle}
-                  className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-sky-300"
+                  className="w-1 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-slate-300 active:bg-slate-400"
                   aria-label="Resize step inspector"
                 />
                 <div
@@ -1331,7 +1331,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                 <>
                   <div
                     {...dockHandle}
-                    className={`h-1 shrink-0 cursor-row-resize transition-colors hover:bg-sky-300 ${
+                    className={`h-1 shrink-0 cursor-row-resize transition-colors hover:bg-slate-300 active:bg-slate-400 ${
                       dockExpanded ? "hidden" : "bg-slate-200"
                     }`}
                     aria-label="Resize log panel"

@@ -5,6 +5,7 @@ import {
   Zap,
   Play,
   StopCircle,
+  RotateCcw,
   ExternalLink,
   Terminal,
   Trash2,
@@ -64,7 +65,8 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
   const [error, setError] = useState<string | null>(null);
   // Destroying a service deletes its volume, so it asks in-app where the warning is readable.
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
-  const [expanded, setExpanded] = useState(false);
+  // Deployment configuration is shown by default so operators immediately see customizable settings.
+  const [expanded, setExpanded] = useState(true);
   const [deployResult, setDeployResult] = useState<DeployLocalResponse | null>(null);
   const [deployProgress, setDeployProgress] = useState<DeployProgressResponse | null>(null);
   const [deployError, setDeployError] = useState<string | null>(null);
@@ -174,6 +176,22 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
       onChanged();
     } catch (e: unknown) {
       setError(extractErrorMessage(e, `Failed to start ${service.name}`));
+    } finally {
+      setOperating(false);
+    }
+  };
+
+  const handleRestart = async () => {
+    setOperating(true);
+    setError(null);
+    try {
+      const res = await api.restartService(service.name);
+      if (!res.ready) {
+        setError(`${service.display_name} restarted, but it is not answering yet: ${res.message || 'no detail'}`);
+      }
+      onChanged();
+    } catch (e: unknown) {
+      setError(extractErrorMessage(e, `Failed to restart ${service.name}`));
     } finally {
       setOperating(false);
     }
@@ -290,10 +308,25 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
               <div className="space-y-3">
                 <div className="flex items-center gap-2 flex-wrap">
                   {isLocalRunning ? (
-                    <button onClick={handleStop} disabled={operating} className="px-3.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-semibold flex items-center gap-1.5 transition-all disabled:opacity-50">
-                      <StopCircle className="w-3.5 h-3.5" />
-                      <span>{operating ? 'Stopping...' : isProcess ? 'Stop Engine' : 'Stop Container'}</span>
-                    </button>
+                    <>
+                      <button
+                        onClick={handleRestart}
+                        disabled={operating}
+                        className="px-3.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-all disabled:opacity-50"
+                        title="Restart this service container"
+                      >
+                        <RotateCcw className={`w-3.5 h-3.5 ${operating ? 'animate-spin text-sky-600' : 'text-slate-500'}`} />
+                        <span>{operating ? 'Restarting...' : 'Restart'}</span>
+                      </button>
+                      <button
+                        onClick={handleStop}
+                        disabled={operating}
+                        className="px-3.5 py-1.5 rounded-lg border border-red-200 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-semibold flex items-center gap-1.5 transition-all disabled:opacity-50"
+                      >
+                        <StopCircle className="w-3.5 h-3.5" />
+                        <span>{operating ? 'Stopping...' : isProcess ? 'Stop Engine' : 'Stop Container'}</span>
+                      </button>
+                    </>
                   ) : containerExists ? (
                     <button onClick={handleStart} disabled={operating || (engineDown && !isProcess)} className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-all disabled:opacity-50" title="Start this container exactly as it was deployed — same credentials, same data">
                       <Play className="w-3.5 h-3.5" />
@@ -307,9 +340,13 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
                   )}
 
                   {!isProcess && canDeploy && (
-                    <button onClick={() => setExpanded((v) => !v)} className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-semibold flex items-center gap-1.5 transition-all" title={expanded ? 'Hide configuration' : 'Configure memory, port, and image'}>
+                    <button
+                      onClick={() => setExpanded((v) => !v)}
+                      className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-semibold flex items-center gap-1.5 transition-all"
+                      title={expanded ? 'Hide configuration' : 'Configure memory, port, and image'}
+                    >
                       <ChevronDown className={`w-3.5 h-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`} />
-                      <span>Configure</span>
+                      <span>{expanded ? 'Hide Config' : 'Configure'}</span>
                     </button>
                   )}
 
@@ -338,6 +375,9 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
 
                 {expanded && !isProcess && canDeploy && (
                   <div className="space-y-3 border-t border-slate-100 pt-3">
+                    <div className="flex items-center justify-between text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                      <span>Deployment Configuration</span>
+                    </div>
                     {recommendation && (
                       <div className="flex items-center justify-between text-xs text-slate-500 font-mono bg-amber-50/60 border border-amber-100 px-3 py-1.5 rounded-md">
                         <span>Recommended RAM:</span>

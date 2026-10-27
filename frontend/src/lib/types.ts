@@ -55,6 +55,48 @@ export interface DeployedCredentials {
   port?: number | null;
 }
 
+/** One row of the Superset source sync report (dry run or real run). */
+export interface SupersetSourceReport {
+  name: string;
+  // pending | would-upsert | created | updated | deleted | absent | skipped | failed
+  action: string;
+  detail: string;
+  /** Masked SQLAlchemy URI, or null when none could be built. */
+  uri?: string | null;
+}
+
+export interface SupersetSyncReport {
+  ok: boolean;
+  detail: string;
+  counts: Record<string, number>;
+  sources: SupersetSourceReport[];
+}
+
+/** A dashboard as Superset itself describes it; `path` is relative to Superset's origin. */
+export interface SupersetDashboardSummary {
+  id?: number | null;
+  title: string;
+  path?: string | null;
+  changed_on?: string | null;
+  published: boolean;
+}
+
+/**
+ * What Superset actually holds, read from its own REST API.
+ *
+ * `counts` values are null when Superset refused that one listing, and every number is
+ * absent when `available` is false — in which case no count is shown at all rather than a
+ * misleading zero.
+ */
+export interface SupersetInventory {
+  available: boolean;
+  detail?: string | null;
+  counts: Record<string, number | null>;
+  dashboards: SupersetDashboardSummary[];
+  checked_at?: string | null;
+}
+
+
 export interface DeployLocalResponse extends ServiceStatus {
   ready: boolean;
   message?: string | null;

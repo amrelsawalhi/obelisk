@@ -236,7 +236,7 @@ export const DataGrid = React.memo(function DataGrid({
                     <div
                       onMouseDown={(e) => handleColResizeStart(col, e)}
                       onDoubleClick={(e) => handleColAutoFit(col, e)}
-                      className="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize hover:bg-sky-500/80 group-hover:bg-slate-300 transition-colors z-20"
+                      className="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize hover:bg-slate-400 group-hover:bg-slate-300 transition-colors z-20"
                       title="Drag to resize • Double-click to auto-fit"
                     />
                   </th>

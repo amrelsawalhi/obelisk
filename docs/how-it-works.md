@@ -138,7 +138,8 @@ federated join behaves identically in all three.
 | `8000` | FastAPI control plane; also serves the built SPA in production. |
 | `5173` | Vite dev server (development only). |
 | `2718` | Headless Marimo notebook server. |
-| `80` | Caddy gateway (Docker Compose: `/api`, `/notebooks`, `/superset`, `/gitea`, SPA). |
+| `8088` | Apache Superset container (its own origin; not proxied by the gateway). |
+| `80` | Caddy gateway (Docker Compose: `/api`, `/notebooks`, `/gitea`, SPA). |
 | `5434` / `27018` | Demo Postgres and MongoDB from `docker-compose.sources.yml`. |
 
 There is no separate scheduler daemon: the orchestrator runs inside the API process, started

@@ -617,13 +617,236 @@ def test_the_drivers_are_installed_before_the_superset_server_starts() -> None:
     assert command.index("pip install") < command.index("run-server.sh"), (
         "the drivers must be installed before the gunicorn entrypoint is exec'd"
     )
+    assert "superset db upgrade" in command, "schema migration must run before the server boots"
+    assert "superset init" in command, "roles and permissions must be initialized before the server boots"
+    assert command.index("superset db upgrade") < command.index("run-server.sh")
+    assert command.index("superset init") < command.index("run-server.sh")
+    assert not blueprint.post_start_commands, (
+        "init sequence runs ahead of run-server.sh in command, leaving post_start_commands empty"
+    )
     assert "exec /usr/bin/run-server.sh" in command, (
         "the image's own CMD must still be honoured after the install"
-    )
-    assert not any("pip install" in cmd for cmd in blueprint.post_start_commands), (
-        "a post-start install runs after the server booted and cannot be seen by it"
     )
     assert 'python -c "import ' in command, (
         "an already-provisioned volume must not pay for pip again on every restart"
     )
+    assert blueprint.restart_after_init is True, (
+        "Superset must trigger restart after initialization so Gunicorn loads installed drivers in clean memory"
+    )
+
+
+
+# -- what Superset already holds ---------------------------------------------
+#
+# The Dashboards page shows counts and recent dashboards. Those numbers must come from
+# Superset itself, and a launcher that cannot read them must say so rather than render
+# four zeros an operator would read as "nothing here".
+
+
+class _InventoryAPI:
+    """Superset's four list endpoints, as Superset 4.x answers them.
+
+    ``page_size=1`` is the whole trick: Superset returns the exact ``count`` with a
+    one-row page, so counting never depends on how many pages exist.
+    """
+
+    def __init__(self, counts=None, dashboards=None, fail=(), login_status=200, offline=False):
+        self.counts = counts or {"dashboard": 2, "chart": 7, "dataset": 3, "database": 1}
+        self.dashboards = (
+            [
+                {
+                    "id": 9,
+                    "dashboard_title": "Revenue",
+                    "changed_on_utc": "2026-01-02T03:04:05",
+                    "published": True,
+                    # Superset's own url carries the base path it was started with.
+                    "url": "/superset/dashboard/9/",
+                },
+                {
+                    "id": 4,
+                    "dashboard_title": "Ops",
+                    "changed_on": {"__typename": "Datetime"},
+                    "published": False,
+                },
+            ]
+            if dashboards is None
+            else dashboards
+        )
+        self.fail = set(fail)
+        self.login_status = login_status
+        self.offline = offline
+        self.calls = []
+        self.queries = []
+
+    def client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(self.handle), base_url="http://superset.test"
+        )
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        if self.offline:
+            raise httpx.ConnectError("connection refused", request=request)
+        path = request.url.path
+        self.calls.append(path)
+
+        if path == "/api/v1/security/login":
+            if self.login_status != 200:
+                return httpx.Response(self.login_status, json={"message": "bad credentials"})
+            return httpx.Response(200, json={"access_token": "tok"})
+        if path == "/api/v1/security/csrf_token/":
+            return httpx.Response(200, json={"result": "csrf-token"})
+
+        resource = path.strip("/").rsplit("/", 1)[-1]
+        if resource in self.fail:
+            return httpx.Response(500, json={"message": "boom"})
+        query = json.loads(request.url.params.get("q") or "{}")
+        self.queries.append((resource, query))
+        result = self.dashboards if resource == "dashboard" else []
+        return httpx.Response(200, json={"count": self.counts[resource], "result": result})
+
+
+def _queries_for(api: _InventoryAPI, resource: str):
+    """Every ``q=`` this run sent for one resource: a count first, then the dashboard page."""
+    return [query for name, query in api.queries if name == resource]
+
+
+@pytest.mark.asyncio
+async def test_the_inventory_counts_what_superset_holds() -> None:
+    """Every number is Superset's own, asked for with a one-row page."""
+    api = _InventoryAPI()
+    await _seed([])
+    try:
+        async with AsyncSessionLocal() as session, api.client() as client:
+            inventory = await SupersetSync(client=client, docker=FakeDocker()).inventory(session)
+    finally:
+        await _unseed()
+
+    assert inventory["available"] is True
+    assert inventory["counts"] == {"dashboards": 2, "charts": 7, "datasets": 3, "databases": 1}
+    assert inventory["detail"] is None
+    assert inventory["checked_at"], "the page says how fresh a number is"
+
+    for resource in ("dashboard", "chart", "dataset", "database"):
+        assert _queries_for(api, resource)[0]["page_size"] == 1, (
+            f"{resource}s: counting must ask for one row, not a whole page"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_recent_dashboards_are_rebuilt_on_supersets_own_origin() -> None:
+    """Superset's stored ``url`` carries a base path; the launcher links to host:port.
+
+    Keeping Superset's url would reintroduce the /superset prefix the page just stopped
+    depending on, and nothing would notice until the click 404'd.
+    """
+    api = _InventoryAPI()
+    await _seed([])
+    try:
+        async with AsyncSessionLocal() as session, api.client() as client:
+            inventory = await SupersetSync(client=client, docker=FakeDocker()).inventory(session)
+    finally:
+        await _unseed()
+
+    assert inventory["dashboards"] == [
+        {
+            "id": 9,
+            "title": "Revenue",
+            "path": "/superset/dashboard/9/",
+            "changed_on": "2026-01-02T03:04:05",
+            "published": True,
+        },
+        {
+            "id": 4,
+            "title": "Ops",
+            "path": "/superset/dashboard/4/",
+            # A dict timestamp is not a string the UI can format.
+            "changed_on": None,
+            "published": False,
+        },
+    ]
+    recent = _queries_for(api, "dashboard")[-1]
+    assert recent["order_column"] == "changed_on"
+    assert recent["order_direction"] == "desc"
+    assert recent["page_size"] == 5, "the card lists five, newest first"
+
+
+@pytest.mark.asyncio
+async def test_a_blank_superset_is_zero_and_available_not_unavailable() -> None:
+    """An empty Superset is a fact; an unreachable one is a failure. The page says
+    different things for each, so they must not look the same here."""
+    api = _InventoryAPI(
+        counts={"dashboard": 0, "chart": 0, "dataset": 0, "database": 0}, dashboards=[]
+    )
+    await _seed([])
+    try:
+        async with AsyncSessionLocal() as session, api.client() as client:
+            inventory = await SupersetSync(client=client, docker=FakeDocker()).inventory(session)
+    finally:
+        await _unseed()
+
+    assert inventory["available"] is True
+    assert inventory["counts"] == {"dashboards": 0, "charts": 0, "datasets": 0, "databases": 0}
+    assert inventory["dashboards"] == []
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_superset_reports_unavailable_instead_of_zero() -> None:
+    api = _InventoryAPI(offline=True)
+    await _seed([])
+    try:
+        async with AsyncSessionLocal() as session, api.client() as client:
+            inventory = await SupersetSync(client=client, docker=FakeDocker()).inventory(session)
+    finally:
+        await _unseed()
+
+    assert inventory["available"] is False
+    assert inventory["counts"] == {}, "a number nobody could read must not be rendered as 0"
+    assert "did not answer" in inventory["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_login_is_reported_without_inventing_numbers() -> None:
+    api = _InventoryAPI(login_status=401)
+    await _seed([])
+    try:
+        async with AsyncSessionLocal() as session, api.client() as client:
+            inventory = await SupersetSync(client=client, docker=FakeDocker()).inventory(session)
+    finally:
+        await _unseed()
+
+    assert inventory["available"] is False
+    assert "login failed" in inventory["detail"]
+    assert [p for p in api.calls if p != "/api/v1/security/login"] == []
+
+
+@pytest.mark.asyncio
+async def test_one_unlistable_resource_leaves_the_others_counted() -> None:
+    """A missing permission on charts must not blank the whole card."""
+    api = _InventoryAPI(fail={"chart"})
+    await _seed([])
+    try:
+        async with AsyncSessionLocal() as session, api.client() as client:
+            inventory = await SupersetSync(client=client, docker=FakeDocker()).inventory(session)
+    finally:
+        await _unseed()
+
+    assert inventory["available"] is True
+    assert inventory["counts"]["charts"] is None, "the one that failed is unknown, not zero"
+    assert inventory["counts"]["dashboards"] == 2
+    assert "charts" in inventory["detail"]
+
+
+@pytest.mark.asyncio
+async def test_the_inventory_is_never_read_when_superset_is_not_deployed() -> None:
+    api = _InventoryAPI()
+    await _seed([], deploy_superset=False)
+    try:
+        async with AsyncSessionLocal() as session, api.client() as client:
+            inventory = await SupersetSync(client=client, docker=FakeDocker()).inventory(session)
+    finally:
+        await _unseed()
+
+    assert inventory["available"] is False
+    assert "not deployed" in inventory["detail"]
+    assert api.calls == [], "nothing may be sent when there is no Superset to ask"
 

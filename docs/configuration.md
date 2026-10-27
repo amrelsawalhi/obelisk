@@ -54,8 +54,9 @@ docker compose up --build -d
 ```
 
 Builds `obelisk-core` from `backend/Dockerfile` and a Caddy gateway from
-`Dockerfile.gateway`; the gateway fronts `/api`, `/notebooks`, `/superset` and `/gitea` and
-serves the SPA on `:80`.
+`Dockerfile.gateway`; the gateway fronts `/api`, `/notebooks` and `/gitea` and
+serves the SPA on `:80`. Apache Superset is not proxied: it is linked at its own
+address (`:8088`), which is the only origin it serves.
 
 ### systemd (Linux servers)
 

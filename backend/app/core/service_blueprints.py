@@ -55,6 +55,7 @@ class ServiceBlueprint:
     web_ui: bool = False                         # primary host port serves a browsable web UI
     web_ui_path: Optional[str] = None             # relative gateway subpath (e.g. "/gitea") served by Caddy / Vite proxy
     post_start_commands: List[str] = field(default_factory=list)  # exec'd after container start (init flows)
+    restart_after_init: bool = False             # triggers container restart after first boot & init to load drivers cleanly
     credential_username: Optional[str] = None     # username shown/registered for generated credentials
     credential_database: Optional[str] = None     # database shown/registered for generated credentials
     build_dockerfile: Optional[str] = None       # local image build instead of registry pull
@@ -68,7 +69,7 @@ class ServiceBlueprint:
 _BLUEPRINTS: List[ServiceBlueprint] = [
     ServiceBlueprint(
         name="postgres",
-        display_name="PostgreSQL 16",
+        display_name="obelisk_postgres",
         description="Relational warehouse for dbt marts and staging.",
         category="Warehouse",
         image="postgres:16-alpine",
@@ -165,40 +166,42 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
         # it exists when the interpreter starts, and a fresh volume has no ``pylibs`` yet.
         env={
             "SUPERSET_SECRET_KEY": "__GENERATED__",
-            "SUPERSET_WEBSERVER_BASEURL": "/superset/",
-            "APPLICATION_ROOT": "/superset",
             "PYTHONPATH": "/app/pythonpath:/app/superset_home/pylibs",
         },
         # Superset's image ships no database drivers, and it resolves (and caches) an engine
-        # spec the first time it is asked for one — at boot. A server that starts before the
-        # drivers land keeps answering every datasource with "Connection failed, please check
-        # your connection settings" (``Could not load database driver: PostgresEngineSpec``)
-        # until it is restarted, which is exactly what a fresh install must not do. So the
-        # install runs *ahead of* the server instead of from post_start_commands, where it
-        # arrived too late. The import guard keeps a restart of an already-provisioned volume
-        # from paying for pip again (and keeps restarts working on an offline host).
-        # ``--no-deps`` keeps pip from shadowing the urllib3/zstandard/certifi the server
-        # already runs on. ``/usr/bin/run-server.sh`` is this image's own CMD: setting
-        # ``command`` replaces it, so it is exec'd explicitly to get the identical launch.
+        # spec the first time it is asked for one — at boot. Furthermore, starting Gunicorn
+        # before database migrations and role initialization run causes workers to boot against
+        # an empty schema and answer every datasource create with 422 until restarted.
+        # Everything — driver installation, schema migrations, admin creation, and permission
+        # init — runs sequentially ahead of run-server.sh. The import guard keeps an
+        # already-provisioned volume from paying for pip again on restarts.
         command=[
             "/bin/sh",
             "-c",
             'python -c "import ' + ", ".join(bi_container_modules()) + '" 2>/dev/null || '
             "pip install --no-cache-dir --no-deps --target /app/superset_home/pylibs "
             + " ".join(bi_container_packages())
-            + "; exec /usr/bin/run-server.sh",
+            + "; "
+            "superset db upgrade && "
+            '(superset fab create-admin --username "$SUPERSET_ADMIN_USER" --firstname Admin --lastname User --email admin@obelisk.local --password "$SUPERSET_ADMIN_PASSWORD" || true) && '
+            "superset init && "
+            "exec /usr/bin/run-server.sh",
         ],
         readiness=ReadinessProbe(kind="http", host_port=8088, path="/health", expected_status=200),
         probe_timeout_seconds=300,
         image_size_gb=3.0,
         credential_username="admin",
         web_ui=True,
-        web_ui_path="/superset",
-        post_start_commands=[
-            "superset db upgrade",
-            'superset fab create-admin --username "$SUPERSET_ADMIN_USER" --firstname Admin --lastname User --email admin@obelisk.local --password "$SUPERSET_ADMIN_PASSWORD" || true',
-            "superset init",
-        ],
+        # No ``web_ui_path``: Superset is served at the root of its own port, and the
+        # Dashboards page links to it there. The gateway used to carve out a ``/superset``
+        # subpath, but Superset was never told to serve one (it needs
+        # ``SUPERSET_WEBSERVER_BASEURL`` *and* ``APPLICATION_ROOT``, and its own asset
+        # paths assume the root), so ``/superset`` answered a Flask 404 while every
+        # dashboard link and cookie stayed wrong. Pointing the browser at the real address
+        # is the whole fix: one origin, no rewrite, no base path to keep in sync.
+        web_ui_path=None,
+        post_start_commands=[],
+        restart_after_init=True,
     ),
 ]
 

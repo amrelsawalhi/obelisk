@@ -834,7 +834,7 @@ export const DbtStudio: React.FC = () => {
         {/* Resizable Dock Divider Bar */}
         <div
           onMouseDown={handleDockResizeStart}
-          className="h-1 bg-slate-200 hover:bg-sky-400 cursor-row-resize transition-colors shrink-0"
+          className="h-1 bg-slate-200 hover:bg-slate-300 active:bg-slate-400 cursor-row-resize transition-colors shrink-0"
           title="Drag to resize output dock"
         />
 

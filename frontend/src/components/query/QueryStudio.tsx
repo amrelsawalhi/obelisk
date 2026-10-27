@@ -1098,11 +1098,9 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
           {/* Draggable Schema Explorer Width Handle */}
           <div
             onMouseDown={handleStartSchemaResize}
-            className="w-1.5 hover:w-2 bg-slate-200/80 hover:bg-sky-500 cursor-col-resize shrink-0 transition-all flex items-center justify-center group select-none z-20"
+            className="w-1 -ml-0.5 hover:bg-slate-300 active:bg-slate-400 cursor-col-resize shrink-0 transition-colors select-none z-10"
             title="Drag to resize Schema Explorer"
-          >
-            <div className="h-8 w-0.5 bg-slate-400 group-hover:bg-white rounded-full" />
-          </div>
+          />
         </>
       )}
 
@@ -1293,11 +1291,9 @@ export const QueryStudio: React.FC<QueryStudioProps> = ({ initialSql, isPopout =
           {/* Draggable Query / Results Resizer */}
           <div
             onMouseDown={handleStartEditorResize}
-            className="h-1.5 hover:h-2 bg-slate-200/90 hover:bg-sky-500 cursor-row-resize shrink-0 transition-all flex items-center justify-center group select-none z-20"
+            className="h-1 -my-0.5 hover:bg-slate-300 active:bg-slate-400 cursor-row-resize shrink-0 transition-colors select-none z-10"
             title="Drag up/down to resize Query and Results panes"
-          >
-            <div className="w-10 h-0.5 bg-slate-400 group-hover:bg-white rounded-full" />
-          </div>
+          />
 
           {/* Results Telemetry Header */}
           <div className="h-10 border-b border-slate-200 bg-slate-100/70 px-5 flex items-center justify-between shrink-0 text-xs text-slate-600 font-mono">

@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Cpu,
   HardDrive,
@@ -21,12 +22,15 @@ import {
   Check,
   X,
   RefreshCw,
+  Server,
 } from 'lucide-react';
 import { useTelemetry } from '../../lib/useTelemetry';
 import { usePolling } from '../../lib/viewActivity';
 import { api } from '../../lib/api';
 import { formatBytes } from '../../lib/format';
 import { serviceUrl } from '../../lib/urls';
+import { TAB_PATHS } from '../../lib/navigation';
+import { SERVICE_ICONS } from '../services/serviceIcons';
 import type {
   ServiceStatus,
   CatalogNode,
@@ -46,6 +50,7 @@ interface HomeViewProps {
 }
 
 export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
+  const navigate = useNavigate();
   const { telemetry } = useTelemetry();
   const [services, setServices] = useState<ServiceStatus[]>([]);
   const [serviceCatalog, setServiceCatalog] = useState<ServiceCatalogEntry[]>([]);
@@ -125,6 +130,22 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
   const isMarimoRunning = notebookStatus?.is_running ?? false;
 
   const runningServicesCount = services.filter((s) => s.status === 'running' || s.status === 'connected').length;
+
+  const sortedServiceCatalog = useMemo(() => {
+    return [...serviceCatalog].sort((a, b) => {
+      const getRank = (entry: ServiceCatalogEntry) => {
+        const s = services.find((svc) => svc.service_name.toLowerCase() === entry.name);
+        if (!s) return 3;
+        if (s.status === 'running' || s.status === 'connected') return 0;
+        if (s.container_exists || s.status === 'stopped') return 1;
+        return 2;
+      };
+      const rankA = getRank(a);
+      const rankB = getRank(b);
+      if (rankA !== rankB) return rankA - rankB;
+      return a.display_name.localeCompare(b.display_name);
+    });
+  }, [serviceCatalog, services]);
 
   const handleOpenRunLogs = async (run: PipelineExecution) => {
     setSelectedRunForLogs(run);
@@ -500,39 +521,58 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-            {serviceCatalog.map((entry) => {
+            {sortedServiceCatalog.map((entry) => {
               const key = entry.name;
               const status = services.find((s) => s.service_name.toLowerCase() === key);
               const isRunning = status && (status.status === 'running' || status.status === 'connected');
               const port = status?.port || entry.default_host_port;
+              const Icon = SERVICE_ICONS[entry.name] || Server;
 
               return (
                 <div
                   key={key}
-                  className="p-4 rounded-xl border border-slate-200/80 bg-slate-50/50 hover:bg-white hover:border-slate-300 hover:shadow-xs transition-all flex flex-col justify-between space-y-3"
+                  onClick={() => navigate(TAB_PATHS.services, { state: { service: entry.name } })}
+                  className={`p-4 rounded-xl border transition-all flex flex-col justify-between space-y-3 cursor-pointer group ${
+                    isRunning
+                      ? 'bg-white border-slate-200/90 hover:border-emerald-300 hover:shadow-xs'
+                      : 'bg-slate-50/50 border-slate-200/70 hover:bg-white hover:border-slate-300 hover:shadow-xs opacity-85 hover:opacity-100'
+                  }`}
+                  title={`Manage ${entry.display_name}`}
                 >
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <div className="font-bold text-slate-900 text-xs leading-tight">
-                        {entry.display_name}
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div
+                        className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 transition-colors ${
+                          isRunning
+                            ? 'bg-emerald-50 text-emerald-600 group-hover:bg-emerald-100/80'
+                            : 'bg-slate-100 text-slate-400 group-hover:bg-slate-200/70'
+                        }`}
+                      >
+                        <Icon className="w-4 h-4" />
                       </div>
-                      <div className="text-[11px] text-slate-400 font-mono mt-0.5">
-                        {entry.category} • Port :{port}
+                      <div className="min-w-0">
+                        <div className="font-bold text-slate-900 text-xs leading-tight truncate group-hover:text-sky-600 transition-colors">
+                          {entry.display_name}
+                        </div>
+                        <div className="text-[11px] text-slate-400 font-mono mt-0.5 truncate">
+                          {entry.category} • Port :{port}
+                        </div>
                       </div>
                     </div>
 
                     <span
-                      className={`px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase ${
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase shrink-0 flex items-center gap-1.5 ${
                         isRunning
                           ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                           : 'bg-slate-200/70 text-slate-500'
                       }`}
                     >
+                      {isRunning && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />}
                       {isRunning ? 'Running' : 'Stopped'}
                     </span>
                   </div>
 
-                  <div className="pt-2.5 border-t border-slate-200/60 flex items-center justify-between text-xs">
+                  <div className="pt-2.5 border-t border-slate-100 flex items-center justify-between text-xs">
                     {isRunning ? (
                       <span className="font-mono text-[11px] text-slate-700 font-medium">
                         {status?.allocated_memory_mb && status.allocated_memory_mb > 0
@@ -549,18 +589,14 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                           href={serviceUrl(port, entry.web_ui_path)}
                           target="_blank"
                           rel="noopener noreferrer"
+                          onClick={(e) => e.stopPropagation()}
                           className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-50 text-sky-700 hover:bg-sky-100 font-semibold text-xs border border-sky-200 transition-colors"
+                          title={`Open ${entry.display_name} in new tab`}
                         >
                           <ExternalLink className="w-3 h-3" />
                           <span>Open UI</span>
                         </a>
                       )}
-                      <button
-                        onClick={() => onNavigate('services')}
-                        className="px-2.5 py-1 rounded-lg text-slate-600 hover:bg-slate-200/60 font-medium text-xs transition-colors"
-                      >
-                        Configure
-                      </button>
                     </div>
                   </div>
                 </div>
