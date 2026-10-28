@@ -121,6 +121,7 @@ class PipelinePatch(BaseModel):
     max_retries: Optional[int] = None
     retry_delay_seconds: Optional[int] = None
     auto_rerun_interrupted: Optional[bool] = None
+    params: Optional[List[ParamIn]] = None
 
 
 class LayoutStep(BaseModel):
