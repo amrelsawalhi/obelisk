@@ -206,7 +206,9 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
 
   const availableTables = useMemo(() => {
     if (!matchedNode?.tables) return [];
-    return matchedNode.tables.map((t) => (t.schema ? `${t.schema}.${t.name}` : t.name));
+    return matchedNode.tables.map((t) =>
+      t.schema && !t.name.startsWith(`${t.schema}.`) ? `${t.schema}.${t.name}` : t.name
+    );
   }, [matchedNode]);
 
   const availableSchemas = useMemo(() => {
@@ -214,6 +216,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
     const set = new Set<string>();
     for (const t of matchedNode.tables) {
       if (t.schema) set.add(t.schema);
+      else if (t.name.includes(".")) set.add(t.name.split(".")[0]);
     }
     return Array.from(set).sort();
   }, [matchedNode]);
@@ -223,7 +226,12 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
     const target = step.target.trim();
     return (
       matchedNode.tables.find(
-        (t) => (t.schema ? `${t.schema}.${t.name}` : t.name) === target || t.name === target
+        (t) =>
+          (t.schema && !t.name.startsWith(`${t.schema}.`)
+            ? `${t.schema}.${t.name}`
+            : t.name) === target ||
+          t.name === target ||
+          (t.name.includes(".") && t.name.split(".").slice(-1)[0] === target)
       ) || null
     );
   }, [matchedNode, step?.target]);

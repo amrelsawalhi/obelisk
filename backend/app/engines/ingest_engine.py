@@ -784,6 +784,16 @@ class IngestEngine:
             schema_name, table_name = entity.split(".", 1)
         else:
             schema_name, table_name = "public", entity
+            try:
+                found = conn.execute(
+                    f"SELECT table_schema FROM information_schema.tables "
+                    f"WHERE table_catalog = {sql_string(alias)} AND table_name = {sql_string(table_name)} "
+                    f"ORDER BY CASE WHEN table_schema = 'public' THEN 0 ELSE 1 END LIMIT 1"
+                ).fetchone()
+                if found and found[0]:
+                    schema_name = found[0]
+            except Exception:
+                pass
         where = ""
         if mode == "incremental" and watermark_column and watermark_value is not None:
             where = f"WHERE {sql_ident(watermark_column)} > {_literal(watermark_value)}"
@@ -793,8 +803,8 @@ class IngestEngine:
 
     def _transfer_from(
         self,
+        conn=None,
         *,
-        conn,
         source_ref: str,
         target: str,
         mode: str,
@@ -802,6 +812,7 @@ class IngestEngine:
         where: str = "",
         limit_clause: str = "",
         on_batch: Optional[Callable[[int], None]] = None,
+        **kwargs,
     ) -> int:
         """Moves rows from a relation DuckDB can scan into the lakehouse, in one statement.
 
@@ -809,32 +820,35 @@ class IngestEngine:
         Parquet files directly, so the cost of the load is one statement rather than one
         Python object per row.
         """
+        c = conn if conn is not None else kwargs.get("conn")
+        if c is None:
+            raise ValueError("conn is required for _transfer_from")
         if mode == "snapshot" or not exists:
             # An empty source must not replace a table that has rows: a source that is
             # briefly empty would otherwise destroy data a rerun cannot bring back.
-            probe = conn.execute(
+            probe = c.execute(
                 f"SELECT 1 FROM {source_ref} {where} LIMIT 1"
             ).fetchall()
             if not probe:
                 return 0
-            conn.execute(
+            c.execute(
                 f"CREATE OR REPLACE TABLE {target} AS "
                 f"SELECT * FROM {source_ref} {where}{limit_clause};"
             )
-            written = self._row_count(conn, target)
+            written = self._row_count(c, target)
         else:
-            before = self._row_count(conn, target)
-            conn.execute(
+            before = self._row_count(c, target)
+            c.execute(
                 f"INSERT INTO {target} SELECT * FROM {source_ref} {where}{limit_clause};"
             )
-            written = max(0, self._row_count(conn, target) - before)
+            written = max(0, self._row_count(c, target) - before)
         if on_batch is not None:
             on_batch(written)
         return written
 
     def _transfer_postgres(
-        self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,
-        limit, target, exists, on_batch=None,
+        self, conn=None, *, connection_params, entity, mode, watermark_column, watermark_value,
+        limit, target, exists, on_batch=None, **kwargs,
     ) -> int:
         """Copies a Postgres table straight into the lakehouse.
 
@@ -842,12 +856,15 @@ class IngestEngine:
         once, to disk, and never becomes a Python object or a second copy in the temp
         directory.
         """
+        c = conn if conn is not None else kwargs.get("conn")
+        if c is None:
+            raise ValueError("conn is required for _transfer_postgres")
         alias, relation, where, limit_clause = self._postgres_source(
-            conn, connection_params, entity, mode, watermark_column, watermark_value, limit
+            c, connection_params, entity, mode, watermark_column, watermark_value, limit
         )
         try:
             return self._transfer_from(
-                conn,
+                c,
                 source_ref=relation,
                 target=target,
                 mode=mode,
@@ -857,7 +874,7 @@ class IngestEngine:
                 on_batch=on_batch,
             )
         finally:
-            conn.execute(f"DETACH {alias};")
+            c.execute(f"DETACH {alias};")
 
     def _stage_postgres(
         self, *, conn, connection_params, entity, mode, watermark_column, watermark_value,

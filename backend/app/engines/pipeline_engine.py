@@ -1284,6 +1284,13 @@ class PipelineEngine:
         schema_name = (args.get("schema_name") or "").strip()
         target_ref = (step.target or args.get("entity") or args.get("table") or "").strip()
 
+        def _get_entity_name(t: Dict[str, Any]) -> str:
+            raw_name = str(t.get("name") or "").strip()
+            schema = str(t.get("schema") or "").strip()
+            if schema and not raw_name.startswith(f"{schema}."):
+                return f"{schema}.{raw_name}"
+            return raw_name
+
         entities: List[str] = []
 
         if isinstance(tables_arg, list) and len(tables_arg) > 0:
@@ -1291,21 +1298,19 @@ class PipelineEngine:
         elif target_ref in ("*", "all") or scope == "source":
             from app.api.routes_catalog import _introspect_connection
             discovered = await _introspect_connection(conn) or []
-            entities = [
-                f"{t['schema']}.{t['name']}" if t.get("schema") else t["name"]
-                for t in discovered
-            ]
+            entities = [_get_entity_name(t) for t in discovered if _get_entity_name(t)]
             if not entities:
                 log.append(f"No tables discovered in source '{conn.name}'.")
         elif target_ref.endswith(".*") or scope == "schema":
-            prefix = schema_name or target_ref.split(".*")[0].strip()
+            prefix = (schema_name or target_ref.split(".*")[0]).strip().lower()
             from app.api.routes_catalog import _introspect_connection
             discovered = await _introspect_connection(conn) or []
-            entities = [
-                f"{t['schema']}.{t['name']}" if t.get("schema") else t["name"]
-                for t in discovered
-                if (t.get("schema") or "").lower() == prefix.lower()
-            ]
+            entities = []
+            for t in discovered:
+                ent = _get_entity_name(t)
+                schema_part = ent.split(".")[0] if "." in ent else str(t.get("schema") or "public")
+                if schema_part.lower() == prefix:
+                    entities.append(ent)
             if not entities:
                 log.append(f"No tables discovered under schema '{prefix}' in source '{conn.name}'.")
         elif "," in target_ref:
@@ -1320,6 +1325,8 @@ class PipelineEngine:
         watermark_column = args.get("watermark_column") or None
         target_folder = str(args.get("target_folder") or "raw").strip().strip("/") or "raw"
         target_name = (args.get("target_name") or "").strip() or None
+        if target_name in ("*", "all"):
+            target_name = None
         limit = args.get("limit")
         if limit is not None:
             try:
@@ -1343,6 +1350,8 @@ class PipelineEngine:
             entity = entities[0]
             stem = target_name or (entity.split(".", 1)[-1] if "." in entity else entity)
             clean_stem = stem.replace(".", "_").replace("/", "_").replace("\\", "_")
+            if clean_stem in ("*", "all") or not clean_stem:
+                clean_stem = (entity.split(".", 1)[-1] if "." in entity else entity).replace(".", "_")
 
             log.append(f"Ingesting '{entity}' from {conn.source_type} source '{conn.name}' (mode={mode})")
 
