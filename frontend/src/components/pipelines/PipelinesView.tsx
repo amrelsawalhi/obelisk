@@ -171,6 +171,7 @@ const toStepPayload = (step: PipelineStepDef) => ({
 });
 
 const TERMINAL: ExecutionStatus[] = ['success', 'failed', 'cancelled', 'interrupted', 'skipped'];
+const RUN_ACTIVE: ExecutionStatus[] = ['pending', 'running', 'waiting_deps'];
 
 const STATUS_TEXT: Record<string, string> = {
   success: 'Last run succeeded',
@@ -1027,7 +1028,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
           {detail && (
             <>
-              {monitor && RUN_ACTIVE.includes(monitor.status as any) ? (
+              {monitorActive && monitor ? (
                 <button
                   type="button"
                   onClick={() => void cancelRun(monitor.id)}
@@ -1178,7 +1179,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     Watching <span className="font-bold">{monitor.id.slice(0, 8)}</span>
                     <span className="text-slate-400">·</span>
                     <span>{fmtDuration(monitor.duration_seconds)}</span>
-                    {RUN_ACTIVE.includes(monitor.status as any) && (
+                    {monitorActive && (
                       <button
                         type="button"
                         onClick={() => void cancelRun(monitor.id)}
@@ -1385,7 +1386,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                         setDockExpanded(false);
                       }}
                       onCancel={() => monitor && void cancelRun(monitor.id)}
-                      isRunActive={Boolean(monitor && RUN_ACTIVE.includes(monitor.status as any))}
+                      isRunActive={monitorActive}
                     />
                   </div>
                 </>
