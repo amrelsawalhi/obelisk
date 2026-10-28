@@ -7,6 +7,7 @@ import {
   Copy,
   Loader2,
   RefreshCw,
+  Square,
   X,
 } from 'lucide-react';
 import type { StepRunItem } from '../../lib/types';
@@ -30,6 +31,8 @@ interface PipelineLogDockProps {
   onToggleExpand: () => void;
   onRefresh: () => void;
   onClose: () => void;
+  onCancel?: () => void;
+  isRunActive?: boolean;
 }
 
 /**
@@ -54,6 +57,8 @@ export const PipelineLogDock: React.FC<PipelineLogDockProps> = ({
   onToggleExpand,
   onRefresh,
   onClose,
+  onCancel,
+  isRunActive,
 }) => {
   const [wrap, setWrap] = useState(true);
   const [follow, setFollow] = useState(true);
@@ -162,7 +167,18 @@ export const PipelineLogDock: React.FC<PipelineLogDockProps> = ({
             </span>
           </span>
         )}
-        <div className="ml-auto flex items-center gap-0.5">
+        <div className="ml-auto flex items-center gap-1">
+          {isRunActive && onCancel && (
+            <button
+              type="button"
+              onClick={onCancel}
+              className="mr-1 flex items-center gap-1 rounded bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-600 hover:bg-rose-100 transition-colors border border-rose-200"
+              title="Stop running pipeline"
+            >
+              <Square className="h-2.5 w-2.5 fill-current" />
+              Stop Run
+            </button>
+          )}
           {loading && <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-500" />}
           <span className="mr-1 font-mono text-[10px] text-slate-300">
             {current?.started_at ? fmtWhen(current.started_at) : ""}

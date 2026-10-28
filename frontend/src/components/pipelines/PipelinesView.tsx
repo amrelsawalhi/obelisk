@@ -10,6 +10,7 @@ import {
   RefreshCw,
   Save,
   ScrollText,
+  Square,
   Trash2,
   Wand2,
   Zap,
@@ -1026,20 +1027,32 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
           {detail && (
             <>
-              <button
-                type="button"
-                onClick={() => void requestRun()}
-                disabled={starting}
-                className="flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors disabled:opacity-50"
-                title="Run now (Ctrl+Enter)"
-              >
-                {starting ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Play className="h-3.5 w-3.5 fill-current" />
-                )}
-                Run now
-              </button>
+              {monitor && RUN_ACTIVE.includes(monitor.status as any) ? (
+                <button
+                  type="button"
+                  onClick={() => void cancelRun(monitor.id)}
+                  className="flex items-center gap-1.5 rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-700 shadow-2xs transition-colors"
+                  title="Stop / cancel the active run"
+                >
+                  <Square className="h-3 w-3 fill-current" />
+                  Stop run
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void requestRun()}
+                  disabled={starting}
+                  className="flex items-center gap-1.5 rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 shadow-2xs transition-colors disabled:opacity-50"
+                  title="Run now (Ctrl+Enter)"
+                >
+                  {starting ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Play className="h-3.5 w-3.5 fill-current" />
+                  )}
+                  Run now
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => void saveGraph()}
@@ -1165,6 +1178,15 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     Watching <span className="font-bold">{monitor.id.slice(0, 8)}</span>
                     <span className="text-slate-400">·</span>
                     <span>{fmtDuration(monitor.duration_seconds)}</span>
+                    {RUN_ACTIVE.includes(monitor.status as any) && (
+                      <button
+                        type="button"
+                        onClick={() => void cancelRun(monitor.id)}
+                        className="font-semibold text-rose-600 hover:underline ml-1"
+                      >
+                        Stop
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => setMonitor(null)}
@@ -1362,6 +1384,8 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                         setDockOpen(false);
                         setDockExpanded(false);
                       }}
+                      onCancel={() => monitor && void cancelRun(monitor.id)}
+                      isRunActive={Boolean(monitor && RUN_ACTIVE.includes(monitor.status as any))}
                     />
                   </div>
                 </>

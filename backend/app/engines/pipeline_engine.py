@@ -357,6 +357,8 @@ class PipelineEngine:
         self._tasks: set = set()
         # step_run_id -> live child process, killed on timeout/cancel/shutdown.
         self._procs: Dict[str, subprocess.Popen] = {}
+        # step_run_id -> asyncio task for in-process steps (ingest, raw_sql, etc.)
+        self._step_tasks: Dict[str, asyncio.Task] = {}
         # run ids the operator asked to cancel; executors consult it after exit.
         self._cancel_runs: set = set()
         # step_run_id -> length of the log last written, so an idle step does not
@@ -776,6 +778,9 @@ class PipelineEngine:
                     proc = self._procs.get(step_run.id)
                     if proc is not None:
                         _kill_process_tree(proc)
+                    step_task = self._step_tasks.get(step_run.id)
+                    if step_task is not None and not step_task.done():
+                        step_task.cancel()
             await session.commit()
         # Finalize right away so the status flips even when no tick is running
         # (tests, or a cancel during shutdown).
@@ -921,7 +926,9 @@ class PipelineEngine:
         for step_run_id in spawned:
             task = asyncio.create_task(self._execute_step(step_run_id))
             self._tasks.add(task)
+            self._step_tasks[step_run_id] = task
             task.add_done_callback(self._tasks.discard)
+            task.add_done_callback(lambda _t, s_id=step_run_id: self._step_tasks.pop(s_id, None))
 
         await self._maybe_finalize(run_id)
 
@@ -1140,6 +1147,9 @@ class PipelineEngine:
         except StepCancelled:
             status = "cancelled"
             log.append("Cancelled before the child produced a result.")
+        except asyncio.CancelledError:
+            status = "cancelled"
+            log.append("Step cancelled by operator.")
         except asyncio.TimeoutError:
             status = "failed"
             error = f"Timed out after {timeout}s."
@@ -1151,6 +1161,7 @@ class PipelineEngine:
             log.append(traceback.format_exc())
         finally:
             self._procs.pop(step_run_id, None)
+            self._step_tasks.pop(step_run_id, None)
 
         duration = round(time.time() - started, 2)
         cancelled = run.id in self._cancel_runs
@@ -1226,7 +1237,7 @@ class PipelineEngine:
         run: PipelineRun,
     ) -> Dict[str, Dict[str, Any]]:
         if step.step_type == "ingest":
-            return await self._run_ingest(step, args, params, log, timeout, step_run_id)
+            return await self._run_ingest(step, args, params, log, timeout, step_run_id, run)
         if step.step_type in ("dbt_run", "dbt_test"):
             return await self._run_dbt(step, args, params, log, timeout, step_run_id)
         if step.step_type == "script":
@@ -1257,6 +1268,7 @@ class PipelineEngine:
         log: List[str],
         timeout: int,
         step_run_id: Optional[str] = None,
+        run: Optional[PipelineRun] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Ingests from an external connection into the lakehouse and publishes table & rows."""
         streamed = step_run_id is not None
@@ -1265,7 +1277,7 @@ class PipelineEngine:
             flusher = asyncio.create_task(self._flush_log_loop(step_run_id, log))
 
         try:
-            return await self._execute_ingest(step, args, params, log, timeout)
+            return await self._execute_ingest(step, args, params, log, timeout, run)
         finally:
             if flusher is not None:
                 flusher.cancel()
@@ -1279,6 +1291,7 @@ class PipelineEngine:
         params: Dict[str, Any],
         log: List[str],
         timeout: int,
+        run: Optional[PipelineRun] = None,
     ) -> Dict[str, Dict[str, Any]]:
         from app.models.connection import Connection
         from app.core.vault import decrypt
@@ -1422,6 +1435,9 @@ class PipelineEngine:
         ingested_tables: List[str] = []
 
         for entity in entities:
+            if run is not None and run.id in self._cancel_runs:
+                log.append("Ingestion cancelled by operator.")
+                raise StepCancelled()
             stem = entity.split(".", 1)[-1] if "." in entity else entity
             clean_stem = stem.replace(".", "_").replace("/", "_").replace("\\", "_")
             try:
