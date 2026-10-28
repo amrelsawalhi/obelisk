@@ -1278,9 +1278,43 @@ class PipelineEngine:
         if not conn:
             raise ValueError(f"Connection '{connection_id}' not found.")
 
-        entity = (step.target or args.get("entity") or args.get("table") or "").strip()
-        if not entity:
-            raise ValueError(f"Ingest step '{step.name}' has no entity or table specified.")
+        # Ingestion scope resolution
+        scope = str(args.get("scope") or "").strip().lower()
+        tables_arg = args.get("tables")
+        schema_name = (args.get("schema_name") or "").strip()
+        target_ref = (step.target or args.get("entity") or args.get("table") or "").strip()
+
+        entities: List[str] = []
+
+        if isinstance(tables_arg, list) and len(tables_arg) > 0:
+            entities = [str(t).strip() for t in tables_arg if str(t).strip()]
+        elif target_ref in ("*", "all") or scope == "source":
+            from app.api.routes_catalog import _introspect_connection
+            discovered = await _introspect_connection(conn) or []
+            entities = [
+                f"{t['schema']}.{t['name']}" if t.get("schema") else t["name"]
+                for t in discovered
+            ]
+            if not entities:
+                log.append(f"No tables discovered in source '{conn.name}'.")
+        elif target_ref.endswith(".*") or scope == "schema":
+            prefix = schema_name or target_ref.split(".*")[0].strip()
+            from app.api.routes_catalog import _introspect_connection
+            discovered = await _introspect_connection(conn) or []
+            entities = [
+                f"{t['schema']}.{t['name']}" if t.get("schema") else t["name"]
+                for t in discovered
+                if (t.get("schema") or "").lower() == prefix.lower()
+            ]
+            if not entities:
+                log.append(f"No tables discovered under schema '{prefix}' in source '{conn.name}'.")
+        elif "," in target_ref:
+            entities = [t.strip() for t in target_ref.split(",") if t.strip()]
+        elif target_ref:
+            entities = [target_ref]
+
+        if not entities:
+            raise ValueError(f"Ingest step '{step.name}' has no tables / entities specified to ingest.")
 
         mode = str(args.get("mode") or "snapshot").strip().lower()
         watermark_column = args.get("watermark_column") or None
@@ -1305,41 +1339,104 @@ class PipelineEngine:
             **(conn.options or {}),
         }
 
-        log.append(f"Ingesting '{entity}' from {conn.source_type} source '{conn.name}' (mode={mode})")
+        if len(entities) == 1:
+            entity = entities[0]
+            stem = target_name or (entity.split(".", 1)[-1] if "." in entity else entity)
+            clean_stem = stem.replace(".", "_").replace("/", "_").replace("\\", "_")
 
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                trigger_ingest,
-                source_type=conn.source_type,
-                connection_params=connection_params,
-                entity=entity,
-                mode=mode,
-                watermark_column=watermark_column,
-                target_name=target_name,
-                target_folder=target_folder,
-                limit=limit,
-                write_strategy=write_strategy,
-                primary_key=primary_key,
-            ),
-            timeout=timeout,
+            log.append(f"Ingesting '{entity}' from {conn.source_type} source '{conn.name}' (mode={mode})")
+
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    trigger_ingest,
+                    source_type=conn.source_type,
+                    connection_params=connection_params,
+                    entity=entity,
+                    mode=mode,
+                    watermark_column=watermark_column,
+                    target_name=clean_stem,
+                    target_folder=target_folder,
+                    limit=limit,
+                    write_strategy=write_strategy,
+                    primary_key=primary_key,
+                ),
+                timeout=timeout,
+            )
+
+            for line in result.get("logs", []):
+                log.append(line)
+
+            if not result.get("success"):
+                raise RuntimeError(f"Ingest failed for '{entity}'. See step log for details.")
+
+            meta = result.get("metadata", {})
+            table_name = meta.get("table_name") or f"{target_folder}.{clean_stem}"
+            rows = meta.get("num_rows", 0)
+
+            log.append(f"Ingest complete: {rows:,} row(s) published as table '{table_name}'")
+            return {
+                "table": {"type": "table", "value": table_name},
+                "rows": {"type": "scalar", "value": rows},
+            }
+
+        # Multi-table / batch ingestion
+        log.append(
+            f"Starting batch ingestion of {len(entities)} table(s) from {conn.source_type} "
+            f"connection '{conn.name}' (mode={mode}) into '{target_folder}/'"
         )
 
-        for line in result.get("logs", []):
-            log.append(line)
+        total_rows = 0
+        succeeded = 0
+        failed_errors: List[str] = []
+        ingested_tables: List[str] = []
 
-        if not result.get("success"):
-            raise RuntimeError(f"Ingest failed for '{entity}'. See step log for details.")
+        for entity in entities:
+            stem = entity.split(".", 1)[-1] if "." in entity else entity
+            clean_stem = stem.replace(".", "_").replace("/", "_").replace("\\", "_")
+            try:
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        trigger_ingest,
+                        source_type=conn.source_type,
+                        connection_params=connection_params,
+                        entity=entity,
+                        mode=mode,
+                        watermark_column=watermark_column,
+                        target_name=clean_stem,
+                        target_folder=target_folder,
+                        limit=limit,
+                        write_strategy=write_strategy,
+                        primary_key=primary_key,
+                    ),
+                    timeout=timeout,
+                )
+                if res.get("success"):
+                    rows = res.get("metadata", {}).get("num_rows", 0)
+                    total_rows += rows
+                    succeeded += 1
+                    t_name = res.get("metadata", {}).get("table_name") or f"{target_folder}.{clean_stem}"
+                    ingested_tables.append(t_name)
+                    log.append(f"✓ Ingested '{entity}' -> {t_name} ({rows:,} rows)")
+                else:
+                    err_msg = (res.get("logs") or ["unknown failure"])[-1]
+                    failed_errors.append(f"'{entity}': {err_msg}")
+                    log.append(f"✗ Failed '{entity}': {err_msg}")
+            except Exception as exc:
+                failed_errors.append(f"'{entity}': {exc}")
+                log.append(f"✗ Failed '{entity}': {exc}")
 
-        meta = result.get("metadata", {})
-        stem = target_name or (entity.split(".", 1)[-1] if "." in entity else entity)
-        clean_stem = stem.replace(".", "_").replace("/", "_").replace("\\", "_")
-        table_name = meta.get("table_name") or f"{target_folder}.{clean_stem}"
-        rows = meta.get("num_rows", 0)
+        log.append(
+            f"Batch ingest finished: {succeeded}/{len(entities)} succeeded, "
+            f"{len(failed_errors)} failed, {total_rows:,} total rows."
+        )
 
-        log.append(f"Ingest complete: {rows} row(s) published as table '{table_name}'")
+        if failed_errors:
+            raise RuntimeError(f"Ingest failed for {len(failed_errors)} table(s): {'; '.join(failed_errors[:3])}")
+
+        primary_table = f"{target_folder}.*" if len(ingested_tables) > 1 else (ingested_tables[0] if ingested_tables else target_folder)
         return {
-            "table": {"type": "table", "value": table_name},
-            "rows": {"type": "scalar", "value": rows},
+            "table": {"type": "table", "value": primary_table},
+            "rows": {"type": "scalar", "value": total_rows},
         }
 
     async def _run_dbt(

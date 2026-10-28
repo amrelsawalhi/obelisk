@@ -1,11 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
+  ArrowDownToLine,
   Copy,
   CornerDownLeft,
+  Database,
+  Folder,
+  Layers,
   Plus,
   RefreshCw,
   ScrollText,
+  Search,
+  Table,
   Terminal,
   Trash2,
   X,
@@ -162,6 +168,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
   const targetRef = useRef<HTMLTextAreaElement | null>(null);
   const [copiedToken, setCopiedToken] = useState<string | null>(null);
   const [catalogNodes, setCatalogNodes] = useState<CatalogNode[]>([]);
+  const [tableSearch, setTableSearch] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -201,6 +208,65 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
     if (!matchedNode?.tables) return [];
     return matchedNode.tables.map((t) => (t.schema ? `${t.schema}.${t.name}` : t.name));
   }, [matchedNode]);
+
+  const availableSchemas = useMemo(() => {
+    if (!matchedNode?.tables) return [];
+    const set = new Set<string>();
+    for (const t of matchedNode.tables) {
+      if (t.schema) set.add(t.schema);
+    }
+    return Array.from(set).sort();
+  }, [matchedNode]);
+
+  const selectedTableObj = useMemo(() => {
+    if (!matchedNode?.tables || !step?.target) return null;
+    const target = step.target.trim();
+    return (
+      matchedNode.tables.find(
+        (t) => (t.schema ? `${t.schema}.${t.name}` : t.name) === target || t.name === target
+      ) || null
+    );
+  }, [matchedNode, step?.target]);
+
+  const tableColumns = useMemo(() => {
+    return selectedTableObj?.columns ?? [];
+  }, [selectedTableObj]);
+
+  const currentScope: "table" | "tables" | "schema" | "source" = useMemo(() => {
+    if (stepArgs.scope === "source" || step?.target === "*") return "source";
+    if (stepArgs.scope === "schema" || (step?.target && step.target.endsWith(".*"))) return "schema";
+    if (
+      stepArgs.scope === "tables" ||
+      (stepArgs.tables && Array.isArray(stepArgs.tables) && stepArgs.tables.length > 0) ||
+      (step?.target && step.target.includes(","))
+    )
+      return "tables";
+    return "table";
+  }, [step?.target, stepArgs.scope, stepArgs.tables]);
+
+  const selectedTablesList = useMemo(() => {
+    if (stepArgs.tables && Array.isArray(stepArgs.tables)) {
+      return stepArgs.tables as string[];
+    }
+    if (step?.target && step.target.includes(",")) {
+      return step.target.split(",").map((s) => s.trim()).filter(Boolean);
+    }
+    return [];
+  }, [stepArgs.tables, step?.target]);
+
+  const filteredAvailableTables = useMemo(() => {
+    if (!availableTables) return [];
+    if (!tableSearch.trim()) return availableTables;
+    const q = tableSearch.toLowerCase().trim();
+    return availableTables.filter((t) => t.toLowerCase().includes(q));
+  }, [availableTables, tableSearch]);
+
+  const allFilteredSelected = useMemo(() => {
+    return (
+      filteredAvailableTables.length > 0 &&
+      filteredAvailableTables.every((t) => selectedTablesList.includes(t))
+    );
+  }, [filteredAvailableTables, selectedTablesList]);
 
   const copyToken = async (value: string) => {
     try {
@@ -256,6 +322,78 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
     const next = { ...args };
     delete next[key];
     onChange({ args: next });
+  };
+
+  const toggleTableInSelection = (tableName: string) => {
+    const next = selectedTablesList.includes(tableName)
+      ? selectedTablesList.filter((t) => t !== tableName)
+      : [...selectedTablesList, tableName];
+    onChange({ target: next.join(", ") });
+    setArgs({
+      scope: "tables",
+      tables: next,
+      entity: undefined,
+      schema_name: undefined,
+      target_name: undefined,
+    });
+  };
+
+  const toggleSelectAll = () => {
+    const next = allFilteredSelected
+      ? selectedTablesList.filter((t) => !filteredAvailableTables.includes(t))
+      : Array.from(new Set([...selectedTablesList, ...filteredAvailableTables]));
+    onChange({ target: next.join(", ") });
+    setArgs({
+      scope: "tables",
+      tables: next,
+      entity: undefined,
+      schema_name: undefined,
+      target_name: undefined,
+    });
+  };
+
+  const switchScope = (newScope: "table" | "tables" | "schema" | "source") => {
+    if (newScope === "table") {
+      const firstTbl = availableTables[0] || "";
+      const cleanStem = firstTbl.includes(".") ? firstTbl.split(".").slice(-1)[0] : firstTbl;
+      onChange({ target: firstTbl });
+      setArgs({
+        scope: "table",
+        entity: firstTbl,
+        tables: undefined,
+        schema_name: undefined,
+        target_name: cleanStem,
+      });
+    } else if (newScope === "tables") {
+      const initial = selectedTablesList.length > 0 ? selectedTablesList : availableTables.slice(0, 3);
+      onChange({ target: initial.join(", ") });
+      setArgs({
+        scope: "tables",
+        tables: initial,
+        entity: undefined,
+        schema_name: undefined,
+        target_name: undefined,
+      });
+    } else if (newScope === "schema") {
+      const firstSchema = availableSchemas[0] || (availableTables[0]?.includes(".") ? availableTables[0].split(".")[0] : "public");
+      onChange({ target: `${firstSchema}.*` });
+      setArgs({
+        scope: "schema",
+        schema_name: firstSchema,
+        entity: undefined,
+        tables: undefined,
+        target_name: undefined,
+      });
+    } else if (newScope === "source") {
+      onChange({ target: "*" });
+      setArgs({
+        scope: "source",
+        entity: undefined,
+        tables: undefined,
+        schema_name: undefined,
+        target_name: undefined,
+      });
+    }
   };
 
   const declared = (args.outputs as Record<string, { type?: string; sensitive?: boolean }>) ?? {};
@@ -379,69 +517,270 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                   </select>
                 </Field>
 
-                <Field
-                  label="Source Table / Entity"
-                  hint="Table, view, or collection to extract from the source."
-                >
-                  {availableTables.length > 0 ? (
-                    <div className="space-y-1.5">
-                      <select
-                        className={inputClass}
-                        value={step.target}
-                        onChange={(event) => {
-                          const val = event.target.value;
-                          const cleanStem = val.includes(".") ? val.split(".").slice(-1)[0] : val;
-                          onChange({ target: val });
-                          setArgs({
-                            entity: val,
-                            ...(!args.target_name ? { target_name: cleanStem } : {}),
-                          });
-                        }}
-                      >
-                        <option value="">Choose discovered table or type below...</option>
-                        {!availableTables.includes(step.target) && step.target && (
-                          <option value={step.target}>{step.target} (custom)</option>
-                        )}
-                        {availableTables.map((tbl) => (
-                          <option key={tbl} value={tbl}>
-                            {tbl}
-                          </option>
-                        ))}
-                      </select>
+                {/* Scope selector tabs */}
+                <div>
+                  <span className="mb-1 block text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
+                    Ingestion Scope
+                  </span>
+                  <div className="grid grid-cols-4 gap-1 rounded-lg bg-slate-100 p-1">
+                    <button
+                      type="button"
+                      onClick={() => switchScope("table")}
+                      className={`flex items-center justify-center gap-1.5 rounded-md py-1.5 text-[11px] font-semibold transition-all ${
+                        currentScope === "table"
+                          ? "bg-white text-sky-700 shadow-xs"
+                          : "text-slate-600 hover:text-slate-900"
+                      }`}
+                    >
+                      <Table className="h-3.5 w-3.5" />
+                      <span>Table</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => switchScope("tables")}
+                      className={`flex items-center justify-center gap-1.5 rounded-md py-1.5 text-[11px] font-semibold transition-all ${
+                        currentScope === "tables"
+                          ? "bg-white text-sky-700 shadow-xs"
+                          : "text-slate-600 hover:text-slate-900"
+                      }`}
+                    >
+                      <Layers className="h-3.5 w-3.5" />
+                      <span>Batch</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => switchScope("schema")}
+                      className={`flex items-center justify-center gap-1.5 rounded-md py-1.5 text-[11px] font-semibold transition-all ${
+                        currentScope === "schema"
+                          ? "bg-white text-sky-700 shadow-xs"
+                          : "text-slate-600 hover:text-slate-900"
+                      }`}
+                    >
+                      <Folder className="h-3.5 w-3.5" />
+                      <span>Schema</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => switchScope("source")}
+                      className={`flex items-center justify-center gap-1.5 rounded-md py-1.5 text-[11px] font-semibold transition-all ${
+                        currentScope === "source"
+                          ? "bg-white text-sky-700 shadow-xs"
+                          : "text-slate-600 hover:text-slate-900"
+                      }`}
+                    >
+                      <Database className="h-3.5 w-3.5" />
+                      <span>All (*)</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Scope-dependent target input */}
+                {currentScope === "table" && (
+                  <Field
+                    label="Source Table / Entity"
+                    hint="Table, view, or collection to extract from the source."
+                  >
+                    {availableTables.length > 0 ? (
+                      <div className="space-y-1.5">
+                        <select
+                          className={inputClass}
+                          value={step.target}
+                          onChange={(event) => {
+                            const val = event.target.value;
+                            const cleanStem = val.includes(".") ? val.split(".").slice(-1)[0] : val;
+                            onChange({ target: val });
+                            setArgs({
+                              scope: "table",
+                              entity: val,
+                              ...(!args.target_name ? { target_name: cleanStem } : {}),
+                            });
+                          }}
+                        >
+                          <option value="">Choose discovered table...</option>
+                          {!availableTables.includes(step.target) && step.target && (
+                            <option value={step.target}>{step.target} (custom)</option>
+                          )}
+                          {availableTables.map((tbl) => (
+                            <option key={tbl} value={tbl}>
+                              {tbl}
+                            </option>
+                          ))}
+                        </select>
+                        <input
+                          className={inputClass}
+                          placeholder="Or custom: schema.table_name"
+                          value={step.target}
+                          onChange={(event) => {
+                            const val = event.target.value;
+                            const cleanStem = val.includes(".") ? val.split(".").slice(-1)[0] : val;
+                            onChange({ target: val });
+                            setArgs({
+                              scope: "table",
+                              entity: val,
+                              ...(!args.target_name ? { target_name: cleanStem } : {}),
+                            });
+                          }}
+                        />
+                      </div>
+                    ) : (
                       <input
                         className={inputClass}
-                        placeholder="Or custom: schema.table_name"
+                        placeholder="e.g. sales.sales_order or public.customers"
                         value={step.target}
                         onChange={(event) => {
                           const val = event.target.value;
                           const cleanStem = val.includes(".") ? val.split(".").slice(-1)[0] : val;
                           onChange({ target: val });
                           setArgs({
+                            scope: "table",
                             entity: val,
                             ...(!args.target_name ? { target_name: cleanStem } : {}),
                           });
                         }}
                       />
-                    </div>
-                  ) : (
-                    <input
-                      className={inputClass}
-                      placeholder="e.g. sales.sales_order or public.customers"
-                      value={step.target}
-                      onChange={(event) => {
-                        const val = event.target.value;
-                        const cleanStem = val.includes(".") ? val.split(".").slice(-1)[0] : val;
-                        onChange({ target: val });
-                        setArgs({
-                          entity: val,
-                          ...(!args.target_name ? { target_name: cleanStem } : {}),
-                        });
-                      }}
-                    />
-                  )}
-                </Field>
+                    )}
+                  </Field>
+                )}
 
-                <div className="grid grid-cols-2 gap-2">
+                {currentScope === "tables" && (
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="text-[10px] font-bold uppercase tracking-wide text-slate-500 font-mono">
+                        Select Tables to Ingest
+                      </span>
+                      <span className="px-2 py-0.5 text-[10px] font-mono bg-sky-100 text-sky-800 rounded-full font-semibold">
+                        {selectedTablesList.length} / {availableTables.length} Selected
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2 mb-2">
+                      <div className="relative flex-1">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" />
+                        <input
+                          type="text"
+                          placeholder="Filter tables..."
+                          value={tableSearch}
+                          onChange={(e) => setTableSearch(e.target.value)}
+                          className="w-full pl-8 pr-2.5 py-1 text-xs bg-slate-50 border border-slate-200 rounded-lg outline-hidden focus:border-sky-500 focus:bg-white transition-all"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={toggleSelectAll}
+                        className="px-2.5 py-1 text-[11px] font-medium text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg shrink-0 transition-colors"
+                      >
+                        {allFilteredSelected ? "Deselect All" : "Select All"}
+                      </button>
+                    </div>
+
+                    <div className="max-h-44 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100 bg-white">
+                      {filteredAvailableTables.length === 0 ? (
+                        <div className="p-3 text-center text-xs text-slate-400">
+                          {availableTables.length === 0
+                            ? "No tables discovered for this connection."
+                            : "No tables match your search."}
+                        </div>
+                      ) : (
+                        filteredAvailableTables.map((tbl) => {
+                          const isSelected = selectedTablesList.includes(tbl);
+                          return (
+                            <label
+                              key={tbl}
+                              className={`flex items-center gap-2.5 px-3 py-1.5 text-xs cursor-pointer transition-colors ${
+                                isSelected ? "bg-sky-50/60 text-slate-900" : "hover:bg-slate-50 text-slate-700"
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => toggleTableInSelection(tbl)}
+                                className="rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                              />
+                              <span className="font-mono text-[11px] truncate">{tbl}</span>
+                            </label>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {currentScope === "schema" && (
+                  <Field
+                    label="Source Schema"
+                    hint="All tables belonging to this schema will be extracted and published into the lakehouse."
+                  >
+                    {availableSchemas.length > 0 ? (
+                      <select
+                        className={inputClass}
+                        value={
+                          (args.schema_name as string) ||
+                          (step.target.endsWith(".*")
+                            ? step.target.slice(0, -2)
+                            : availableSchemas[0] || "")
+                        }
+                        onChange={(e) => {
+                          const sch = e.target.value;
+                          onChange({ target: `${sch}.*` });
+                          setArgs({
+                            scope: "schema",
+                            schema_name: sch,
+                            entity: undefined,
+                            tables: undefined,
+                          });
+                        }}
+                      >
+                        {availableSchemas.map((sch) => {
+                          const count =
+                            matchedNode?.tables.filter((t) => t.schema === sch).length ?? 0;
+                          return (
+                            <option key={sch} value={sch}>
+                              {sch} ({count} table{count === 1 ? "" : "s"})
+                            </option>
+                          );
+                        })}
+                      </select>
+                    ) : (
+                      <input
+                        className={inputClass}
+                        placeholder="e.g. public, sales"
+                        value={
+                          (args.schema_name as string) ||
+                          (step.target.endsWith(".*") ? step.target.slice(0, -2) : "")
+                        }
+                        onChange={(e) => {
+                          const sch = e.target.value;
+                          onChange({ target: `${sch}.*` });
+                          setArgs({
+                            scope: "schema",
+                            schema_name: sch,
+                            entity: undefined,
+                            tables: undefined,
+                          });
+                        }}
+                      />
+                    )}
+                  </Field>
+                )}
+
+                {currentScope === "source" && (
+                  <div className="rounded-lg border border-sky-200 bg-sky-50/50 p-3 text-xs text-sky-900">
+                    <div className="flex items-center gap-2 font-semibold text-sky-950">
+                      <Database className="w-4 h-4 text-sky-600" />
+                      <span>Entire Source Ingestion</span>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-relaxed text-sky-800">
+                      Extracts all{" "}
+                      {availableTables.length > 0 ? `${availableTables.length} discovered ` : ""}
+                      tables from source connection{" "}
+                      <strong>{matchedNode?.name || currentConnectionId}</strong>. Each table is
+                      published into its own Parquet file under the target folder.
+                    </p>
+                  </div>
+                )}
+
+                {/* Lakehouse folder and target stem */}
+                <div className={`grid ${currentScope === "table" ? "grid-cols-2" : "grid-cols-1"} gap-2`}>
                   <Field label="Lakehouse folder" hint="e.g. raw, bronze">
                     <input
                       className={inputClass}
@@ -450,84 +789,202 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                       onChange={(event) => setArgs({ target_folder: event.target.value })}
                     />
                   </Field>
-                  <Field label="Table name stem" hint="Parquet table stem">
-                    <input
-                      className={`${inputClass} font-mono`}
-                      value={(args.target_name as string) ?? ""}
-                      placeholder={
-                        step.target
-                          ? step.target.includes(".")
-                            ? step.target.split(".").slice(-1)[0]
-                            : step.target
-                          : "table_name"
-                      }
-                      onChange={(event) => setArgs({ target_name: event.target.value })}
-                    />
-                  </Field>
+                  {currentScope === "table" && (
+                    <Field label="Table name stem" hint="Parquet table stem">
+                      <input
+                        className={`${inputClass} font-mono`}
+                        value={(args.target_name as string) ?? ""}
+                        placeholder={
+                          step.target
+                            ? step.target.includes(".")
+                              ? step.target.split(".").slice(-1)[0]
+                              : step.target
+                            : "table_name"
+                        }
+                        onChange={(event) => setArgs({ target_name: event.target.value })}
+                      />
+                    </Field>
+                  )}
                 </div>
 
+                {/* Ingestion Mode */}
                 <Field label="Ingestion mode">
-                  <div className="flex gap-2">
+                  <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
                       onClick={() => setArgs({ mode: "snapshot" })}
-                      className={`flex-1 rounded-lg border py-1.5 text-xs font-semibold transition-all ${
+                      className={`py-2 px-2.5 text-xs font-medium rounded-lg border text-left transition-all ${
                         (args.mode ?? "snapshot") === "snapshot"
-                          ? "border-sky-500 bg-sky-50 text-sky-700 shadow-xs"
+                          ? "border-sky-500 bg-sky-50 text-sky-900 ring-1 ring-sky-500 font-semibold shadow-xs"
                           : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
                       }`}
                     >
-                      Snapshot (Full)
+                      <div className="font-semibold flex items-center gap-1.5">
+                        <RefreshCw className="w-3.5 h-3.5 text-sky-600" />
+                        <span>Full Snapshot</span>
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">
+                        Direct streaming snapshot to Parquet
+                      </div>
                     </button>
                     <button
                       type="button"
-                      onClick={() => setArgs({ mode: "incremental" })}
-                      className={`flex-1 rounded-lg border py-1.5 text-xs font-semibold transition-all ${
+                      onClick={() => {
+                        const patch: Record<string, unknown> = { mode: "incremental" };
+                        if (!args.watermark_column && tableColumns.length > 0) {
+                          const cand =
+                            tableColumns.find(
+                              (c) =>
+                                c.name.toLowerCase().includes("updated") ||
+                                c.name.toLowerCase().includes("time") ||
+                                c.name.toLowerCase().includes("date") ||
+                                c.name.toLowerCase().includes("created")
+                            )?.name ||
+                            tableColumns.find((c) => c.name.toLowerCase().includes("id"))?.name ||
+                            tableColumns[0]?.name;
+                          if (cand) patch.watermark_column = cand;
+                        }
+                        setArgs(patch);
+                      }}
+                      className={`py-2 px-2.5 text-xs font-medium rounded-lg border text-left transition-all ${
                         args.mode === "incremental"
-                          ? "border-sky-500 bg-sky-50 text-sky-700 shadow-xs"
+                          ? "border-sky-500 bg-sky-50 text-sky-900 ring-1 ring-sky-500 font-semibold shadow-xs"
                           : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
                       }`}
                     >
-                      Incremental (Delta)
+                      <div className="font-semibold flex items-center gap-1.5">
+                        <ArrowDownToLine className="w-3.5 h-3.5 text-sky-600" />
+                        <span>Incremental</span>
+                      </div>
+                      <div className="text-[10px] text-slate-500 mt-0.5">
+                        Extracts deltas ($gt watermark) & merges
+                      </div>
                     </button>
                   </div>
                 </Field>
 
+                {/* Incremental Configuration */}
                 {args.mode === "incremental" && (
-                  <div className="space-y-2 rounded-lg border border-slate-200 bg-slate-50/70 p-2.5">
-                    <Field
-                      label="Watermark column"
-                      hint="Timestamp or incremental column (e.g. updated_at, order_date)"
-                    >
-                      <input
-                        className={inputClass}
-                        placeholder="updated_at"
-                        value={(args.watermark_column as string) ?? ""}
-                        onChange={(event) => setArgs({ watermark_column: event.target.value })}
-                      />
-                    </Field>
-                    <div className="grid grid-cols-2 gap-2">
-                      <Field label="Write strategy">
+                  <div className="space-y-3 p-3 bg-sky-50/50 border border-sky-200 rounded-xl">
+                    <div>
+                      <span className="block text-xs font-semibold text-slate-800 mb-1">
+                        Watermark Column (Timestamp or Sequence)
+                      </span>
+                      {currentScope === "table" && tableColumns.length > 0 ? (
                         <select
-                          className={inputClass}
-                          value={(args.write_strategy as string) ?? "append"}
-                          onChange={(event) => setArgs({ write_strategy: event.target.value })}
+                          className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500 font-mono text-slate-800"
+                          value={(args.watermark_column as string) ?? ""}
+                          onChange={(e) => setArgs({ watermark_column: e.target.value })}
                         >
-                          <option value="append">Append</option>
-                          <option value="upsert">Upsert (Merge)</option>
+                          <option value="">Select watermark column...</option>
+                          {tableColumns.map((c) => (
+                            <option key={c.name} value={c.name}>
+                              {c.name} ({c.data_type})
+                            </option>
+                          ))}
+                          {Boolean(args.watermark_column) &&
+                            !tableColumns.some((c) => c.name === args.watermark_column) && (
+                              <option value={String(args.watermark_column)}>
+                                {String(args.watermark_column)} (custom)
+                              </option>
+                            )}
                         </select>
-                      </Field>
-                      {args.write_strategy === "upsert" && (
-                        <Field label="Primary key" hint="Unique key for merge">
+                      ) : (
+                        <input
+                          className={inputClass}
+                          placeholder="e.g. updated_at, created_at, modified_date"
+                          value={(args.watermark_column as string) ?? ""}
+                          onChange={(e) => setArgs({ watermark_column: e.target.value })}
+                        />
+                      )}
+                      <p className="text-[10px] text-slate-500 mt-1">
+                        Obelisk inspects the existing Parquet file to calculate the current maximum watermark scalar.
+                      </p>
+                    </div>
+
+                    {/* Write Strategy: Append vs Upsert */}
+                    <div>
+                      <span className="block text-xs font-semibold text-slate-800 mb-1">
+                        Delta Merge Strategy
+                      </span>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setArgs({ write_strategy: "append" })}
+                          className={`py-1.5 px-2.5 text-xs rounded-lg border text-left transition-all ${
+                            (args.write_strategy ?? "append") === "append"
+                              ? "border-sky-500 bg-white text-sky-900 font-semibold shadow-xs ring-1 ring-sky-500"
+                              : "border-slate-200 bg-white/70 text-slate-600 hover:bg-white"
+                          }`}
+                        >
+                          <div className="text-xs font-semibold">Append Only</div>
+                          <div className="text-[9px] text-slate-500 mt-0.5">Fast log-append</div>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const patch: Record<string, unknown> = { write_strategy: "upsert" };
+                            if (!args.primary_key && tableColumns.length > 0) {
+                              const pkCand =
+                                tableColumns.find((c) => c.is_primary_key)?.name ||
+                                tableColumns.find(
+                                  (c) =>
+                                    c.name.toLowerCase() === "id" ||
+                                    c.name.toLowerCase().endsWith("_id")
+                                )?.name ||
+                                tableColumns[0]?.name;
+                              if (pkCand) patch.primary_key = pkCand;
+                            }
+                            setArgs(patch);
+                          }}
+                          className={`py-1.5 px-2.5 text-xs rounded-lg border text-left transition-all ${
+                            args.write_strategy === "upsert"
+                              ? "border-sky-500 bg-white text-sky-900 font-semibold shadow-xs ring-1 ring-sky-500"
+                              : "border-slate-200 bg-white/70 text-slate-600 hover:bg-white"
+                          }`}
+                        >
+                          <div className="text-xs font-semibold">Upsert (Deduplicate)</div>
+                          <div className="text-[9px] text-slate-500 mt-0.5">Updates matching PK</div>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Primary Key for Upsert */}
+                    {args.write_strategy === "upsert" && (
+                      <div className="pt-0.5">
+                        <span className="block text-xs font-semibold text-slate-800 mb-1">
+                          Primary Key / Deduplication Column
+                        </span>
+                        {currentScope === "table" && tableColumns.length > 0 ? (
+                          <select
+                            className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500 font-mono text-slate-800"
+                            value={(args.primary_key as string) ?? ""}
+                            onChange={(e) => setArgs({ primary_key: e.target.value })}
+                          >
+                            <option value="">Select primary key column...</option>
+                            {tableColumns.map((c) => (
+                              <option key={c.name} value={c.name}>
+                                {c.name} ({c.data_type}){c.is_primary_key ? " 🔑 PK" : ""}
+                              </option>
+                            ))}
+                            {Boolean(args.primary_key) &&
+                              !tableColumns.some((c) => c.name === args.primary_key) && (
+                                <option value={String(args.primary_key)}>
+                                  {String(args.primary_key)} (custom)
+                                </option>
+                              )}
+                          </select>
+                        ) : (
                           <input
                             className={inputClass}
-                            placeholder="id"
+                            placeholder="e.g. id"
                             value={(args.primary_key as string) ?? ""}
-                            onChange={(event) => setArgs({ primary_key: event.target.value })}
+                            onChange={(e) => setArgs({ primary_key: e.target.value })}
                           />
-                        </Field>
-                      )}
-                    </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
 
