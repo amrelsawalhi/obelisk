@@ -823,6 +823,19 @@ class IngestEngine:
         c = conn if conn is not None else kwargs.get("conn")
         if c is None:
             raise ValueError("conn is required for _transfer_from")
+        def _select_expr() -> str:
+            try:
+                desc = c.execute(f"DESCRIBE SELECT * FROM {source_ref} LIMIT 0;").fetchall()
+                enum_cols = [row[0] for row in desc if "ENUM" in str(row[1]).upper()]
+                if enum_cols:
+                    replaces = ", ".join(f"{quote_ident(col)}::VARCHAR AS {quote_ident(col)}" for col in enum_cols)
+                    return f"* REPLACE ({replaces})"
+            except Exception as ex:
+                logger.debug("Column introspection for ENUM conversion skipped: %s", ex)
+            return "*"
+
+        projection = _select_expr()
+
         if mode == "snapshot" or not exists:
             # An empty source must not replace a table that has rows: a source that is
             # briefly empty would otherwise destroy data a rerun cannot bring back.
@@ -833,13 +846,13 @@ class IngestEngine:
                 return 0
             c.execute(
                 f"CREATE OR REPLACE TABLE {target} AS "
-                f"SELECT * FROM {source_ref} {where}{limit_clause};"
+                f"SELECT {projection} FROM {source_ref} {where}{limit_clause};"
             )
             written = self._row_count(c, target)
         else:
             before = self._row_count(c, target)
             c.execute(
-                f"INSERT INTO {target} SELECT * FROM {source_ref} {where}{limit_clause};"
+                f"INSERT INTO {target} SELECT {projection} FROM {source_ref} {where}{limit_clause};"
             )
             written = max(0, self._row_count(c, target) - before)
         if on_batch is not None:

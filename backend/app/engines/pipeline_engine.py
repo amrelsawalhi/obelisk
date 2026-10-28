@@ -1226,7 +1226,7 @@ class PipelineEngine:
         run: PipelineRun,
     ) -> Dict[str, Dict[str, Any]]:
         if step.step_type == "ingest":
-            return await self._run_ingest(step, args, params, log, timeout)
+            return await self._run_ingest(step, args, params, log, timeout, step_run_id)
         if step.step_type in ("dbt_run", "dbt_test"):
             return await self._run_dbt(step, args, params, log, timeout, step_run_id)
         if step.step_type == "script":
@@ -1256,8 +1256,30 @@ class PipelineEngine:
         params: Dict[str, Any],
         log: List[str],
         timeout: int,
+        step_run_id: Optional[str] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Ingests from an external connection into the lakehouse and publishes table & rows."""
+        streamed = step_run_id is not None
+        flusher: Optional[asyncio.Task] = None
+        if streamed:
+            flusher = asyncio.create_task(self._flush_log_loop(step_run_id, log))
+
+        try:
+            return await self._execute_ingest(step, args, params, log, timeout)
+        finally:
+            if flusher is not None:
+                flusher.cancel()
+            if streamed:
+                await self._flush_logs(step_run_id, log)
+
+    async def _execute_ingest(
+        self,
+        step: PipelineStep,
+        args: Dict[str, Any],
+        params: Dict[str, Any],
+        log: List[str],
+        timeout: int,
+    ) -> Dict[str, Dict[str, Any]]:
         from app.models.connection import Connection
         from app.core.vault import decrypt
         from app.engines.ingest_runner import trigger_ingest
@@ -1440,7 +1462,21 @@ class PipelineEngine:
         )
 
         if failed_errors:
-            raise RuntimeError(f"Ingest failed for {len(failed_errors)} table(s): {'; '.join(failed_errors[:3])}")
+            continue_on_error = bool(
+                args.get("continue_on_error")
+                or args.get("ignore_errors")
+                or str(args.get("on_error", "")).lower() == "continue"
+                or (succeeded > 0 and args.get("allow_partial_success", True))
+            )
+            if continue_on_error and succeeded > 0:
+                log.append(
+                    f"WARNING: Batch ingest finished with {len(failed_errors)} failed table(s), "
+                    f"but proceeding because {succeeded} table(s) succeeded (allow_partial_success)."
+                )
+            else:
+                raise RuntimeError(
+                    f"Ingest failed for {len(failed_errors)} table(s): {'; '.join(failed_errors[:3])}"
+                )
 
         primary_table = f"{target_folder}.*" if len(ingested_tables) > 1 else (ingested_tables[0] if ingested_tables else target_folder)
         return {

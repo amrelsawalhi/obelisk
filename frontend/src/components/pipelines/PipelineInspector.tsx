@@ -1008,6 +1008,23 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                     }
                   />
                 </Field>
+
+                {currentScope !== "table" && (
+                  <label className="flex items-start gap-2.5 pt-1 text-xs text-slate-700 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                      checked={(args.allow_partial_success as boolean) ?? true}
+                      onChange={(e) => setArgs({ allow_partial_success: e.target.checked })}
+                    />
+                    <div>
+                      <span className="font-semibold text-slate-900">Allow partial batch success</span>
+                      <p className="text-[11px] text-slate-500">
+                        Continue pipeline if some tables fail, as long as other tables succeed (matches Catalog batch ingest).
+                      </p>
+                    </div>
+                  </label>
+                )}
               </>
             ) : (
               <Field
