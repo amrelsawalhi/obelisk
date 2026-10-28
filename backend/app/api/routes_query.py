@@ -72,6 +72,12 @@ class QueryExportRequest(BaseModel):
         None, description="Optional Postgres sources to attach dynamically"
     )
 
+@router.get("/telemetry")
+async def get_query_engine_telemetry():
+    """Returns live DuckDB engine concurrency, spill directory usage, and lakehouse disk headroom."""
+    return await asyncio.to_thread(duckdb_engine.get_telemetry)
+
+
 @router.get("/targets", response_model=List[QueryTarget])
 async def list_query_targets(db: AsyncSession = Depends(get_db)):
     """
@@ -468,12 +474,14 @@ async def export_sql_results(
             output_format=fmt,
             attachments=attachments,
         )
-    except Exception as e:
+    except BaseException as e:
         await asyncio.to_thread(temp_file.unlink, missing_ok=True)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Export failed: {str(e)}",
-        )
+        if isinstance(e, Exception):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Export failed: {str(e)}",
+            )
+        raise
 
     base_name = req.filename or "export"
     media_type = "application/octet-stream" if fmt == "parquet" else "text/csv"

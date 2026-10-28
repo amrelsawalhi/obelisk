@@ -324,7 +324,7 @@ def _coerce_param(raw: Any, kind: str) -> Any:
 
 
 def render_sql_params(sql: str, params: Dict[str, Any]) -> str:
-    """Substitutes ``{{name}}`` placeholders with escaped SQL literals.
+    """Substitutes ``{{name}}`` or ``{{params.name}}`` placeholders with escaped SQL literals.
 
     DuckDB's ``conn.sql`` path has no bind-parameter API, so the literal is built
     here: numbers and booleans unquoted, everything else as a quoted string with
@@ -341,8 +341,8 @@ def render_sql_params(sql: str, params: Dict[str, Any]) -> str:
             literal = str(value)
         else:
             literal = "'" + str(value).replace("'", "''") + "'"
-        out = out.replace("{{" + name + "}}", literal)
-        out = out.replace("{{ " + name + " }}", literal)
+        pattern = re.compile(rf"\{{\{{\s*(?:params?\.)?{re.escape(name)}\s*\}}\}}", re.IGNORECASE)
+        out = pattern.sub(literal, out)
     return out
 
 
@@ -1357,7 +1357,14 @@ class PipelineEngine:
             raise ValueError(f"Ingest step '{step.name}' has no tables / entities specified to ingest.")
 
         mode = str(args.get("mode") or "snapshot").strip().lower()
-        watermark_column = args.get("watermark_column") or None
+        if mode == "snapshot":
+            watermark_column = None
+            write_strategy = "append"
+            primary_key = None
+        else:
+            watermark_column = args.get("watermark_column") or None
+            write_strategy = str(args.get("write_strategy") or "append").strip().lower()
+            primary_key = (args.get("primary_key") or None) if write_strategy == "upsert" else None
         target_folder = str(args.get("target_folder") or "raw").strip().strip("/") or "raw"
         target_name = (args.get("target_name") or "").strip() or None
         if target_name in ("*", "all"):
@@ -1368,8 +1375,6 @@ class PipelineEngine:
                 limit = int(limit)
             except (ValueError, TypeError):
                 limit = None
-        write_strategy = str(args.get("write_strategy") or "append").strip().lower()
-        primary_key = args.get("primary_key") or None
 
         plaintext_pw = decrypt(conn.encrypted_credentials)
         connection_params = {
@@ -1390,22 +1395,34 @@ class PipelineEngine:
 
             log.append(f"Ingesting '{entity}' from {conn.source_type} source '{conn.name}' (mode={mode})")
 
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    trigger_ingest,
-                    source_type=conn.source_type,
-                    connection_params=connection_params,
-                    entity=entity,
-                    mode=mode,
-                    watermark_column=watermark_column,
-                    target_name=clean_stem,
-                    target_folder=target_folder,
-                    limit=limit,
-                    write_strategy=write_strategy,
-                    primary_key=primary_key,
-                ),
-                timeout=timeout,
-            )
+            active_conns: List[Any] = []
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        trigger_ingest,
+                        source_type=conn.source_type,
+                        connection_params=connection_params,
+                        entity=entity,
+                        mode=mode,
+                        watermark_column=watermark_column,
+                        target_name=clean_stem,
+                        target_folder=target_folder,
+                        limit=limit,
+                        write_strategy=write_strategy,
+                        primary_key=primary_key,
+                        should_cancel=lambda: (run is not None and run.id in self._cancel_runs),
+                        on_connection=active_conns.append,
+                        schema_policy=str(args.get("schema_policy") or "evolve"),
+                    ),
+                    timeout=timeout,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                for c in active_conns:
+                    try:
+                        c.interrupt()
+                    except Exception:
+                        pass
+                raise
 
             for line in result.get("logs", []):
                 log.append(line)
@@ -1440,6 +1457,7 @@ class PipelineEngine:
                 raise StepCancelled()
             stem = entity.split(".", 1)[-1] if "." in entity else entity
             clean_stem = stem.replace(".", "_").replace("/", "_").replace("\\", "_")
+            active_conns_multi: List[Any] = []
             try:
                 res = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -1454,6 +1472,9 @@ class PipelineEngine:
                         limit=limit,
                         write_strategy=write_strategy,
                         primary_key=primary_key,
+                        should_cancel=lambda: (run is not None and run.id in self._cancel_runs),
+                        on_connection=active_conns_multi.append,
+                        schema_policy=str(args.get("schema_policy") or "evolve"),
                     ),
                     timeout=timeout,
                 )
@@ -1468,6 +1489,16 @@ class PipelineEngine:
                     err_msg = (res.get("logs") or ["unknown failure"])[-1]
                     failed_errors.append(f"'{entity}': {err_msg}")
                     log.append(f"✗ Failed '{entity}': {err_msg}")
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                for c in active_conns_multi:
+                    try:
+                        c.interrupt()
+                    except Exception:
+                        pass
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                failed_errors.append(f"'{entity}': timed out after {timeout}s")
+                log.append(f"✗ Failed '{entity}': timed out after {timeout}s")
             except Exception as exc:
                 failed_errors.append(f"'{entity}': {exc}")
                 log.append(f"✗ Failed '{entity}': {exc}")
@@ -1562,6 +1593,13 @@ class PipelineEngine:
         flusher: Optional[asyncio.Task] = None
         if streamed:
             flusher = asyncio.create_task(self._flush_log_loop(step_run_id, log))
+        dbt_procs: List[ subprocess.Popen ] = []
+
+        def _register_dbt_proc(proc: subprocess.Popen) -> None:
+            dbt_procs.append(proc)
+            if step_run_id:
+                self._procs[step_run_id] = proc
+
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -1571,15 +1609,19 @@ class PipelineEngine:
                     dbt_vars=dbt_vars,
                     env_vars=env_vars,
                     on_line=log.append if streamed else None,
+                    on_process=_register_dbt_proc,
                 ),
                 timeout=timeout,
             )
-        except asyncio.TimeoutError:
-            # A thread cannot be killed; dbt's own subprocess finishes on its own.
-            # The step is still terminal and honest about the timeout.
-            log.append(f"dbt exceeded {timeout}s; abandoning the wait.")
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            for proc in dbt_procs:
+                _kill_process_tree(proc)
+            if isinstance(exc, asyncio.TimeoutError):
+                log.append(f"dbt exceeded {timeout}s; process tree terminated.")
             raise
         finally:
+            if step_run_id:
+                self._procs.pop(step_run_id, None)
             if flusher is not None:
                 flusher.cancel()
         output = (result or {}).get("output", "")
@@ -1805,19 +1847,24 @@ class PipelineEngine:
         import queue
         import threading
 
+        from app.core.resource_advisor import advisor
+
+        popen_kwargs: Dict[str, Any] = {}
+        preexec = advisor.make_posix_rlimit_preexec()
+        if preexec is not None:
+            popen_kwargs["preexec_fn"] = preexec
+
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            # Decode as UTF-8 regardless of the Windows console code page; the child
-            # is also told to write UTF-8 (see _child_env), so what a script prints is
-            # what the log shows instead of a charmap error.
             encoding="utf-8",
             errors="replace",
             bufsize=1,
             env=env,
             cwd=str(self.workspace_root),
+            **popen_kwargs,
         )
         self._procs[step_run_id] = proc
         lines: "queue.Queue[Optional[str]]" = queue.Queue()
@@ -1899,6 +1946,8 @@ class PipelineEngine:
         Skips the write when nothing changed: an idle step must not compete for the
         single SQLite writer every second.
         """
+        if len(log) > 4000:
+            del log[:-2000]
         text = self._cap_logs("\n".join(log))
         if self._flushed.get(step_run_id) == len(text):
             return
@@ -2189,7 +2238,11 @@ class PipelineEngine:
         parents: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
         output_path: Optional[Path] = None,
     ) -> Dict[str, str]:
+        from app.core.resource_advisor import advisor
+
         env = os.environ.copy()
+        for k, v in advisor.get_child_env_limits().items():
+            env.setdefault(k, v)
         backend_dir = str(self.workspace_root / "backend")
         # The notebooks directory carries the `obelisk` SDK shim that notebooks and
         # scripts import; without it `import obelisk` only works from inside that

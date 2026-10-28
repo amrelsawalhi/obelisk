@@ -48,7 +48,11 @@ class ProcessServiceManager:
     def _build_env(self, bp: Any, service_home: Optional[Path]) -> Dict[str, str]:
         from app.config import settings
 
+        from app.core.resource_advisor import advisor
+
         env = os.environ.copy()
+        for k, v in advisor.get_child_env_limits().items():
+            env.setdefault(k, v)
         env["PYTHONPATH"] = str((_PROJECT_ROOT / "backend").resolve()) + os.pathsep + env.get("PYTHONPATH", "")
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONDONTWRITEBYTECODE"] = "1"

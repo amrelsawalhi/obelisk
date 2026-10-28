@@ -569,7 +569,8 @@ async def test_connection(
         )
 
     plaintext_pw = decrypt(conn.encrypted_credentials)
-    return _execute_live_test(
+    return await asyncio.to_thread(
+        _execute_live_test,
         source_type=conn.source_type,
         host=conn.host,
         port=conn.port,

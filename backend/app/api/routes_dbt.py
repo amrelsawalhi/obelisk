@@ -182,9 +182,13 @@ async def get_warehouse():
     """The connection marts publish into, plus the candidates a picker can offer."""
     from app.core.warehouse_resolver import describe_warehouse_postgres, warehouse_candidates
 
+    warehouse, candidates = await asyncio.gather(
+        asyncio.to_thread(describe_warehouse_postgres),
+        asyncio.to_thread(warehouse_candidates),
+    )
     return {
-        "warehouse": describe_warehouse_postgres(),
-        "candidates": warehouse_candidates(),
+        "warehouse": warehouse,
+        "candidates": candidates,
     }
 
 
@@ -198,7 +202,7 @@ async def set_warehouse(req: WarehouseBinding):
     )
 
     if req.connection_id:
-        candidate = warehouse_candidate(req.connection_id.strip())
+        candidate = await asyncio.to_thread(warehouse_candidate, req.connection_id.strip())
         if not candidate:
             raise HTTPException(status_code=404, detail="No such Postgres connection.")
         if candidate["read_only"]:
@@ -209,8 +213,9 @@ async def set_warehouse(req: WarehouseBinding):
                     "before making it the warehouse."
                 ),
             )
-    set_warehouse_connection_id(req.connection_id)
-    return {"warehouse": describe_warehouse_postgres()}
+    await asyncio.to_thread(set_warehouse_connection_id, req.connection_id)
+    warehouse = await asyncio.to_thread(describe_warehouse_postgres)
+    return {"warehouse": warehouse}
 
 
 @router.post("/compile")

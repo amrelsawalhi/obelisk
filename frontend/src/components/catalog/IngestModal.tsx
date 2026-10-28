@@ -31,6 +31,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({
     table.columns.find((c) => c.name.toLowerCase().includes('id') || c.name.toLowerCase().includes('time'))?.name || ''
   );
   const [writeStrategy, setWriteStrategy] = useState<'append' | 'upsert'>('append');
+  const [schemaPolicy, setSchemaPolicy] = useState<'evolve' | 'strict'>('evolve');
   const [primaryKey, setPrimaryKey] = useState(
     table.columns.find((c) => c.name.toLowerCase() === 'id' || c.name.toLowerCase().endsWith('_id'))?.name || table.columns[0]?.name || ''
   );
@@ -69,6 +70,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({
         mode,
         watermark_column: mode === 'incremental' ? watermarkCol : undefined,
         write_strategy: mode === 'incremental' ? writeStrategy : undefined,
+        schema_policy: mode === 'incremental' ? schemaPolicy : 'evolve',
         primary_key: mode === 'incremental' && writeStrategy === 'upsert' ? primaryKey : undefined,
         target_name: targetFileName,
         target_folder: targetFolder.trim(),
@@ -230,6 +232,21 @@ export const IngestModal: React.FC<IngestModalProps> = ({
                   </select>
                 </div>
               )}
+
+              {/* Schema Evolution Policy */}
+              <div className="pt-1">
+                <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                  Schema Drift Policy
+                </label>
+                <select
+                  value={schemaPolicy}
+                  onChange={(e) => setSchemaPolicy(e.target.value as 'evolve' | 'strict')}
+                  className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-1.5 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500 text-slate-800"
+                >
+                  <option value="evolve">Auto-Evolve Schema (ALTER TABLE ADD COLUMN)</option>
+                  <option value="strict">Strict Schema Guard (Fail on Upstream Drift)</option>
+                </select>
+              </div>
             </div>
           )}
 

@@ -110,6 +110,8 @@ class DbtRunner:
         restart, which previously wiped every run.
         """
         self._runs_history.append(run)
+        if len(self._runs_history) > 100:
+            del self._runs_history[:-100]
         run_id = str(run.get("run_id") or uuid.uuid4())
         task_history.record(
             "dbt",
@@ -404,13 +406,11 @@ class DbtRunner:
 
         schema = sql_ident(schema_name)
 
-        conn = duckdb.connect(":memory:")
+        from app.engines.duckdb_engine import duckdb_engine
+        conn = duckdb_engine.get_connection()
         synced_info = []
 
         try:
-            from app.core.catalog import attach_lakehouse
-
-            attach_lakehouse(conn)
             conn.execute("LOAD postgres;")
             conn_str = build_pg_dsn(
                 dbname=database,
@@ -529,6 +529,7 @@ class DbtRunner:
         select: Optional[str] = None,
         dbt_vars: Optional[Dict[str, Any]] = None,
         on_line: Optional[Callable[[str], None]] = None,
+        on_process: Optional[Callable[[subprocess.Popen], None]] = None,
     ) -> Dict[str, Any]:
         """
         Executes a dbt command (run, test, seed, compile) inside the dbt_project directory.
@@ -561,7 +562,11 @@ class DbtRunner:
         if dbt_vars:
             cmd.extend(["--vars", json.dumps(dbt_vars)])
 
+        from app.core.resource_advisor import advisor
+
         env = os.environ.copy()
+        for k, v in advisor.get_child_env_limits().items():
+            env.setdefault(k, v)
         if env_vars:
             env.update(env_vars)
         # The lakehouse output opens DBT_DUCKDB_PATH; this run's own file means a second
@@ -570,46 +575,34 @@ class DbtRunner:
 
         start_time = time.time()
         try:
-            if on_line is None:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    env=env,
-                    cwd=str(self.dbt_project_dir),
-                )
-                output = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
-                # Filter out noisy runpy import warnings
-                clean_lines = [l for l in output.splitlines() if "RuntimeWarning: 'dbt.cli.main'" not in l]
-                output = "\n".join(clean_lines).strip()
-                exit_code = proc.returncode
-            else:
-                # Streaming mode: hand each line to the caller as dbt writes it, so a step's
-                # log is readable while the step runs instead of appearing all at once at the
-                # end. ``output`` is rebuilt from the same kept lines, so callers that only
-                # want the text see no difference.
-                kept: List[str] = []
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    env=env,
-                    cwd=str(self.dbt_project_dir),
-                )
-                assert proc.stdout is not None
-                for raw_line in proc.stdout:
-                    line = raw_line.rstrip("\n")
-                    if "RuntimeWarning: 'dbt.cli.main'" in line:
-                        continue
-                    kept.append(line)
+            kept: List[str] = []
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env,
+                cwd=str(self.dbt_project_dir),
+            )
+            if on_process is not None:
+                try:
+                    on_process(proc)
+                except Exception:
+                    pass
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip("\n")
+                if "RuntimeWarning: 'dbt.cli.main'" in line:
+                    continue
+                kept.append(line)
+                if on_line is not None:
                     on_line(line)
-                proc.wait()
-                output = "\n".join(kept).strip()
-                exit_code = proc.returncode
+            proc.wait()
+            output = "\n".join(kept).strip()
+            exit_code = proc.returncode
         finally:
             # Even a failed or interrupted run leaves a usable manifest behind; dbt writes
             # it before it starts executing models.
@@ -1149,6 +1142,8 @@ class DbtRunner:
                 }
             )
         elif adapter == "duckdb":
+            from app.core.resource_advisor import advisor
+
             env["DBT_DUCKDB_PATH"] = (
                 settings.lakehouse_root_path / DBT_SCRATCH_DB
             ).resolve().as_posix()
@@ -1158,6 +1153,11 @@ class DbtRunner:
             # The lake's data path is where its Parquet goes; the profile passes it on
             # attach so a fresh install lands in the same directory as ingestion does.
             env["DBT_LAKEHOUSE_DATA_PATH"] = settings.duckdb_storage_path
+            slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
+            env["DBT_DUCKDB_MEMORY_LIMIT"] = advisor.get_duckdb_memory_limit(slots)
+            env["DBT_DUCKDB_MAX_TEMP_SIZE"] = advisor.get_duckdb_temp_limit(
+                settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT
+            )
 
         return env
 

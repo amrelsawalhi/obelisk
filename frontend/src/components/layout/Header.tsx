@@ -196,6 +196,31 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
                     </div>
                   </div>
 
+                  {/* DuckDB Concurrency, Spill & Disk Headroom */}
+                  <div className="pt-2 border-t border-slate-100 space-y-1.5 text-[11px] text-slate-600">
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium text-slate-700">DuckDB Heavy Slots</span>
+                      <span className="font-mono font-bold text-slate-900 bg-slate-100 px-1.5 py-0.5 rounded">
+                        {telemetry.active_heavy_queries ?? 0}/{telemetry.max_concurrent_heavy ?? 2} active
+                        {(telemetry.waiting_heavy_queries ?? 0) > 0
+                          ? ` (${telemetry.waiting_heavy_queries} queued)`
+                          : ''}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium text-slate-700">Temp Spill Usage</span>
+                      <span className="font-mono text-slate-800">
+                        {telemetry.temp_spill_mb ?? 0} MB / {telemetry.temp_spill_limit ?? '50GB'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium text-slate-700">Lakehouse Headroom</span>
+                      <span className="font-mono text-emerald-700 font-semibold">
+                        {telemetry.lakehouse_free_gb ?? '—'} GB free
+                      </span>
+                    </div>
+                  </div>
+
                   {/* Active Containers */}
                   <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-slate-600">
                     <span className="flex items-center gap-1 font-medium">

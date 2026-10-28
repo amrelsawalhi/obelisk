@@ -14,6 +14,7 @@ name is the schema, and the file you write is the table.
 import io
 import logging
 import os
+import re
 import sys
 import json
 import uuid
@@ -28,7 +29,15 @@ import pyarrow.parquet as pq
 import polars as pl
 
 from app.config import settings
-from app.core.catalog import SOURCE, fqn_for, path_for, split_table_path, sql_name_for
+from app.core.catalog import (
+    LOAD_TABLE_SUFFIX,
+    PARQUET_SUFFIX,
+    SOURCE,
+    fqn_for,
+    path_for,
+    split_table_path,
+    sql_name_for,
+)
 from app.core.resource_advisor import advisor
 from app.core.storage import warehouse_storage
 from app.engines.duckdb_engine import DuckDBEngine
@@ -49,19 +58,11 @@ __all__ = [
     "EagerReadTooLarge",
 ]
 
-# One shared connection for SDK helpers that do not receive an explicit one.
-# Creating a fresh in-memory connection per call leaked a DuckDB instance every
-# time to_duckdb()/to_arrow() was used (audit M4).
 _IMPLICIT_DUCKDB_CONN = None
 
 
 class EagerReadTooLarge(RuntimeError):
-    """An eager read was refused because the table is bigger than this machine can hold.
-
-    ``to_polars()``, ``to_df()`` and ``to_arrow()`` materialise the whole table. Past a
-    threshold that is not a slow cell, it is the notebook kernel dying — and the guard
-    says so *before* it happens, naming the lazy alternative instead.
-    """
+    """An eager read was refused because the table is bigger than this machine can hold."""
 
 
 def _human_bytes(size: float) -> str:
@@ -70,7 +71,7 @@ def _human_bytes(size: float) -> str:
         if abs(size) < 1024 or unit == "TB":
             return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
         size /= 1024
-    return f"{size:.1f} TB"  # unreachable, kept for type checkers
+    return f"{size:.1f} TB"
 
 
 def _eager_refuse_bytes() -> int:
@@ -87,6 +88,29 @@ def _eager_refuse_bytes() -> int:
     return max(8 * 1024 ** 3, int(total_ram * 0.25))
 
 
+def _catalog_table_bytes(identifier: str) -> int:
+    """Queries DuckLake catalog metadata for exact active Parquet byte size when disk path is empty."""
+    from app.core.catalog import scan
+
+    clean = (identifier or "").strip().replace("`", "").replace('"', "")
+    if not clean:
+        return 0
+    stripped = clean[len("lakehouse."):] if clean.lower().startswith("lakehouse.") else clean
+    wanted = stripped.replace(".", "/").lower()
+    try:
+        for entry in scan().tables:
+            entry_rel = (
+                entry.path[: -len(PARQUET_SUFFIX)]
+                if entry.path.lower().endswith(PARQUET_SUFFIX)
+                else entry.path
+            )
+            if entry_rel.lower() == wanted or entry.fqn.lower() == f"lakehouse.{stripped.lower()}":
+                return int(entry.size_bytes or 0)
+    except Exception:
+        return 0
+    return 0
+
+
 def _guard_eager_read(
     identifier: str,
     files: list[Path],
@@ -94,19 +118,13 @@ def _guard_eager_read(
     warn_bytes: Optional[int] = None,
     refuse_bytes: Optional[int] = None,
 ) -> None:
-    """Warns — or refuses — before an eager read pulls a table into memory.
-
-    ``files`` is what the table actually occupies on disk, which is a lower bound on the
-    memory the dataframe needs (Parquet is compressed). The point is not precision: it is
-    that a 40 GB table read by accident fails with a sentence instead of an OOM kill.
-
-    The thresholds default to :mod:`app.config`; they are parameters so the rule can be
-    tested at a size a test can actually write.
-    """
+    """Warns — or refuses — before an eager read pulls a table into memory."""
     try:
         on_disk = sum(path.stat().st_size for path in files if path.exists())
     except OSError:
-        return
+        on_disk = 0
+    if on_disk <= 0 and not files:
+        on_disk = _catalog_table_bytes(identifier)
     if on_disk <= 0:
         return
 
@@ -149,34 +167,26 @@ class TableWrapper:
 
     @property
     def _readable_file(self) -> Optional[Path]:
-        """The single Parquet file behind this table, when there is one.
-
-        With the catalog in charge, a table lives in a *directory* named after it, so a
-        path that exists is not necessarily a table — reading it as one returned an empty
-        dataset instead of an error. Only a real ``.parquet`` file is read directly;
-        everything else goes through SQL.
-        """
+        """The single Parquet file behind this table, when there is one."""
         path = self.file_path
         if path is None:
             return None
         return path if path.is_file() and path.suffix.lower() == ".parquet" else None
 
     def _parquet_files(self) -> list[Path]:
-        """The Parquet files this table's data lives in, for size estimation.
-
-        A lakehouse table is a directory, and a directory can still hold the files of a
-        snapshot DuckLake has not reclaimed yet. That makes this an upper bound on the size
-        of the *current* table, which is the safe direction for a guard — and the reason
-        reads go through the catalog (SQL) rather than globbing this list.
-        """
+        """The Parquet files this table's data lives in, including swapped __obelisk_load directories."""
         path = self.file_path
         if path is None:
             return []
         if self._readable_file:
             return [path]
+        found: list[Path] = []
         if path.is_dir():
-            return [p for p in path.rglob("*.parquet") if p.is_file()]
-        return []
+            found.extend(p for p in path.rglob("*.parquet") if p.is_file())
+        load_dir = path.parent / f"{path.name}{LOAD_TABLE_SUFFIX}"
+        if load_dir.is_dir():
+            found.extend(p for p in load_dir.rglob("*.parquet") if p.is_file())
+        return found
 
     def exists(self) -> bool:
         if self._readable_file:
@@ -189,8 +199,8 @@ class TableWrapper:
 
     def to_arrow(self) -> pa.Table:
         """Reads the table into a PyArrow Table, or queries an external database table."""
+        _guard_eager_read(self.full_identifier, self._parquet_files(), "to_arrow()")
         if self._readable_file:
-            _guard_eager_read(self.full_identifier, [self._readable_file], "to_arrow()")
             return pq.read_table(str(self._readable_file))
         try:
             res = query_arrow(f"SELECT * FROM {self.full_identifier}")
@@ -204,18 +214,11 @@ class TableWrapper:
             ) from e
 
     def to_polars(self) -> pl.DataFrame:
-        """Reads the table into a Polars DataFrame, or queries an external database table.
-
-        Eager: the whole table lands in memory. On a large table use
-        :meth:`to_lazy_polars` and ``collect()`` only what you need — the guard here warns
-        at 2 GB of Parquet and refuses above a quarter of RAM.
-        """
+        """Reads the table into a Polars DataFrame, or queries an external database table."""
         _guard_eager_read(self.full_identifier, self._parquet_files(), "to_polars()")
         if self._readable_file:
             return pl.read_parquet(str(self._readable_file))
         try:
-            # The catalog decides which Parquet files are current; a directory glob would
-            # also see files from snapshots DuckLake has not cleaned up yet.
             return query(f"SELECT * FROM {self.full_identifier}")
         except Exception as e:
             raise FileNotFoundError(
@@ -224,35 +227,21 @@ class TableWrapper:
             ) from e
 
     def to_lazy_polars(self) -> pl.LazyFrame:
-        """A Polars ``LazyFrame`` over this table: nothing is read until ``collect()``.
-
-        This is the answer to "the table is too big for a DataFrame". Polars pushes the
-        projection and filter into the scan, so ``.select("a").filter(...).collect()`` reads
-        only the columns it needs — the difference between a notebook cell that returns and
-        one that gets the kernel killed.
-
-        A lakehouse table is scanned through DuckDB (the catalog knows which files are
-        current, and small tables may be inlined in the catalog with no Parquet file to
-        scan at all); a loose ``.parquet`` file goes through Polars directly.
-        """
+        """A Polars ``LazyFrame`` over this table: nothing is read until ``collect()``."""
         if self._readable_file:
             return pl.scan_parquet(str(self._readable_file))
         return lazy_query(f"SELECT * FROM {self.full_identifier}")
 
     def to_df(self) -> Any:
         """Reads dataset into a Pandas DataFrame (eager — see :meth:`to_polars`)."""
+        _guard_eager_read(self.full_identifier, self._parquet_files(), "to_df()")
         arrow_obj = self.to_arrow()
         if hasattr(arrow_obj, "read_all"):
             arrow_obj = arrow_obj.read_all()
-        return arrow_obj.to_pandas()
+        return arrow_obj.to_pandas(split_blocks=True, self_destruct=True)
 
     def to_duckdb(self, conn=None):
-        """Returns a DuckDB relation referencing the dataset.
-
-        Pass ``conn`` to control the connection's lifetime. When omitted, the
-        shared SDK connection is reused instead of opening a new one per call
-        (audit M4).
-        """
+        """Returns a DuckDB relation referencing the dataset."""
         c = conn or _implicit_connection()
         if self._readable_file:
             return c.from_parquet(self._readable_file.resolve().as_posix())
@@ -260,12 +249,40 @@ class TableWrapper:
             duckdb_engine.attach(c, attachment)
         return c.query(f"SELECT * FROM {self.full_identifier}")
 
+    def iter_batches(
+        self, batch_size: int = 100_000, columns: Optional[list[str]] = None
+    ):
+        """Streams PyArrow RecordBatches out-of-core in O(batch_size) memory."""
+        step = max(1, int(batch_size))
+        if self._readable_file:
+            pf = pq.ParquetFile(str(self._readable_file))
+            for batch in pf.iter_batches(batch_size=step, columns=columns):
+                yield batch
+            return
+        proj = (
+            ", ".join(f'"{c.replace(chr(34), chr(34)*2)}"' for c in columns)
+            if columns
+            else "*"
+        )
+        yield from iter_batches(
+            f"SELECT {proj} FROM {self.full_identifier}", batch_size=step
+        )
+
+    def sql(self, clause_or_query: str) -> "LazyQueryBuilder":
+        """Builds a scoped lazy/streaming SQL query against this table (use ``self`` or ``WHERE ...``)."""
+        raw = (clause_or_query or "").strip().rstrip(";")
+        if not raw:
+            full_sql = f"SELECT * FROM {self.full_identifier}"
+        elif re.match(r"^(?:select|with)\b", raw, flags=re.IGNORECASE):
+            full_sql = re.sub(
+                r"\bself\b", self.full_identifier, raw, flags=re.IGNORECASE
+            )
+        else:
+            full_sql = f"SELECT * FROM {self.full_identifier} {raw}"
+        return LazyQueryBuilder(full_sql)
+
     def to_spark(self, spark_session=None):
-        """
-        Converts the dataset to a PySpark DataFrame.
-        Bypasses Hadoop's winutils.exe on Windows by passing in-memory Arrow/Pandas
-        data directly to spark.createDataFrame().
-        """
+        """Converts the dataset to a PySpark DataFrame."""
         spark_sess = spark_session or spark()
         pandas_df = self.to_df()
         return spark_sess.createDataFrame(pandas_df)
@@ -275,14 +292,31 @@ class TableWrapper:
         return f"<ObeliskTable: {self.full_identifier} [{status}] -> {self.full_identifier}>"
 
 
-class SourceNotQueryable(RuntimeError):
-    """Raised when an identifier names a source that cannot be queried live.
+class LazyQueryBuilder:
+    """Chainable out-of-core SQL builder returned by ``obelisk.table(...).sql(...)``."""
 
-    Only an *attached* source (PostgreSQL, through DuckDB's own scanner) can be read as
-    SQL. MySQL, MongoDB, Oracle and HTTP sources are pulled: their rows reach DuckDB only
-    after an ingest copies them into the lakehouse. Saying that here beats letting DuckDB
-    answer with ``schema "..." does not exist``.
-    """
+    def __init__(self, sql: str):
+        self.sql = sql
+
+    def to_lazy_polars(self) -> pl.LazyFrame:
+        return lazy_query(self.sql)
+
+    def iter_batches(self, batch_size: int = 100_000):
+        return iter_batches(self.sql, batch_size=batch_size)
+
+    def to_arrow(self) -> pa.Table:
+        res = query_arrow(self.sql)
+        return res.read_all() if hasattr(res, "read_all") else res
+
+    def to_polars(self) -> pl.DataFrame:
+        return query(self.sql)
+
+    def to_df(self) -> Any:
+        return self.to_arrow().to_pandas(split_blocks=True, self_destruct=True)
+
+
+class SourceNotQueryable(RuntimeError):
+    """Raised when an identifier names a source that cannot be queried live."""
 
 
 def _registered_connection(segment: str) -> Optional[tuple[str, str, str]]:
@@ -304,13 +338,7 @@ def _registered_connection(segment: str) -> Optional[tuple[str, str, str]]:
 
 
 def _resolve_external_identifier(identifier: str) -> str:
-    """
-    Checks registered connections in the SQLite vault to resolve an external table.
-    Examples:
-        'supabase.public.venues_old' -> 'supabase.public.venues_old'
-        'public.venues_old' -> 'supabase.public.venues_old' (if venues_old in supabase)
-        'venues_old' -> 'supabase.public.venues_old'
-    """
+    """Checks registered connections in the SQLite vault to resolve an external table."""
     import re
     db_path = settings.sqlite_db_path
     if not Path(db_path).exists():
@@ -327,11 +355,9 @@ def _resolve_external_identifier(identifier: str) -> str:
             ).fetchall()
             aliases = [re.sub(r"[^a-zA-Z0-9_]", "_", r[0].lower()) for r in rows]
 
-            # If already starts with a known connection alias
             if parts[0].lower() in aliases:
                 return clean
 
-            # Try prefixing with registered postgres connections
             for alias in aliases:
                 test_sql = f"SELECT 1 FROM {alias}.{clean} LIMIT 1"
                 try:
@@ -341,7 +367,6 @@ def _resolve_external_identifier(identifier: str) -> str:
                 except Exception:
                     pass
 
-            # Fallback: if single connection exists, prefix it
             if len(aliases) == 1:
                 return f"{aliases[0]}.{clean}"
     except Exception:
@@ -351,14 +376,7 @@ def _resolve_external_identifier(identifier: str) -> str:
 
 
 def table(identifier: str) -> TableWrapper:
-    """Resolves a warehouse table by its address, or an external table by its FQN.
-
-    Accepts the canonical address (``lakehouse.marts.sales.orders``), a path
-    (``marts/sales/orders``), a folder plus name (``marts.orders``), or a bare name
-    when exactly one table answers to it. Resolution reads the warehouse — the same
-    scan the editor and the catalog use — so there is no second registry to disagree
-    with.
-    """
+    """Resolves a warehouse table by its address, or an external table by its FQN."""
     from app.core.catalog import scan
     from app.core.storage import warehouse_storage
 
@@ -371,9 +389,15 @@ def table(identifier: str) -> TableWrapper:
 
     result = scan(store)
 
-    # 1. An exact address: folder path plus table name.
+    # 1. Exact address match: TableFile.path from scan() does not carry .parquet, so strip
+    #    .parquet only when present instead of unconditionally slicing 8 characters off.
     for entry in result.tables:
-        if entry.path[: -len(".parquet")].lower() == wanted:
+        entry_rel = (
+            entry.path[: -len(PARQUET_SUFFIX)]
+            if entry.path.lower().endswith(PARQUET_SUFFIX)
+            else entry.path
+        )
+        if entry_rel.lower() == wanted:
             return TableWrapper(
                 name=entry.name,
                 folder=entry.folder,
@@ -381,10 +405,7 @@ def table(identifier: str) -> TableWrapper:
                 full_identifier=entry.fqn,
             )
 
-    # 2. The identifier may name a source, which is a different question than a lakehouse
-    #    table: ``table("mongo_x.db.coll")`` says "read this source", and if that source has
-    #    no DuckDB scanner the answer is no. Checked before the bare-name shortcut, so a
-    #    unique lakehouse table with the same leaf can never be substituted for it.
+    # 2. Registered external source check
     parts = clean_id.split(".")
     connection = _registered_connection(parts[0]) if len(parts) >= 2 else None
     if connection:
@@ -411,8 +432,6 @@ def table(identifier: str) -> TableWrapper:
                 f"cannot be queried live: DuckDB has no scanner for it (Postgres, MySQL and "
                 f"Mongo do; Oracle and SQL Server need an ODBC DSN).{hint}"
             )
-        # Naming an attached source means *that* table, even if a lakehouse table happens to
-        # share the leaf name.
         return TableWrapper(
             name=parts[-1],
             folder=".".join(parts[:-2]) if len(parts) >= 3 else "main",
@@ -420,8 +439,7 @@ def table(identifier: str) -> TableWrapper:
             full_identifier=_resolve_external_identifier(clean_id),
         )
 
-    # 3. A bare name, or a folder/name whose folder was spelled with dots, is still
-    # unambiguous while only one table carries that name.
+    # 3. Unambiguous leaf name match
     leaf = wanted.rsplit("/", 1)[-1]
     matches = [entry for entry in result.tables if entry.name.lower() == leaf]
     if len(matches) == 1:
@@ -433,7 +451,7 @@ def table(identifier: str) -> TableWrapper:
             full_identifier=entry.fqn,
         )
 
-    # 4. Not a warehouse table and not a known source: let the Postgres resolver try.
+    # 4. External resolver fallback
     resolved = _resolve_external_identifier(clean_id)
     return TableWrapper(
         name=parts[-1],
@@ -444,13 +462,7 @@ def table(identifier: str) -> TableWrapper:
 
 
 def _attachments_for_sql(sql: str) -> list:
-    """Sources the SQL names that DuckDB can attach live, credentials decrypted.
-
-    The vault is read directly because the SDK is synchronous. The *shape* of each dict
-    comes from :func:`app.core.sources.attachment_for`, so a notebook, the SQL editor and
-    the orchestrator all attach a source the same way — and a source with no scanner never
-    appears here.
-    """
+    """Sources the SQL names that DuckDB can attach live, credentials decrypted."""
     from types import SimpleNamespace
 
     from app.core.sources import UnsupportedSource, attachment_for, resolve_source
@@ -516,16 +528,7 @@ def query(sql: str) -> pl.DataFrame:
 
 
 def lazy_query(sql: str) -> pl.LazyFrame:
-    """``query()`` without materialising: a ``LazyFrame`` you ``collect()`` when you need it.
-
-    ``query()`` loads the whole result into a DataFrame. On a large table that is the same
-    trap as ``to_polars()`` — a cell that takes the kernel with it. This hands back a plan
-    instead: DuckDB keeps the scan until ``collect()``, and Polars/column pruning mean
-    ``obelisk.lazy_query("SELECT a FROM marts.orders").filter(...).collect()`` reads only
-    the column it needs.
-
-    The frame runs on the SDK's shared DuckDB connection, so it stays valid until collected.
-    """
+    """``query()`` without materialising: a ``LazyFrame`` you ``collect()`` when you need it."""
     if not (sql or "").strip():
         raise ValueError("lazy_query() needs a SQL statement.")
     conn = _implicit_connection()
@@ -558,6 +561,37 @@ def query_arrow(sql: str) -> pa.Table:
         conn.close()
 
 
+def iter_batches(sql: str, batch_size: int = 100_000):
+    """Streams federated SQL results as PyArrow RecordBatches in O(batch_size) RAM."""
+    step = max(1, int(batch_size))
+    conn = duckdb_engine.get_connection()
+    try:
+        storage_path = duckdb_engine._ensure_storage()
+        for attachment in _attachments_for_sql(sql):
+            duckdb_engine.attach(conn, attachment)
+        exec_sql = duckdb_engine._prepare_sql_and_views(conn, sql, storage_path)
+        rel = conn.sql(exec_sql)
+        if rel is None:
+            return
+        if hasattr(rel, "fetch_arrow_reader"):
+            reader = rel.fetch_arrow_reader(step)
+            for batch in reader:
+                yield batch
+        else:
+            arrow_obj = conn.execute(exec_sql).arrow()
+            if hasattr(arrow_obj, "read_next_batch"):
+                while True:
+                    try:
+                        yield arrow_obj.read_next_batch()
+                    except StopIteration:
+                        break
+            elif hasattr(arrow_obj, "to_batches"):
+                for batch in arrow_obj.to_batches(max_chunksize=step):
+                    yield batch
+    finally:
+        conn.close()
+
+
 def _coerce_to_arrow(df: Any) -> pa.Table:
     """Normalizes a Polars / Arrow / pandas / Spark DataFrame to a PyArrow Table."""
     if isinstance(df, pl.DataFrame):
@@ -576,22 +610,13 @@ def _coerce_to_arrow(df: Any) -> pa.Table:
 
 
 def save(df: Any, target: str) -> Dict[str, Any]:
-    """Persists a DataFrame as a table in the DuckLake lakehouse.
-
-    ``target`` is a warehouse path — ``"supabase/auth/table1"``, the fully qualified
-    ``"lakehouse.supabase.auth.table1"``, or a bare ``"orders"`` for the root. Dots and
-    slashes are both separators, so a layer-style ``"marts.sales.orders"`` still works
-    and lands in schema ``marts.sales``.
-
-    DuckLake is the single source of truth: the table is created through its catalog and
-    nothing is mirrored into PostgreSQL. The row count, schema and size follow from the
-    catalog without anything being registered by hand.
-    """
+    """Persists a DataFrame as a table in the DuckLake lakehouse."""
     folder, stem = split_table_path(target)
     schema_name = folder.replace("/", ".") if folder else "main"
     rel_path = f"{folder}/{stem}" if folder else stem
 
     arrow_table = _coerce_to_arrow(df)
+    advisor.assert_disk_headroom(settings.duckdb_storage_path)
 
     from app.core.catalog import quote_ident
 
@@ -604,6 +629,8 @@ def save(df: Any, target: str) -> Dict[str, Any]:
             conn.execute(
                 f"CREATE OR REPLACE TABLE {address} AS SELECT * FROM _obelisk_save_src;"
             )
+            from app.core.catalog import record_lakehouse_commit
+            record_lakehouse_commit(conn)
         finally:
             try:
                 conn.unregister("_obelisk_save_src")
@@ -637,18 +664,14 @@ def save(df: Any, target: str) -> Dict[str, Any]:
 
 
 def materialize_sql(sql: str, target: str) -> Dict[str, Any]:
-    """Materializes a SQL query directly into a DuckLake table.
-
-    DuckDB reads the sources named by ``sql`` and writes the result through the catalog in
-    one statement, so a multi-GB result never becomes a Python / Arrow object first. Use
-    this in place of ``save(query_arrow(sql), target)`` when the result is large.
-    """
+    """Materializes a SQL query directly into a DuckLake table."""
     from app.core.catalog import quote_ident
 
     folder, stem = split_table_path(target)
     schema_name = folder.replace("/", ".") if folder else "main"
     rel_path = f"{folder}/{stem}" if folder else stem
     address = f"{SOURCE}.{quote_ident(schema_name)}.{quote_ident(stem)}"
+    advisor.assert_disk_headroom(settings.duckdb_storage_path)
 
     conn = duckdb_engine.get_connection()
     try:
@@ -660,6 +683,8 @@ def materialize_sql(sql: str, target: str) -> Dict[str, Any]:
         )
         conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema_name)};")
         conn.execute(f"CREATE OR REPLACE TABLE {address} AS {exec_sql};")
+        from app.core.catalog import record_lakehouse_commit
+        record_lakehouse_commit(conn)
         num_rows = int(conn.execute(f"SELECT count(*) FROM {address};").fetchone()[0])
     finally:
         conn.close()
@@ -692,12 +717,10 @@ def is_java_compatible() -> bool:
     import subprocess
     import re
 
-    # Validate JAVA_HOME if set
     java_home = os.environ.get("JAVA_HOME")
     if java_home:
         candidate = Path(java_home) / "bin" / ("java.exe" if os.name == "nt" else "java")
         if not candidate.is_file():
-            # Stale or invalid JAVA_HOME; remove to avoid batch script crash
             os.environ.pop("JAVA_HOME", None)
 
     try:
@@ -718,12 +741,7 @@ def spark(
     remote_url: Optional[str] = None,
     app_name: str = "ObeliskAnalytics",
 ):
-    """
-    Initializes a PySpark session.
-    - If SPARK_REMOTE_URL (sc://...) is set, configures Spark Connect without requiring local Java.
-    - Otherwise, configures local[*] with driver memory capped dynamically via ResourceAdvisor,
-      disables UI for headless efficiency, and enables PyArrow acceleration.
-    """
+    """Initializes a PySpark session."""
     from pyspark.sql import SparkSession
 
     remote = remote_url or settings.SPARK_REMOTE_URL
@@ -731,7 +749,6 @@ def spark(
         builder = SparkSession.builder.remote(remote).appName(app_name)
         return builder.getOrCreate() if get_or_create else builder
 
-    # Local mode: check Java 17+ runtime
     if get_or_create and not is_java_compatible():
         raise RuntimeError(
             "Java 17+ runtime is required for local PySpark. "
@@ -756,14 +773,7 @@ def spark(
 
 
 def var(key: str, default: Any = None) -> Any:
-    """
-    Retrieves an Obelisk variable or secret by key.
-    If the variable is an encrypted secret, it is automatically decrypted with the AES-128 Fernet vault.
-    Usage:
-        import obelisk
-        env = obelisk.var("ENV", default="development")
-        slack_token = obelisk.var("SLACK_WEBHOOK_URL")
-    """
+    """Retrieves an Obelisk variable or secret by key."""
     clean_key = key.strip().upper()
     db_path = settings.sqlite_db_path
     try:
@@ -780,4 +790,3 @@ def var(key: str, default: Any = None) -> Any:
             return val
     except Exception:
         return default
-

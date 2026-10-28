@@ -29,6 +29,7 @@ class IngestTriggerRequest(BaseModel):
     limit: Optional[int] = Field(None, description="Optional row limit for sample ingestion")
     write_strategy: Optional[str] = Field("append", description="'append' or 'upsert'")
     primary_key: Optional[str] = Field(None, description="Primary key for upsert deduplication")
+    schema_policy: Optional[str] = Field("evolve", description="'evolve' or 'strict'")
     
 class IngestTriggerResponse(BaseModel):
     success: bool
@@ -45,6 +46,7 @@ class BatchIngestRequest(BaseModel):
     watermark_column: Optional[str] = Field(None, description="Watermark column for incremental mode")
     write_strategy: str = Field("append", description="'append' or 'upsert'")
     primary_key: Optional[str] = Field(None, description="Primary key for upsert deduplication")
+    schema_policy: Optional[str] = Field("evolve", description="'evolve' or 'strict'")
     target_folder: Optional[str] = Field(None, description="Target lakehouse folder/directory")
     limit: Optional[int] = Field(None, description="Optional row limit for sample ingestion")
     
@@ -123,6 +125,7 @@ async def trigger_ingestion(
             limit=req.limit,
             write_strategy=req.write_strategy or "append",
             primary_key=req.primary_key,
+            schema_policy=req.schema_policy or "evolve",
         )
 
         logs = run_res["logs"]
@@ -194,6 +197,7 @@ async def trigger_batch_ingestion(
                 limit=req.limit,
                 write_strategy=req.write_strategy,
                 primary_key=req.primary_key,
+                schema_policy=req.schema_policy or "evolve",
             )
             results.append(res)
             logs.append(f"✓ Ingested '{table_name}': {res['num_rows']} total rows (extracted: {res['new_rows_extracted']})")
@@ -274,6 +278,7 @@ async def trigger_ingest_async(
             limit=req.limit,
             write_strategy=req.write_strategy or "append",
             primary_key=req.primary_key,
+            schema_policy=req.schema_policy or "evolve",
         )
     )
 
@@ -345,6 +350,7 @@ async def trigger_batch_ingest_async(
             limit=req.limit,
             write_strategy=req.write_strategy or "append",
             primary_key=req.primary_key,
+            schema_policy=req.schema_policy or "evolve",
         )
     )
 

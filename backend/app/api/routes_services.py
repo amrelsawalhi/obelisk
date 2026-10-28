@@ -208,8 +208,8 @@ async def _forget_service_connection(db: AsyncSession, service_name: str) -> Non
     ).scalar_one_or_none()
     if not record:
         return
-    if get_warehouse_connection_id() == record.id:
-        set_warehouse_connection_id(None)
+    if (await asyncio.to_thread(get_warehouse_connection_id)) == record.id:
+        await asyncio.to_thread(set_warehouse_connection_id, None)
     await db.delete(record)
     await db.commit()
 
@@ -717,10 +717,10 @@ async def deploy_local_service(
         if (
             conn_record is not None
             and bp.provides == "postgres"
-            and get_warehouse_connection_id() is None
+            and (await asyncio.to_thread(get_warehouse_connection_id)) is None
         ):
             try:
-                set_warehouse_connection_id(conn_record.id)
+                await asyncio.to_thread(set_warehouse_connection_id, conn_record.id)
             except Exception as exc:
                 # Binding is a convenience; it never fails a running service.
                 probe_detail = f"{probe_detail}; warehouse binding failed: {exc}"

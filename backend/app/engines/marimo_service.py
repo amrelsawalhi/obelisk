@@ -138,12 +138,23 @@ class MarimoService:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log_handle = open(self.log_path, "a", encoding="utf-8", errors="replace")
 
+        from app.core.resource_advisor import advisor
+
+        marimo_env = os.environ.copy()
+        for k, v in advisor.get_child_env_limits().items():
+            marimo_env.setdefault(k, v)
+        popen_kwargs: Dict[str, Any] = {"env": marimo_env}
+        preexec = advisor.make_posix_rlimit_preexec()
+        if preexec is not None:
+            popen_kwargs["preexec_fn"] = preexec
+
         # Launch background subprocess
         self._process = subprocess.Popen(
             cmd,
             stdout=self._log_handle,
             stderr=subprocess.STDOUT,
             cwd=str(self.notebooks_dir),
+            **popen_kwargs,
         )
         # Record the child so a restarted backend can still stop *this* process — and
         # nothing else. The PID alone is not enough; ``stop`` re-checks the command line.

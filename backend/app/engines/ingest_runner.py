@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from app.engines.ingest_engine import ingest_engine
 
@@ -34,6 +34,9 @@ def trigger_ingest(
     limit: Optional[int] = None,
     write_strategy: str = "append",
     primary_key: Optional[str] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    on_connection: Optional[Callable[[Any], None]] = None,
+    schema_policy: str = "evolve",
 ) -> Dict[str, Any]:
     """Extracts one entity into the lakehouse and reports what happened."""
     asset_name = _clean_stem(target_name, entity)
@@ -55,6 +58,9 @@ def trigger_ingest(
             limit=limit,
             write_strategy=write_strategy,
             primary_key=primary_key,
+            should_cancel=should_cancel,
+            on_connection=on_connection,
+            schema_policy=schema_policy,
         )
     except Exception as exc:
         logs.append(f"[error] {exc.__class__.__name__}: {exc}")

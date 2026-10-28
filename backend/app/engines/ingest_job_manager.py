@@ -12,6 +12,10 @@ from collections import defaultdict
 from app.engines.ingest_engine import ingest_engine
 from app.services.state import task_history
 
+MAX_JOB_LOGS = 2000
+MAX_IN_MEMORY_JOBS = 100
+SSE_QUEUE_MAXSIZE = 256
+
 
 @dataclass
 class IngestJob:
@@ -33,8 +37,6 @@ class IngestJob:
     current_phase: Optional[str] = None
     percent: int = 0
     total_rows: int = 0
-    # Rows staged for the table in flight. Kept apart from total_rows so a failed write
-    # cannot leave the job claiming rows that were never committed.
     staged_rows: int = 0
     logs: List[str] = field(default_factory=list)
     results: List[Dict[str, Any]] = field(default_factory=list)
@@ -42,7 +44,31 @@ class IngestJob:
     is_cancelled: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {
+            "id": self.id,
+            "title": self.title,
+            "job_type": self.job_type,
+            "connection_id": self.connection_id,
+            "source_name": self.source_name,
+            "source_type": self.source_type,
+            "status": self.status,
+            "mode": self.mode,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "duration_ms": self.duration_ms,
+            "total_tables": self.total_tables,
+            "completed_tables": self.completed_tables,
+            "failed_tables": self.failed_tables,
+            "current_table": self.current_table,
+            "current_phase": self.current_phase,
+            "percent": self.percent,
+            "total_rows": self.total_rows,
+            "staged_rows": self.staged_rows,
+            "logs": list(self.logs),
+            "results": list(self.results),
+            "errors": list(self.errors),
+            "is_cancelled": self.is_cancelled,
+        }
 
 
 class IngestJobManager:
@@ -57,9 +83,6 @@ class IngestJobManager:
         self._subscribers: Dict[str, List[asyncio.Queue]] = defaultdict(list)
         self._lock = asyncio.Lock()
         self._last_persist: Dict[str, float] = {}
-        # The DuckDB connection each running job is using. A load that is one long
-        # statement (the whole Postgres path) has no batch boundary at which to notice a
-        # cancel flag, so cancelling has to interrupt the statement itself.
         self._live_connections: Dict[str, Any] = {}
         self._connection_lock = threading.Lock()
 
@@ -72,27 +95,33 @@ class IngestJobManager:
         with self._connection_lock:
             self._live_connections.pop(job_id, None)
 
-    def _persist(self, job: IngestJob) -> bool:
-        """Mirrors the job into task history (M3).
+    def _evict_old_jobs(self) -> None:
+        """Caps in-memory terminal jobs to MAX_IN_MEMORY_JOBS so RAM never grows unbounded."""
+        if len(self._jobs) <= MAX_IN_MEMORY_JOBS:
+            return
+        terminal = sorted(
+            (j for j in self._jobs.values() if j.status != "running"),
+            key=lambda j: j.started_at,
+        )
+        excess = len(self._jobs) - MAX_IN_MEMORY_JOBS
+        for old_job in terminal[:excess]:
+            self._jobs.pop(old_job.id, None)
+            self._last_persist.pop(old_job.id, None)
 
-        Throttled to once a second while running: progress arrives per log line, and
-        the point of this write is that a restart can reconstruct the job, not that it
-        captures every tick. Terminal states always land.
-        """
+    def _persist(self, job: IngestJob) -> bool:
+        """Mirrors the job into task history (M3)."""
         now = time.monotonic()
         terminal = job.status != "running"
         if not terminal and (now - self._last_persist.get(job.id, 0.0)) < 1.0:
             return False
         self._last_persist[job.id] = now
+        payload = job.to_dict()
         return task_history.record(
-            "ingest", job.id, job.status, job.started_at, job.to_dict()
+            "ingest", job.id, job.status, job.started_at, payload
         )
 
     def hydrate(self, limit: int = 50) -> int:
-        """Reloads recent jobs so history survives a restart.
-
-        Must run after ``mark_interrupted`` so nothing returns as still running.
-        """
+        """Reloads recent jobs so history survives a restart."""
         restored = 0
         for payload in task_history.recent("ingest", limit=limit):
             job_id = payload.get("id")
@@ -133,6 +162,7 @@ class IngestJobManager:
         mode: str,
         total_tables: int = 1,
     ) -> IngestJob:
+        self._evict_old_jobs()
         job_id = str(uuid.uuid4())
         now_str = datetime.now(timezone.utc).isoformat()
         job = IngestJob(
@@ -160,8 +190,9 @@ class IngestJobManager:
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         formatted = f"[{ts}] {message}"
         job.logs.append(formatted)
+        if len(job.logs) > MAX_JOB_LOGS:
+            del job.logs[: len(job.logs) - MAX_JOB_LOGS]
 
-        # Broadcast to all live subscribers
         event_payload = json.dumps({"type": "log", "text": formatted})
         for q in list(self._subscribers.get(job_id, [])):
             try:
@@ -182,6 +213,7 @@ class IngestJobManager:
         failed_tables: Optional[int] = None,
         total_rows: Optional[int] = None,
         staged_rows: Optional[int] = None,
+        persist: bool = True,
     ):
         job = self._jobs.get(job_id)
         if not job:
@@ -204,7 +236,8 @@ class IngestJobManager:
             done = job.completed_tables + job.failed_tables
             job.percent = min(100, int((done / job.total_tables) * 100))
 
-        self._persist(job)
+        if persist:
+            self._persist(job)
 
         event_payload = json.dumps({
             "type": "progress",
@@ -225,23 +258,24 @@ class IngestJobManager:
                 pass
 
     def _batch_progress(self, job_id: str, label: Optional[str] = None) -> Callable[[int], None]:
-        """A per-batch progress hook that is safe to call from the worker thread.
-
-        ``update_progress`` writes to the SSE queues, which belong to the event loop, so
-        the call is marshalled back instead of mutating them from the ingestion thread.
-        """
+        """A per-batch progress hook that persists SQLite state on the worker thread and only marshals SSE queue pushes to the event loop."""
         loop = asyncio.get_running_loop()
 
         def report(staged: int) -> None:
             phase = f"{label} - {staged:,} rows staged" if label else f"Staged {staged:,} rows"
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.current_phase = phase
+                job.staged_rows = staged
+                # Persist on the worker thread so synchronous SQLite writes never block the asyncio loop
+                self._persist(job)
             loop.call_soon_threadsafe(
                 functools.partial(
                     self.update_progress,
                     job_id,
                     current_phase=phase,
-                    # Deliberately not total_rows: these rows are staged, not committed — a
-                    # load that fails must not leave them counted as ingested.
                     staged_rows=staged,
+                    persist=False,
                 )
             )
 
@@ -257,8 +291,6 @@ class IngestJobManager:
         job.completed_at = datetime.now(timezone.utc).isoformat()
         self._persist(job)
 
-        # Break the statement that is running right now, if any. Without this a cancel
-        # during a single-statement load (the Postgres path) waited for the whole table.
         with self._connection_lock:
             live = self._live_connections.get(job_id)
         if live is not None:
@@ -281,17 +313,12 @@ class IngestJobManager:
         return True
 
     async def subscribe(self, job_id: str) -> AsyncGenerator[str, None]:
-        """
-        Yields Server-Sent Events (SSE).
-        First flushes all existing accumulated logs & status to catch the client up,
-        then streams new events as they occur.
-        """
+        """Yields Server-Sent Events (SSE) with bounded subscriber queue."""
         job = self._jobs.get(job_id)
         if not job:
             yield f"event: error\ndata: {json.dumps({'error': 'Job not found'})}\n\n"
             return
 
-        # 1. Flush historical catch-up state
         initial_progress = json.dumps({
             "type": "progress",
             "percent": job.percent,
@@ -312,18 +339,15 @@ class IngestJobManager:
             log_event = json.dumps({"type": "log", "text": log_line})
             yield f"event: log\ndata: {log_event}\n\n"
 
-        # If already done, yield final complete event and exit
         if job.status in ("completed", "failed", "cancelled"):
             yield f"event: complete\ndata: {json.dumps(job.to_dict())}\n\n"
             return
 
-        # 2. Register live queue
-        q: asyncio.Queue = asyncio.Queue()
+        q: asyncio.Queue = asyncio.Queue(maxsize=SSE_QUEUE_MAXSIZE)
         self._subscribers[job_id].append(q)
 
         try:
             while True:
-                # Wait for next event or heartbeat
                 try:
                     payload = await asyncio.wait_for(q.get(), timeout=15.0)
                     data_obj = json.loads(payload)
@@ -333,10 +357,8 @@ class IngestJobManager:
                     if ev_type in ("complete", "cancelled"):
                         break
                 except asyncio.TimeoutError:
-                    # Keep-alive heartbeat comment for proxies (Caddy/Nginx)
                     yield ": ping\n\n"
 
-                # Check if job transitioned while waiting
                 if job.status in ("completed", "failed", "cancelled") and q.empty():
                     yield f"event: complete\ndata: {json.dumps(job.to_dict())}\n\n"
                     break
@@ -356,6 +378,7 @@ class IngestJobManager:
         limit: Optional[int] = None,
         write_strategy: str = "append",
         primary_key: Optional[str] = None,
+        schema_policy: str = "evolve",
     ):
         """Asynchronously executes single-table lakehouse ingestion."""
         job = self._jobs[job_id]
@@ -369,7 +392,6 @@ class IngestJobManager:
 
             self.update_progress(job_id, current_phase="Staging rows into the lakehouse")
 
-            # Run in worker thread so DuckDB C++ / PyArrow doesn't block async loop
             res = await asyncio.to_thread(
                 ingest_engine.ingest_entity,
                 source_type=job.source_type,
@@ -383,10 +405,9 @@ class IngestJobManager:
                 write_strategy=write_strategy,
                 primary_key=primary_key,
                 on_batch=self._batch_progress(job_id),
-                # Polled between batches, and the connection is published so cancel_job can
-                # interrupt a single-statement load.
                 should_cancel=lambda: job.is_cancelled,
                 on_connection=lambda conn: self._attach_connection(job_id, conn),
+                schema_policy=schema_policy,
             )
 
             job.results.append(res)
@@ -406,9 +427,6 @@ class IngestJobManager:
             self.update_progress(job_id, current_phase="Finished", completed_tables=1)
 
         except Exception as e:
-            # A cancel surfaces here as IngestCancelled (raised between batches) or as
-            # DuckDB's interrupt exception (raised inside a single statement). Either way
-            # nothing was committed, so it is not a failure and is not counted as one.
             if job.is_cancelled:
                 job.status = "cancelled"
                 job.failed_tables = 0
@@ -424,8 +442,6 @@ class IngestJobManager:
             else:
                 job.status = "failed"
                 job.failed_tables = 1
-                # Whatever was staged was never committed: nothing is written until the final
-                # statement runs, and that is the statement that just failed.
                 job.staged_rows = 0
                 job.completed_at = datetime.now(timezone.utc).isoformat()
                 job.duration_ms = int((time.time() - start_time) * 1000)
@@ -454,6 +470,7 @@ class IngestJobManager:
         limit: Optional[int] = None,
         write_strategy: str = "append",
         primary_key: Optional[str] = None,
+        schema_policy: str = "evolve",
     ):
         """Asynchronously executes batch schema/database lakehouse ingestion."""
         job = self._jobs[job_id]
@@ -491,6 +508,7 @@ class IngestJobManager:
                         ),
                         should_cancel=lambda: job.is_cancelled,
                         on_connection=lambda conn: self._attach_connection(job_id, conn),
+                        schema_policy=schema_policy,
                     )
                     t_duration = int((time.time() - table_start) * 1000)
                     job.results.append(res)
@@ -505,7 +523,6 @@ class IngestJobManager:
                     )
                 except Exception as table_err:
                     if job.is_cancelled:
-                        # Not a failure: the operator stopped it, and nothing was committed.
                         job.staged_rows = 0
                         self.append_log(
                             job_id,
@@ -554,5 +571,4 @@ class IngestJobManager:
                     pass
 
 
-# Singleton instance
 ingest_job_manager = IngestJobManager()

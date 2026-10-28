@@ -171,7 +171,6 @@ const toStepPayload = (step: PipelineStepDef) => ({
 });
 
 const TERMINAL: ExecutionStatus[] = ['success', 'failed', 'cancelled', 'interrupted', 'skipped'];
-const RUN_ACTIVE: ExecutionStatus[] = ['pending', 'running', 'waiting_deps'];
 
 const STATUS_TEXT: Record<string, string> = {
   success: 'Last run succeeded',
@@ -837,7 +836,7 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       name: `${template.name}${duplicate ? ` ${index + 1}` : ""}`,
       step_type: type,
       target: template.target,
-      args: type === 'ingest' ? { target_folder: 'raw', mode: 'snapshot', write_strategy: 'append' } : {},
+      args: type === 'ingest' ? { target_folder: 'raw', mode: 'snapshot', write_strategy: 'append', schema_policy: 'evolve' } : {},
       timeout_seconds: null,
       max_retries: null,
       retry_delay_seconds: null,

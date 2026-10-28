@@ -1,4 +1,4 @@
-// Strict TypeScript interfaces matching FastAPI Pydantic v2 schemas 1:1
+﻿// Strict TypeScript interfaces matching FastAPI Pydantic v2 schemas 1:1
 
 export interface HostSpecs {
   total_ram_bytes: number;
@@ -21,6 +21,16 @@ export interface TelemetryData {
   max_safe_allocation_gb: number;
   active_containers_count: number;
   allocated_ram_gb: number;
+  active_heavy_queries?: number;
+  waiting_heavy_queries?: number;
+  max_concurrent_heavy?: number;
+  memory_limit_per_slot?: string;
+  threads_per_slot?: number;
+  temp_spill_mb?: number;
+  temp_spill_limit?: string;
+  lakehouse_free_gb?: number;
+  lakehouse_percent_used?: number;
+  active_load_tables?: number;
   timestamp?: number;
 }
 
@@ -273,6 +283,7 @@ export interface IngestTriggerRequest {
   limit?: number;
   write_strategy?: 'append' | 'upsert';
   primary_key?: string;
+  schema_policy?: 'evolve' | 'strict';
 }
 
 export interface IngestTriggerResponse {
@@ -293,6 +304,7 @@ export interface BatchIngestRequest {
   limit?: number;
   write_strategy?: 'append' | 'upsert';
   primary_key?: string;
+  schema_policy?: 'evolve' | 'strict';
 }
 
 export interface BatchIngestResultItem {
@@ -897,6 +909,7 @@ export interface CreatePipelinePayload {
   retry_delay_seconds: number;
   auto_rerun_interrupted: boolean;
   graph?: GraphPayload;
+  params?: PipelineParamDef[];
 }
 
 // ==========================================

@@ -3,6 +3,7 @@ import re
 import time
 import asyncio
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 import duckdb
@@ -20,41 +21,95 @@ from app.core.storage import warehouse_storage
 
 logger = logging.getLogger(__name__)
 
+
 class DuckDBEngine:
     """
     In-process DuckDB analytical engine with:
     - Zero-cost storage URI integration (reads from settings.duckdb_storage_path)
-    - Dynamic memory sizing via ResourceAdvisor
+    - Dynamic memory, thread, and spill sizing via ResourceAdvisor
+    - Bounded concurrency semaphore for heavy analytical queries/exports
     - Dynamic scanner attaching (PostgreSQL, MySQL, MongoDB)
     - Non-blocking query execution & Parquet/CSV streaming exports
     """
 
-    # Scanners DuckDB keeps in its community repository rather than the signed core.
     COMMUNITY_EXTENSIONS: tuple[str, ...] = ("mongo",)
 
     def __init__(self):
         self._ensure_storage()
+        self._max_heavy_slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
+        self._heavy_semaphore = threading.BoundedSemaphore(self._max_heavy_slots)
+        self._telemetry_lock = threading.Lock()
+        self._active_heavy_queries = 0
+        self._waiting_heavy_queries = 0
+        self._total_queries_executed = 0
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _acquire_heavy_slot(self):
+        with self._telemetry_lock:
+            self._waiting_heavy_queries += 1
+        self._heavy_semaphore.acquire()
+        with self._telemetry_lock:
+            self._waiting_heavy_queries = max(0, self._waiting_heavy_queries - 1)
+            self._active_heavy_queries += 1
+            self._total_queries_executed += 1
+        try:
+            yield
+        finally:
+            with self._telemetry_lock:
+                self._active_heavy_queries = max(0, self._active_heavy_queries - 1)
+            self._heavy_semaphore.release()
+
+    def get_telemetry(self) -> Dict[str, Any]:
+        """Live DuckDB engine concurrency, spill directory usage, and lakehouse headroom."""
+        from app.core.catalog import get_active_load_tables
+
+        slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
+        cpu_cores = os.cpu_count() or 4
+        threads = (
+            int(settings.DUCKDB_THREADS)
+            if settings.DUCKDB_THREADS
+            else max(1, cpu_cores // slots)
+        )
+        temp_path = settings.duckdb_temp_path
+        temp_bytes = 0
+        if temp_path.is_dir():
+            for entry in temp_path.rglob("*"):
+                try:
+                    if entry.is_file():
+                        temp_bytes += entry.stat().st_size
+                except OSError:
+                    continue
+        disk = advisor.get_disk_info(settings.duckdb_storage_path)
+        with self._telemetry_lock:
+            active_q = self._active_heavy_queries
+            waiting_q = self._waiting_heavy_queries
+            total_q = self._total_queries_executed
+        return {
+            "active_heavy_queries": active_q,
+            "waiting_heavy_queries": waiting_q,
+            "max_concurrent_heavy": slots,
+            "total_queries_executed": total_q,
+            "memory_limit_per_slot": advisor.get_duckdb_memory_limit(slots),
+            "threads_per_slot": threads,
+            "temp_directory": temp_path.as_posix(),
+            "temp_spill_bytes": temp_bytes,
+            "temp_spill_mb": round(temp_bytes / (1024 * 1024), 2),
+            "temp_spill_limit": advisor.get_duckdb_temp_limit(
+                temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT
+            ),
+            "lakehouse_free_gb": disk.get("free_gb", 0.0),
+            "lakehouse_percent_used": disk.get("percent_used", 0.0),
+            "active_load_tables": len(get_active_load_tables()),
+        }
 
     def _ensure_storage(self) -> str:
-        """Returns the resolved lakehouse root.
-
-        Path resolution (and the remote-scheme rejection) lives in Settings so
-        every caller agrees on a single answer; this method no longer re-derives
-        it from the raw URI (audit B1).
-        """
+        """Returns the resolved lakehouse root."""
         return settings.duckdb_storage_path
 
     def get_connection(self, *, with_lakehouse: bool = True) -> duckdb.DuckDBPyConnection:
-        """An in-memory DuckDB connection with this process's budget applied.
-
-        Every connection in the application comes from here (Rule 5): the memory limit
-        from ``ResourceAdvisor``, a local temp directory so a large query spills instead
-        of dying, a cap on that spill, and a thread ceiling so concurrent queries do not
-        each claim every core.
-
-        The lakehouse catalog is attached by default, because a connection without it can
-        neither read nor write a table.
-        """
+        """An in-memory DuckDB connection with this process's budget applied."""
         conn = duckdb.connect(":memory:")
         self._apply_session_budget(conn)
         try:
@@ -67,18 +122,22 @@ class DuckDBEngine:
 
     def _apply_session_budget(self, conn: duckdb.DuckDBPyConnection) -> None:
         """One place that decides how much of the machine a connection may use."""
+        slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
+        cpu_cores = os.cpu_count() or 4
+        threads = (
+            int(settings.DUCKDB_THREADS)
+            if settings.DUCKDB_THREADS
+            else max(1, cpu_cores // slots)
+        )
         statements = [
-            f"SET memory_limit = '{advisor.get_duckdb_memory_limit(settings.DUCKDB_MAX_CONCURRENT_HEAVY)}';",
+            f"SET memory_limit = '{advisor.get_duckdb_memory_limit(slots)}';",
             f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
-            # The spill budget follows the free space on the volume that holds it, so a
-            # 50 GB ceiling on a 40 GB disk cannot promise space the disk does not have.
             "SET max_temp_directory_size = '"
             f"{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT)}';",
+            f"SET threads = {threads};",
             "SET preserve_insertion_order = false;",
             f"SET storage_directory = '{self._ensure_storage()}';",
         ]
-        if settings.DUCKDB_THREADS:
-            statements.append(f"SET threads = {int(settings.DUCKDB_THREADS)};")
         for statement in statements:
             try:
                 conn.execute(statement)
@@ -86,11 +145,7 @@ class DuckDBEngine:
                 logger.debug("DuckDB setting failed (%s): %s", statement, exc)
 
     def attach_lakehouse(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Attaches the DuckLake catalog under the name ``lakehouse``.
-
-        The address people already type — ``lakehouse.raw.orders`` — is unchanged; only
-        who owns the metadata is. See :func:`app.core.catalog.attach_lakehouse`.
-        """
+        """Attaches the DuckLake catalog under the name ``lakehouse``."""
         attach_lakehouse(conn)
 
     def attach_postgres(
@@ -106,10 +161,7 @@ class DuckDBEngine:
         sslmode: str = "disable",
         connect_timeout: int = 8,
     ) -> None:
-        """
-        Dynamically attaches a remote or local PostgreSQL database to the DuckDB connection.
-        Enables cross-database federated SQL joins without blocking on WAN view loops.
-        """
+        """Dynamically attaches a remote or local PostgreSQL database to the DuckDB connection."""
         try:
             conn.execute("INSTALL postgres; LOAD postgres;")
         except Exception as e:
@@ -148,11 +200,7 @@ class DuckDBEngine:
         password: Optional[str],
         connect_timeout: int = 8,
     ) -> None:
-        """Attaches a MySQL/MariaDB database through DuckDB's own ``mysql`` scanner.
-
-        ``READ_ONLY`` is not decoration: DuckDB can ``INSERT`` through this scanner, and a
-        source attached by the platform is a source it does not own.
-        """
+        """Attaches a MySQL/MariaDB database through DuckDB's own ``mysql`` scanner."""
         try:
             conn.execute("LOAD mysql;")
         except Exception:
@@ -178,13 +226,7 @@ class DuckDBEngine:
         )
 
     def attach_mongo(self, conn: duckdb.DuckDBPyConnection, alias: str, uri: str) -> None:
-        """Attaches a MongoDB deployment through the community ``mongo`` scanner.
-
-        Only ``LOAD`` happens here. ``INSTALL`` needs ``allow_unsigned_extensions``, which
-        DuckDB refuses to change once a database is running, so the install is a startup
-        step (:meth:`install_community_extensions`) and a session can only load a scanner
-        that is already on disk.
-        """
+        """Attaches a MongoDB deployment through the community ``mongo`` scanner."""
         try:
             conn.execute("LOAD mongo;")
         except Exception as exc:
@@ -204,12 +246,7 @@ class DuckDBEngine:
     def attach(
         self, conn: duckdb.DuckDBPyConnection, attachment: Dict[str, Any]
     ) -> None:
-        """Attaches one dict from :func:`app.core.sources.attachment_for`.
-
-        A dict without ``kind`` is the pre-MySQL shape, which could only ever mean
-        Postgres, so it is still accepted: the notebooks and the editor ship their own
-        helper, and an out-of-tree caller should not break because a scanner was added.
-        """
+        """Attaches one dict from :func:`app.core.sources.attachment_for`."""
         kind = attachment.get("kind") or "postgres"
         fields = {key: value for key, value in attachment.items() if key != "kind"}
         if kind == "mongo":
@@ -224,13 +261,7 @@ class DuckDBEngine:
             )
 
     def install_community_extensions(self) -> List[str]:
-        """Installs the community scanners once, where the unsigned flag can be set.
-
-        ``allow_unsigned_extensions`` is a connection-level config that cannot be changed
-        while a database runs, so this opens its own short-lived connection, installs, and
-        closes it. Sessions then load a signed-on-disk copy without the flag. Failure is
-        logged, not fatal: an air-gapped install simply keeps such sources pull-only.
-        """
+        """Installs the community scanners once, where the unsigned flag can be set."""
         if not settings.ALLOW_COMMUNITY_EXTENSIONS:
             logger.info(
                 "Community DuckDB extensions are disabled; MongoDB sources stay pull-only."
@@ -272,13 +303,7 @@ class DuckDBEngine:
 
     @staticmethod
     def _rewrite_names(sql: str, mapping: Dict[str, str]) -> str:
-        """Rewrites the dotted address someone typed into the form DuckDB parses.
-
-        `lakehouse.supabase.auth.table1` is four parts, and the parser stops at three.
-        Only names the warehouse actually has are rewritten, in code regions only —
-        string literals, quoted identifiers and comments are copied untouched — so a
-        native three-part name, a Postgres schema or a filename is never disturbed.
-        """
+        """Rewrites the dotted address someone typed into the form DuckDB parses."""
         if not mapping:
             return sql
 
@@ -329,17 +354,7 @@ class DuckDBEngine:
     def _prepare_sql_and_views(
         self, conn: duckdb.DuckDBPyConnection, sql: str, storage_path: str
     ) -> str:
-        """Makes warehouse names resolvable, without walking the filesystem.
-
-        The tables already exist — the catalog is attached — so the per-query scan and
-        the ``CREATE VIEW`` per file are gone. Two conveniences remain:
-
-        * the folder shorthand (``raw.orders``) is rewritten to the address DuckDB
-          parses, because that is what SQL steps and the docs use;
-        * a bare name (``orders``) becomes a temporary view while it is unique in the
-          warehouse, so ``SELECT * FROM orders`` keeps working and an ambiguous name
-          still fails loudly instead of picking a schema.
-        """
+        """Makes warehouse names resolvable, without walking the filesystem."""
         tables = self._lakehouse_tables(conn)
         tokens = set(re.findall(r"[a-zA-Z0-9_]+", sql.lower()))
         counts: Dict[str, int] = {}
@@ -355,12 +370,8 @@ class DuckDBEngine:
             if schema.strip() and schema.lower() != "main":
                 names.setdefault(f"{schema}.{table}".lower(), target)
             else:
-                # A table in the catalog's default schema keeps its documented two-slot
-                # address: `lakehouse.orders`, not `lakehouse.main.orders`.
                 names.setdefault(f"{SOURCE}.{table}".lower(), target)
 
-            # A bare alias is a convenience, not an address: only when exactly one table
-            # answers to that name, and never for a word SQL already uses.
             bare = table.lower()
             if counts[bare] == 1 and bare in tokens and bare not in RESERVED:
                 try:
@@ -406,71 +417,53 @@ class DuckDBEngine:
         max_rows: Optional[int] = None,
         on_connection: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """
-        Executes a SQL query against DuckDB in a thread-safe synchronous runner.
-        Can resolve tables in Bronze Parquet directly via read_parquet() or table name.
-
-        ``attachments`` carries one dict per source to attach (see
-        :func:`app.core.sources.attachment_for`); ``postgres_attachments`` is the old name
-        and is still accepted so an out-of-tree caller keeps working.
-
-        Rows are capped and never materialised beyond ``max_rows``
-        (``DUCKDB_MAX_QUERY_ROWS`` by default): a ``SELECT *`` on a huge table returns a
-        truncated preview instead of loading the whole relation into Python memory.
-        ``on_connection`` receives the live connection so a caller waiting on a timeout can
-        call ``conn.interrupt()`` and stop the DuckDB C++ work instead of leaking it.
-        """
+        """Executes a SQL query against DuckDB in a thread-safe synchronous runner."""
         start_time = time.time()
         storage_path = self._ensure_storage()
-        conn = self.get_connection()
-        if on_connection is not None:
-            on_connection(conn)
+        with self._acquire_heavy_slot():
+            conn = self.get_connection()
+            if on_connection is not None:
+                on_connection(conn)
 
-        try:
-            for attachment in attachments or postgres_attachments or []:
-                self.attach(conn, attachment)
+            try:
+                for attachment in attachments or postgres_attachments or []:
+                    self.attach(conn, attachment)
 
-            # Register bronze parquet views and normalize relative paths
-            exec_sql = self._prepare_sql_and_views(conn, sql, storage_path)
+                exec_sql = self._prepare_sql_and_views(conn, sql, storage_path)
+                rel = conn.sql(exec_sql)
+                if rel is None:
+                    duration_ms = int((time.time() - start_time) * 1000)
+                    return {
+                        "columns": [],
+                        "rows": [],
+                        "row_count": 0,
+                        "truncated": False,
+                        "duration_ms": duration_ms,
+                    }
 
-            # Execute the user's query
-            rel = conn.sql(exec_sql)
-            if rel is None:
+                limit_cap = max_rows if max_rows is not None else settings.DUCKDB_MAX_QUERY_ROWS
+                columns = list(rel.columns or [])
+                if limit_cap > 0:
+                    fetched_tuples = rel.limit(limit_cap + 1).fetchall()
+                    truncated = len(fetched_tuples) > limit_cap
+                    if truncated:
+                        fetched_tuples = fetched_tuples[:limit_cap]
+                else:
+                    fetched_tuples = rel.fetchall()
+                    truncated = False
+
+                rows = [dict(zip(columns, tup)) for tup in fetched_tuples]
                 duration_ms = int((time.time() - start_time) * 1000)
+
                 return {
-                    "columns": [],
-                    "rows": [],
-                    "row_count": 0,
-                    "truncated": False,
+                    "columns": columns,
+                    "rows": rows,
+                    "row_count": len(rows),
+                    "truncated": truncated,
                     "duration_ms": duration_ms,
                 }
-
-            limit_cap = max_rows if max_rows is not None else settings.DUCKDB_MAX_QUERY_ROWS
-            columns = list(rel.columns or [])
-            # DuckDB 2.x relations keep no result between calls (and have no fetchmany), so
-            # the cap is pushed into the plan with limit() — only cap + 1 rows are ever
-            # materialised, which is what makes `SELECT *` on a huge table safe.
-            if limit_cap > 0:
-                fetched_tuples = rel.limit(limit_cap + 1).fetchall()
-                truncated = len(fetched_tuples) > limit_cap
-                if truncated:
-                    fetched_tuples = fetched_tuples[:limit_cap]
-            else:
-                fetched_tuples = rel.fetchall()
-                truncated = False
-
-            rows = [dict(zip(columns, tup)) for tup in fetched_tuples]
-            duration_ms = int((time.time() - start_time) * 1000)
-
-            return {
-                "columns": columns,
-                "rows": rows,
-                "row_count": len(rows),
-                "truncated": truncated,
-                "duration_ms": duration_ms,
-            }
-        finally:
-            conn.close()
+            finally:
+                conn.close()
 
     def export_query_to_file(
         self,
@@ -480,35 +473,32 @@ class DuckDBEngine:
         attachments: Optional[List[Dict[str, Any]]] = None,
         postgres_attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> Path:
-        """Streams query results directly to ``dest_path`` using DuckDB's native COPY.
-
-        The result never passes through Python: a multi-GB export is written by DuckDB to
-        the file, not accumulated in an Arrow table and an ``io.BytesIO`` buffer.
-        """
+        """Streams query results directly to ``dest_path`` using DuckDB's native COPY."""
         storage_path = self._ensure_storage()
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = self.get_connection()
-        try:
-            for attachment in attachments or postgres_attachments or []:
-                self.attach(conn, attachment)
+        advisor.assert_disk_headroom(dest_path.parent.as_posix())
+        with self._acquire_heavy_slot():
+            conn = self.get_connection()
+            try:
+                for attachment in attachments or postgres_attachments or []:
+                    self.attach(conn, attachment)
 
-            # Register bronze parquet views and normalize relative paths
-            exec_sql = self._prepare_sql_and_views(conn, sql, storage_path).strip().rstrip(";")
-            dest_posix = dest_path.resolve().as_posix().replace("'", "''")
-            fmt = output_format.lower()
-            if fmt == "parquet":
-                conn.execute(
-                    f"COPY ({exec_sql}) TO '{dest_posix}' (FORMAT PARQUET, COMPRESSION SNAPPY);"
-                )
-            elif fmt == "csv":
-                conn.execute(
-                    f"COPY ({exec_sql}) TO '{dest_posix}' (FORMAT CSV, HEADER TRUE);"
-                )
-            else:
-                raise ValueError(f"Unsupported export format: {output_format}")
-            return dest_path
-        finally:
-            conn.close()
+                exec_sql = self._prepare_sql_and_views(conn, sql, storage_path).strip().rstrip(";")
+                dest_posix = dest_path.resolve().as_posix().replace("'", "''")
+                fmt = output_format.lower()
+                if fmt == "parquet":
+                    conn.execute(
+                        f"COPY ({exec_sql}) TO '{dest_posix}' (FORMAT PARQUET, COMPRESSION SNAPPY);"
+                    )
+                elif fmt == "csv":
+                    conn.execute(
+                        f"COPY ({exec_sql}) TO '{dest_posix}' (FORMAT CSV, HEADER TRUE);"
+                    )
+                else:
+                    raise ValueError(f"Unsupported export format: {output_format}")
+                return dest_path
+            finally:
+                conn.close()
 
     def export_query(
         self,
@@ -517,12 +507,7 @@ class DuckDBEngine:
         attachments: Optional[List[Dict[str, Any]]] = None,
         postgres_attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> bytes:
-        """Executes a query and returns Parquet or CSV bytes.
-
-        Compatibility helper for callers that need bytes in hand. The HTTP export route
-        uses :meth:`export_query_to_file` instead, so a large export is streamed from
-        disk rather than held in RAM here.
-        """
+        """Executes a query and returns Parquet or CSV bytes."""
         import tempfile
 
         fmt = output_format.lower()
@@ -537,7 +522,6 @@ class DuckDBEngine:
             )
             return dest.read_bytes()
 
-
     def query_bronze_to_polars(self, table_name: str) -> pl.DataFrame:
         """Reads a Bronze Parquet file into a Polars DataFrame."""
         storage_path = self._ensure_storage()
@@ -545,5 +529,6 @@ class DuckDBEngine:
         if not file_path.exists():
             raise FileNotFoundError(f"Bronze table file {file_path.as_posix()} does not exist.")
         return pl.read_parquet(file_path.as_posix())
+
 
 duckdb_engine = DuckDBEngine()

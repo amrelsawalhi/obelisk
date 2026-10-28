@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Loader2, Save, Trash2 } from 'lucide-react';
-import type { CreatePipelinePayload, OverlapPolicy, PipelineDetail } from '../../lib/types';
+import { Loader2, Plus, Save, Trash2 } from 'lucide-react';
+import type { CreatePipelinePayload, OverlapPolicy, PipelineDetail, PipelineParamDef } from '../../lib/types';
 
 const CRON_PRESETS: Array<{ label: string; expr: string }> = [
   { label: 'Every 15 min', expr: '*/15 * * * *' },
@@ -39,6 +39,7 @@ type FormState = {
   max_retries: number;
   retry_delay_seconds: number;
   auto_rerun_interrupted: boolean;
+  params: PipelineParamDef[];
 };
 
 const formFrom = (pipeline: PipelineDetail): FormState => ({
@@ -54,6 +55,12 @@ const formFrom = (pipeline: PipelineDetail): FormState => ({
   max_retries: pipeline.max_retries,
   retry_delay_seconds: pipeline.retry_delay_seconds,
   auto_rerun_interrupted: pipeline.auto_rerun_interrupted,
+  params: (pipeline.params ?? []).map((p) => ({
+    name: p.name,
+    type: p.type,
+    default_value: p.default_value ?? '',
+    required: Boolean(p.required),
+  })),
 });
 
 interface PipelineSettingsFormProps {
@@ -85,6 +92,30 @@ export const PipelineSettingsForm: React.FC<PipelineSettingsFormProps> = ({
   );
 
   const patch = (update: Partial<FormState>) => setForm((current) => ({ ...current, ...update }));
+
+  const addParam = () => {
+    patch({
+      params: [
+        ...form.params,
+        {
+          name: `PARAM_${form.params.length + 1}`,
+          type: 'string',
+          default_value: '',
+          required: false,
+        },
+      ],
+    });
+  };
+
+  const updateParam = (index: number, update: Partial<PipelineParamDef>) => {
+    const next = [...form.params];
+    next[index] = { ...next[index], ...update };
+    patch({ params: next });
+  };
+
+  const removeParam = (index: number) => {
+    patch({ params: form.params.filter((_, i) => i !== index) });
+  };
 
   return (
     <div className="h-full overflow-y-auto">
@@ -158,6 +189,113 @@ export const PipelineSettingsForm: React.FC<PipelineSettingsFormProps> = ({
               </span>
             )}
           </label>
+        </section>
+
+        <section className="space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                Runtime Parameters
+              </h3>
+              <p className="text-[11px] text-slate-500">
+                Variables prompted when running manually (or using defaults when scheduled).
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={addParam}
+              className="flex items-center gap-1 text-xs font-semibold text-sky-600 hover:text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 px-2.5 py-1 rounded-lg transition-colors cursor-pointer"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Add Parameter
+            </button>
+          </div>
+
+          {form.params.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-slate-300 p-4 text-center bg-slate-50/50">
+              <p className="text-xs text-slate-500 font-medium">No runtime parameters configured.</p>
+              <p className="text-[11px] text-slate-400 mt-0.5">
+                Add parameters to inject dynamic values like LIMIT, date filters, or table names into steps.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="grid grid-cols-12 gap-2 px-1 text-[10px] font-bold uppercase tracking-wider text-slate-400 font-mono">
+                <span className="col-span-4">Name</span>
+                <span className="col-span-3">Type</span>
+                <span className="col-span-3">Default Value</span>
+                <span className="col-span-1 text-center">Req</span>
+                <span className="col-span-1"></span>
+              </div>
+              {form.params.map((param, idx) => (
+                <div
+                  key={idx}
+                  className="grid grid-cols-12 gap-2 items-center bg-slate-50/80 p-2 rounded-lg border border-slate-200"
+                >
+                  <div className="col-span-4">
+                    <input
+                      type="text"
+                      className={`${inputClass} font-mono`}
+                      placeholder="e.g. LIMIT"
+                      value={param.name}
+                      onChange={(e) =>
+                        updateParam(idx, {
+                          name: e.target.value.replace(/[^a-zA-Z0-9_]/g, ""),
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="col-span-3">
+                    <select
+                      className={inputClass}
+                      value={param.type}
+                      onChange={(e) =>
+                        updateParam(idx, {
+                          type: e.target.value as "string" | "int" | "float" | "bool",
+                        })
+                      }
+                    >
+                      <option value="string">string</option>
+                      <option value="int">int</option>
+                      <option value="float">float</option>
+                      <option value="bool">bool</option>
+                    </select>
+                  </div>
+                  <div className="col-span-3">
+                    <input
+                      type="text"
+                      className={inputClass}
+                      placeholder={param.type === "bool" ? "true / false" : "default"}
+                      value={param.default_value ?? ""}
+                      onChange={(e) =>
+                        updateParam(idx, { default_value: e.target.value })
+                      }
+                    />
+                  </div>
+                  <div className="col-span-1 flex justify-center">
+                    <input
+                      type="checkbox"
+                      className="rounded border-slate-300 text-sky-600 focus:ring-sky-500 cursor-pointer"
+                      checked={param.required}
+                      onChange={(e) =>
+                        updateParam(idx, { required: e.target.checked })
+                      }
+                    />
+                  </div>
+                  <div className="col-span-1 flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => removeParam(idx)}
+                      className="p-1 text-slate-400 hover:text-rose-600 transition-colors cursor-pointer"
+                      title="Remove parameter"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
 
         <section className="space-y-3">

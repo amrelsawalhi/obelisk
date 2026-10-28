@@ -1,4 +1,6 @@
+import re
 import time
+import uuid
 from typing import Dict, Any, List, Optional
 import psycopg2
 import psycopg2.extras
@@ -7,6 +9,12 @@ import pymysql
 import pymysql.cursors
 
 from app.core.host_resolver import resolve_connection_host
+
+_READ_ONLY_SQL_RE = re.compile(
+    r"^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*(SELECT|WITH|VALUES|TABLE)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def _json_serializable(val: Any) -> Any:
     if val is None:
@@ -24,19 +32,14 @@ def _json_serializable(val: Any) -> Any:
 
 
 def _fetch_bounded(cur, max_rows: Optional[int]) -> tuple[List[Any], bool]:
-    """Reads at most ``max_rows`` rows, and one extra to know whether more exist.
-
-    ``fetchall`` turns the whole result into Python objects before anything decides how
-    many rows the caller wanted, so a ``SELECT *`` against a 50 M-row table built 50 M
-    dicts and died — while the DuckDB path was already capping the same query. Asking for
-    one row past the cap answers "is this all of it?" for the price of a single row.
-    """
+    """Reads at most ``max_rows`` rows, and one extra to know whether more exist."""
     if not max_rows or max_rows <= 0:
         return cur.fetchall(), False
     rows = cur.fetchmany(max_rows + 1)
     if len(rows) > max_rows:
         return rows[:max_rows], True
     return rows, False
+
 
 class NativeQueryEngine:
     """
@@ -62,6 +65,17 @@ class NativeQueryEngine:
     ) -> Dict[str, Any]:
         resolved_host = resolve_connection_host(host, port)
         t0 = time.perf_counter()
+        clean_sql = (sql or "").strip()
+        # Use a server-side named cursor when max_rows > 0 and the query is a single read-only
+        # SELECT/WITH/VALUES statement so libpq streams only max_rows + 1 tuples rather than
+        # buffering the entire table in client C heap inside cur.execute().
+        stripped_body = clean_sql.rstrip(";").strip()
+        use_server_cursor = bool(
+            max_rows
+            and max_rows > 0
+            and _READ_ONLY_SQL_RE.match(clean_sql)
+            and ";" not in stripped_body
+        )
 
         conn = psycopg2.connect(
             host=resolved_host,
@@ -73,30 +87,34 @@ class NativeQueryEngine:
             connect_timeout=min(timeout_seconds, 10),
             options=f"-c statement_timeout={int(timeout_seconds * 1000)}",
         )
-        conn.autocommit = True
+        conn.autocommit = not use_server_cursor
 
-        # Published so a Stop (or a timeout) can reach this statement: psycopg2 answers
-        # cancel() from another thread, which is the only way to end a running query.
         if on_connection is not None:
             on_connection(conn)
 
         try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                if schema_name and schema_name.strip():
-                    clean_schema = schema_name.strip().replace('"', '""')
-                    cur.execute(f'SET search_path TO "{clean_schema}", public;')
+            if schema_name and schema_name.strip():
+                clean_schema = schema_name.strip().replace('"', '""')
+                with conn.cursor() as setup_cur:
+                    setup_cur.execute(f'SET search_path TO "{clean_schema}", public;')
 
+            cursor_name = f"obelisk_ss_{uuid.uuid4().hex[:10]}" if use_server_cursor else None
+            with conn.cursor(name=cursor_name, cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if use_server_cursor:
+                    cur.itersize = min(max_rows + 1, 2000)
                 cur.execute(sql)
                 duration_ms = int((time.perf_counter() - t0) * 1000)
-                status_msg = cur.statusmessage or "OK"
+                status_msg = cur.statusmessage or ("SELECT" if use_server_cursor else "OK")
 
-                if cur.description:
+                if use_server_cursor or cur.description:
                     raw_rows, truncated = _fetch_bounded(cur, max_rows)
-                    cols = [d[0] for d in cur.description]
-                    rows: List[Dict[str, Any]] = []
-                    for r in raw_rows:
-                        rows.append({col: _json_serializable(r.get(col)) for col in cols})
-
+                    cols = [d[0] for d in (cur.description or [])]
+                    rows: List[Dict[str, Any]] = [
+                        {col: _json_serializable(r.get(col)) for col in cols}
+                        for r in raw_rows
+                    ]
+                    if not conn.autocommit:
+                        conn.commit()
                     return {
                         "columns": cols,
                         "rows": rows,
@@ -108,6 +126,8 @@ class NativeQueryEngine:
                     }
                 else:
                     row_count = cur.rowcount if cur.rowcount >= 0 else 0
+                    if not conn.autocommit:
+                        conn.commit()
                     return {
                         "columns": [],
                         "rows": [],
@@ -181,9 +201,6 @@ class NativeQueryEngine:
             user=username,
             password=password,
             connect_timeout=min(timeout_seconds, 10),
-            # Unbuffered on purpose: a buffered cursor reads the *entire* result set into
-            # client memory inside execute(), so no fetch limit could bound anything. This
-            # cursor reads a batch off the socket at a time, and it returns tuples.
             cursorclass=pymysql.cursors.SSCursor,
             autocommit=True,
         )
@@ -222,5 +239,6 @@ class NativeQueryEngine:
                     }
         finally:
             conn.close()
+
 
 native_query_engine = NativeQueryEngine()

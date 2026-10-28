@@ -50,6 +50,11 @@ BLOCKING_MODULES = {
     "marimo_service",
     "pipeline_engine",
     "introspector",
+    "_execute_live_test",
+    "describe_warehouse_postgres",
+    "warehouse_candidates",
+    "warehouse_candidate",
+    "set_warehouse_connection_id",
 }
 
 # Attribute calls that block regardless of the module they hang off.

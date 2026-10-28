@@ -600,7 +600,9 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                             setArgs({
                               scope: "table",
                               entity: val,
-                              ...(!args.target_name ? { target_name: cleanStem } : {}),
+                              target_name: cleanStem,
+                              watermark_column: undefined,
+                              primary_key: undefined,
                             });
                           }}
                         >
@@ -625,7 +627,9 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                             setArgs({
                               scope: "table",
                               entity: val,
-                              ...(!args.target_name ? { target_name: cleanStem } : {}),
+                              target_name: cleanStem,
+                              watermark_column: undefined,
+                              primary_key: undefined,
                             });
                           }}
                         />
@@ -820,7 +824,14 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                   <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
-                      onClick={() => setArgs({ mode: "snapshot" })}
+                      onClick={() =>
+                        setArgs({
+                          mode: "snapshot",
+                          write_strategy: "append",
+                          watermark_column: undefined,
+                          primary_key: undefined,
+                        })
+                      }
                       className={`py-2 px-2.5 text-xs font-medium rounded-lg border text-left transition-all ${
                         (args.mode ?? "snapshot") === "snapshot"
                           ? "border-sky-500 bg-sky-50 text-sky-900 ring-1 ring-sky-500 font-semibold shadow-xs"
@@ -993,6 +1004,21 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                         )}
                       </div>
                     )}
+
+                    {/* Schema Drift Policy */}
+                    <div>
+                      <span className="block text-xs font-semibold text-slate-800 mb-1">
+                        Schema Drift Policy
+                      </span>
+                      <select
+                        className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 outline-hidden focus:border-sky-500 focus:ring-1 focus:ring-sky-500 text-slate-800"
+                        value={(args.schema_policy as string) ?? "evolve"}
+                        onChange={(e) => setArgs({ schema_policy: e.target.value })}
+                      >
+                        <option value="evolve">Auto-Evolve Schema (ALTER TABLE ADD COLUMN)</option>
+                        <option value="strict">Strict Schema Guard (Fail on Upstream Drift)</option>
+                      </select>
+                    </div>
                   </div>
                 )}
 

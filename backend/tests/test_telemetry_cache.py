@@ -27,6 +27,19 @@ TELEMETRY_KEYS = {
     "max_safe_allocation_gb",
     "active_containers_count",
     "allocated_ram_gb",
+    "active_heavy_queries",
+    "waiting_heavy_queries",
+    "max_concurrent_heavy",
+    "total_queries_executed",
+    "memory_limit_per_slot",
+    "threads_per_slot",
+    "temp_directory",
+    "temp_spill_bytes",
+    "temp_spill_mb",
+    "temp_spill_limit",
+    "lakehouse_free_gb",
+    "lakehouse_percent_used",
+    "active_load_tables",
 }
 
 

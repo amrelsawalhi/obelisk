@@ -123,6 +123,12 @@ duck_rel  = tbl_orders.to_duckdb()   # DuckDB PyRelation for chaining queries
 lazy = tbl_orders.to_lazy_polars()   # Polars LazyFrame, prunes columns and row groups
 top  = lazy.select("region", "amount").group_by("region").sum().collect()
 
+# Out-of-core Arrow RecordBatch streaming & scoped SQL pushdown (O(batch_size) RAM):
+for batch in tbl_orders.iter_batches(batch_size=100_000, columns=["order_id", "amount"]):
+    process_chunk(batch)
+
+filtered = tbl_orders.sql("WHERE amount > 500").to_lazy_polars().collect()
+
 # Eager reads are guarded: a warning at 2 GB of Parquet, a refusal above a quarter of
 # RAM (OBELISK_SDK_EAGER_WARN_BYTES / OBELISK_SDK_EAGER_REFUSE_BYTES).
 print(f"Loaded {len(df_polars):,} rows across {len(df_polars.columns)} columns.")`,

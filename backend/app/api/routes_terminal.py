@@ -136,7 +136,9 @@ class UnixPtySession(BaseTerminalSession):
 
     async def write(self, data: str):
         if self.master_fd is not None and self._alive:
-            os.write(self.master_fd, data.encode("utf-8", errors="replace"))
+            await asyncio.to_thread(
+                os.write, self.master_fd, data.encode("utf-8", errors="replace")
+            )
 
     async def resize(self, cols: int, rows: int):
         if self.master_fd is not None and self._alive:
@@ -172,10 +174,15 @@ class UnixPtySession(BaseTerminalSession):
                 pass
             self.master_fd = None
         if self.proc:
+            import signal
             try:
-                self.proc.terminate()
-            except ProcessLookupError:
-                pass
+                pgid = os.getpgid(self.proc.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    self.proc.terminate()
+                except ProcessLookupError:
+                    pass
             self.proc = None
 
 

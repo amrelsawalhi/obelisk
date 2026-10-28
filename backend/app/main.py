@@ -196,10 +196,15 @@ _telemetry_cache_lock = asyncio.Lock()
 
 
 async def _compute_telemetry() -> dict:
-    """Reads host specs, allocations and container count once."""
-    specs = await asyncio.to_thread(advisor.get_host_specs)
-    allocations = await asyncio.to_thread(advisor.get_active_container_allocations)
-    containers = await asyncio.to_thread(docker_mgr.list_managed_containers)
+    """Reads host specs, allocations, container count, and DuckDB engine telemetry once."""
+    from app.engines.duckdb_engine import duckdb_engine
+
+    specs, allocations, containers, engine_telem = await asyncio.gather(
+        asyncio.to_thread(advisor.get_host_specs),
+        asyncio.to_thread(advisor.get_active_container_allocations),
+        asyncio.to_thread(docker_mgr.list_managed_containers),
+        asyncio.to_thread(duckdb_engine.get_telemetry),
+    )
     return {
         "cpu_percent": specs.get("cpu_percent", 0.0),
         "cpu_count": specs.get("cpu_count", 1),
@@ -212,6 +217,7 @@ async def _compute_telemetry() -> dict:
         "max_safe_allocation_gb": specs.get("max_safe_allocation_gb", 0.0),
         "active_containers_count": len(containers),
         "allocated_ram_gb": allocations.get("total_allocated_gb", 0.0),
+        **engine_telem,
     }
 
 

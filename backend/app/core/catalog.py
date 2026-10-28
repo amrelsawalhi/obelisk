@@ -16,7 +16,10 @@ which table at which version.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import logging
+import os
+from pathlib import Path
 import re
 import sqlite3
 import threading
@@ -31,18 +34,11 @@ logger = logging.getLogger(__name__)
 SOURCE = "lakehouse"
 PARQUET_SUFFIX = ".parquet"
 
-# Tables an ingestion writes into while it streams rows: the snapshot lands in
-# ``<table>__obelisk_load`` next to its target and is renamed into place when it is
-# complete. They are never a user's table — a half-written load must not be offered as one
-# — so every catalog read hides them.
 LOAD_TABLE_SUFFIX = "__obelisk_load"
 
-# One folder or table name: letters, digits, '_' and '-', never starting with '-'.
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _SIMPLE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Identifiers that must be quoted or the parser reads them as syntax. A table may
-# legitimately be called "order", so the name has to survive being written by hand.
 RESERVED = frozenset(
     """
     all alter analyze and as asc attach begin between by case cast check column commit
@@ -61,20 +57,11 @@ class InvalidTablePath(ValueError):
     """Raised when a table path cannot be represented as a three-slot address."""
 
 
-# A name is pasted into SQL, into a URL and into the catalog's text columns, so the rule
-# is enforced once, here, and every door uses it. None of these characters can end a
-# quoted identifier or start a new statement.
 MAX_SEGMENT_LENGTH = 63
 
 
 def validate_segment(name: object, *, what: str = "name") -> str:
-    """One folder or table name: letters, digits, ``_`` and ``-``, not starting with ``-``.
-
-    Rejects anything that would stop being a name once quoted: quotes, semicolons,
-    spaces, dots, ``..``, and anything non-ASCII. The 63-character cap is Postgres'
-    identifier limit, so a name that passes here also survives the round trip through
-    an external warehouse.
-    """
+    """One folder or table name: letters, digits, ``_`` and ``-``, not starting with ``-``."""
     value = name.strip() if isinstance(name, str) else ""
     if not value:
         raise InvalidTablePath(f"A {what} is required.")
@@ -92,11 +79,7 @@ def validate_segment(name: object, *, what: str = "name") -> str:
 
 
 def validate_column(name: object, *, what: str = "column name") -> str:
-    """A column name used in generated SQL: ``[A-Za-z_][A-Za-z0-9_]*``.
-
-    No dots and no dashes: a column is never a path, and ``"-"`` in one would have to be
-    quoted in every statement that mentions it.
-    """
+    """A column name used in generated SQL: ``[A-Za-z_][A-Za-z0-9_]*``."""
     value = name.strip() if isinstance(name, str) else ""
     if not value:
         raise InvalidTablePath(f"A {what} is required.")
@@ -114,11 +97,7 @@ def validate_column(name: object, *, what: str = "column name") -> str:
 
 
 def validate_folder(path: object, *, what: str = "folder") -> str:
-    """A folder path: validated segments joined by ``/``, returned normalised.
-
-    ``a\\b`` and ``a/b`` are the same folder; ``.`` and ``..`` are refused rather than
-    silently rewritten, because the address a caller asked for is the address they get.
-    """
+    """A folder path: validated segments joined by ``/``, returned normalised."""
     raw = path.strip().replace("\\", "/") if isinstance(path, str) else ""
     parts = [part for part in raw.split("/") if part]
     if not parts:
@@ -136,42 +115,84 @@ class LakehouseUnavailable(RuntimeError):
     """The lakehouse catalog cannot be reached, so no table can be read or written."""
 
 
-# The first attach against a catalog is the one that creates DuckLake's metadata tables,
-# and SQLite takes a single writer: two threads arriving together meant the loser died with
-# "database is locked". The catalog tree attaches twice at once (its scan and its folder
-# list), so it was the tree that fell over on a fresh warehouse while everything after it
-# ran fine — a race that showed only on the very first read of a data path.
-#
-# Only that initialising attach is serialised. Attaching an existing catalog is read-only
-# and takes ~160 ms, so keeping every attach behind this lock would queue each query behind
-# the previous one; once a catalog is known to exist in this process, attaches overlap
-# again exactly as before. A second *process* (the maintenance CLI, a dbt run) is not
-# covered by this lock.
 _ATTACH_LOCK = threading.Lock()
 _initialised_catalogs: set[str] = set()
-
-# Catalogs already put into WAL mode by this process. The mode is stored in the file, so
-# doing it more than once buys nothing.
 _prepared_catalogs: set[str] = set()
 
-# How long the sqlite catalog waits for a competing writer before giving up. The catalog is
-# written by every dbt run and every ingest, and read by every Query Studio attach, so the
-# default (fail immediately) is the difference between "one query waited" and "database is
-# locked" surfacing in the UI.
+# Registry of in-flight load tables and per-table ingestion locks so concurrent ingests
+# and maintenance sweeps never drop a live load table mid-flight.
+_LOAD_REGISTRY_LOCK = threading.Lock()
+_ACTIVE_LOAD_TABLES: set[tuple[str, str]] = set()
+_TABLE_INGEST_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+
 CATALOG_BUSY_TIMEOUT_MS = 15_000
 
 
+def register_active_load_table(schema: str, table: str) -> None:
+    """Marks ``(schema, table)`` as an active in-flight load table protected from maintenance."""
+    with _LOAD_REGISTRY_LOCK:
+        _ACTIVE_LOAD_TABLES.add((str(schema), str(table)))
+
+
+def unregister_active_load_table(schema: str, table: str) -> None:
+    """Releases active protection on ``(schema, table)`` once ingestion finishes."""
+    with _LOAD_REGISTRY_LOCK:
+        _ACTIVE_LOAD_TABLES.discard((str(schema), str(table)))
+
+_COMMIT_COUNTER_LOCK = threading.Lock()
+_COMMIT_COUNTER = 0
+AUTO_COMPACT_COMMIT_INTERVAL = 10
+
+
+def get_active_load_tables() -> list[tuple[str, str]]:
+    """Returns a snapshot of currently active in-flight load tables."""
+    with _LOAD_REGISTRY_LOCK:
+        return sorted(_ACTIVE_LOAD_TABLES)
+
+
+def record_lakehouse_commit(conn=None, *, interval: int = AUTO_COMPACT_COMMIT_INTERVAL) -> bool:
+    """Tracks lakehouse commits and triggers automatic adjacent-file compaction every ``interval`` commits."""
+    global _COMMIT_COUNTER
+    with _COMMIT_COUNTER_LOCK:
+        _COMMIT_COUNTER += 1
+        should_compact = interval > 0 and (_COMMIT_COUNTER % interval == 0)
+    if not should_compact:
+        return False
+    with _LOAD_REGISTRY_LOCK:
+        if _ACTIVE_LOAD_TABLES:
+            return False
+    own_conn = conn is None
+    c = conn or lakehouse_connection()
+    try:
+        c.execute(f"CALL ducklake_merge_adjacent_files('{SOURCE}');").fetchall()
+        return True
+    except Exception as exc:
+        logger.debug("Automatic DuckLake file compaction skipped: %s", exc)
+        return False
+    finally:
+        if own_conn:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+
+
+@contextmanager
+def table_ingest_lock(schema: str, table: str):
+    """Serializes concurrent ingestion writes targeting the same ``(schema, table)``."""
+    key = (str(schema), str(table))
+    with _LOAD_REGISTRY_LOCK:
+        lock = _TABLE_INGEST_LOCKS.setdefault(key, threading.Lock())
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _prepare_catalog_file(catalog: Path) -> None:
-    """Puts the DuckLake metadata file in WAL mode, once per process.
-
-    DuckLake opens that sqlite file with its own connection, so the journal mode is
-    whatever the file itself says — and WAL is persistent in the header. WAL lets a reader
-    (an attach for a query) and a writer (a dbt run, an ingest) proceed at the same time
-    instead of serialising every catalog access behind one lock.
-
-    Best effort: if the file is busy or the filesystem refuses WAL (a network share), the
-    catalog keeps working exactly as before.
-    """
+    """Puts the DuckLake metadata file in WAL mode, once per process."""
     key = str(catalog)
     if key in _prepared_catalogs:
         return
@@ -183,8 +204,8 @@ def _prepare_catalog_file(catalog: Path) -> None:
         finally:
             con.close()
     except Exception as exc:
-        logger.debug("Could not put the DuckLake catalog in WAL mode: %s", exc)
-        _prepared_catalogs.add(key)  # do not retry on every attach
+        # Do not add to _prepared_catalogs on transient lock error so the next attach retries.
+        logger.debug("Could not put the DuckLake catalog in WAL mode (will retry): %s", exc)
         return
     _prepared_catalogs.add(key)
     if mode and str(mode[0]).lower() != "wal":
@@ -197,16 +218,7 @@ def _prepare_catalog_file(catalog: Path) -> None:
 
 
 def attach_lakehouse(conn) -> None:
-    """Attaches the DuckLake catalog under the name ``lakehouse``.
-
-    The address people already type — ``lakehouse.raw.orders`` — does not change; only
-    who owns the metadata does. The catalog is created on first attach, which is what
-    makes a fresh install work without a migration step.
-
-    That first attach is serialised against every other first attach in this process,
-    because two of them creating the metadata tables at once is what "database is locked"
-    was; see :data:`_ATTACH_LOCK`.
-    """
+    """Attaches the DuckLake catalog under the name ``lakehouse``."""
     from app.config import settings
 
     catalog = settings.lakehouse_catalog_path
@@ -215,20 +227,12 @@ def attach_lakehouse(conn) -> None:
         _attach_catalog(conn, catalog)
         return
     with _ATTACH_LOCK:
-        # A thread that waited on the lock attaches to a catalog someone else created,
-        # which is the cheap, read-only path again — but it still needs its own ATTACH.
         _attach_catalog(conn, catalog)
         _initialised_catalogs.add(key)
 
 
 def _attach_catalog(conn, catalog: Path) -> None:
-    """Loads the DuckLake extension and attaches ``catalog``.
-
-    Loading is tried before installing: DuckDB 2.0 refuses an ``INSTALL`` whose recorded
-    origin differs from the one it would download from, and an extension is often already
-    present (shipped in an air-gapped bundle, or installed by an earlier version). A
-    ``FORCE INSTALL`` is the last resort and the only step that requires a network.
-    """
+    """Loads the DuckLake extension and attaches ``catalog``."""
     from app.config import settings
 
     try:
@@ -254,9 +258,6 @@ def _attach_catalog(conn, catalog: Path) -> None:
 
     catalog.parent.mkdir(parents=True, exist_ok=True)
     _prepare_catalog_file(catalog)
-    # BUSY_TIMEOUT is DuckLake's own sqlite-catalog option: a second writer waits instead of
-    # failing with "database is locked" the moment two things touch the catalog at once
-    # (a dbt run and an ingest are enough).
     conn.execute(
         f"ATTACH 'ducklake:sqlite:{catalog.as_posix()}' AS {SOURCE} "
         f"(DATA_PATH '{settings.duckdb_storage_path}', BUSY_TIMEOUT {CATALOG_BUSY_TIMEOUT_MS});"
@@ -264,15 +265,27 @@ def _attach_catalog(conn, catalog: Path) -> None:
 
 
 def lakehouse_connection():
-    """A throwaway connection with the catalog attached.
-
-    Callers that already own a connection should use :func:`attach_lakehouse` instead;
-    this exists for the few places (a scan, a preview) that only need one answer.
-    """
+    """A throwaway connection with the session budget and catalog attached."""
     import duckdb
+    from app.config import settings
+    from app.core.resource_advisor import advisor
 
     conn = duckdb.connect(":memory:")
     try:
+        slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
+        cpu_cores = os.cpu_count() if "os" in globals() else 4
+        threads = int(settings.DUCKDB_THREADS) if settings.DUCKDB_THREADS else max(1, (cpu_cores or 4) // slots)
+        for stmt in (
+            f"SET memory_limit = '{advisor.get_duckdb_memory_limit(slots)}';",
+            f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
+            f"SET max_temp_directory_size = '{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT)}';",
+            f"SET threads = {threads};",
+            "SET preserve_insertion_order = false;",
+        ):
+            try:
+                conn.execute(stmt)
+            except Exception:
+                pass
         attach_lakehouse(conn)
     except Exception:
         conn.close()
@@ -281,12 +294,7 @@ def lakehouse_connection():
 
 
 def _live_table_rows(conn) -> list:
-    """Every live table, as the catalog's own metadata table describes it.
-
-    One query replaces a directory walk plus a footer read per file: the schema and table
-    come from ``ducklake_schema`` / ``ducklake_table``, and the physical facts from
-    ``ducklake_table_stats``. Some of these rows are load tables, so callers filter.
-    """
+    """Every live table, as the catalog's own metadata table describes it."""
     return conn.execute(
         f"""
         SELECT s.schema_name,
@@ -307,16 +315,7 @@ def _live_table_rows(conn) -> list:
 
 
 def lakehouse_tables(conn) -> list[dict]:
-    """Every live table, as the catalog describes it.
-
-    ``modified_at`` is the catalog's newest snapshot — a coarser answer than a file
-    timestamp, and the honest one here, because a table is now many files and only the
-    catalog knows when any of them last changed.
-
-    A load table (``<table>__obelisk_load``) is skipped: it holds the rows of a snapshot or
-    an upsert that is still being written, and until it is renamed into place it is not a
-    table anyone may query, preview or join.
-    """
+    """Every live table, as the catalog describes it (excluding load tables)."""
     return [
         {
             "schema": str(schema),
@@ -331,28 +330,18 @@ def lakehouse_tables(conn) -> list[dict]:
 
 
 def load_tables(conn) -> list[tuple[str, str]]:
-    """The load tables the catalog still holds, as ``(schema, table)``.
-
-    A load table is not a table anyone asked for: it is where one ingest streams the rows it
-    will swap in or merge from, and a run that ends — either way — drops it. Anything listed
-    here therefore belongs to a run that was killed before it could clean up (SIGKILL, an
-    OOM kill, a lost machine), so its rows can never be applied and it is pure waste: bytes
-    no scan reads and every backup copies. Maintenance drops them.
-    """
+    """The orphaned load tables the catalog still holds, excluding any active in-flight loads."""
+    with _LOAD_REGISTRY_LOCK:
+        active = set(_ACTIVE_LOAD_TABLES)
     return [
         (str(schema), str(table))
         for schema, table, *_rest in _live_table_rows(conn)
-        if str(table).endswith(LOAD_TABLE_SUFFIX)
+        if str(table).endswith(LOAD_TABLE_SUFFIX) and (str(schema), str(table)) not in active
     ]
 
 
 def drop_load_tables(conn, *, dry_run: bool = False) -> list[tuple[str, str]]:
-    """Drops the leftovers :func:`load_tables` describes; returns what it found.
-
-    This is the housekeeping half of a crash: the ingest that owned these tables cannot run
-    its own cleanup, so something else has to, or the bytes are carried by every scan of the
-    catalog and every backup. ``dry_run`` reports without changing anything.
-    """
+    """Drops the orphaned load tables :func:`load_tables` describes; returns what it found."""
     orphans = load_tables(conn)
     if not dry_run:
         for schema, table in orphans:
@@ -363,21 +352,7 @@ def drop_load_tables(conn, *, dry_run: bool = False) -> list[tuple[str, str]]:
 
 
 def lakehouse_all_columns(conn) -> dict[tuple[str, str], tuple[dict, ...]]:
-    """Every table's columns in one query, keyed by ``(schema, table)``.
-
-    ``scan()`` used to ``DESCRIBE`` each table in turn: one statement per table inside a loop
-    over the whole catalog, which is where a lakehouse of a few hundred tables spent most of
-    a scan's time. DuckDB's own ``duckdb_columns()`` answers for all of them at once.
-
-    It is asked in preference to DuckLake's ``ducklake_column`` metadata table because a
-    column's type is shown to a user and the two disagree on the spelling: the metadata
-    table stores DuckLake's own names (``int32``, ``decimal(2,1)``), while
-    ``duckdb_columns()`` reports exactly what ``DESCRIBE`` would (``INTEGER``,
-    ``DECIMAL(2,1)``).
-
-    Returns an empty mapping if the query fails, which leaves the caller to fall back to
-    :func:`lakehouse_columns` table by table.
-    """
+    """Every table's columns in one query, keyed by ``(schema, table)``."""
     try:
         rows = conn.execute(
             f"""
@@ -391,7 +366,7 @@ def lakehouse_all_columns(conn) -> dict[tuple[str, str], tuple[dict, ...]]:
             ORDER BY schema_name, table_name, column_index
             """
         ).fetchall()
-    except Exception:  # noqa: BLE001 - a missing fast path is not a failed scan
+    except Exception:  # noqa: BLE001
         return {}
     by_table: dict[tuple[str, str], list[dict]] = {}
     for schema, table, column, data_type, nullable in rows:
@@ -426,12 +401,7 @@ def lakehouse_columns(conn, schema: str, table: str) -> tuple[dict, ...]:
 
 
 def last_snapshot_time(conn) -> datetime:
-    """When the catalog last changed, always in UTC.
-
-    DuckDB returns ``TIMESTAMPTZ`` converted into the session's timezone, so the value is
-    normalised here: every timestamp the platform shows is UTC, and a tree that mixed
-    zones would be subtly wrong everywhere it was compared.
-    """
+    """When the catalog last changed, always in UTC."""
     try:
         row = conn.execute(
             f"SELECT max(snapshot_time) FROM ducklake_snapshots('{SOURCE}')"
@@ -454,13 +424,7 @@ def quote_ident(value: str) -> str:
 
 
 def split_table_path(value: str) -> tuple[str, str]:
-    """``'supabase/auth/table1'`` -> ``('supabase/auth', 'table1')``.
-
-    Accepts the three spellings an operator might use — a relative path, the fully
-    qualified name, or a bare table name — because callers range from a form field to
-    the SDK. Dots and slashes are both separators, so neither may appear inside a
-    folder or table name; that is what keeps one path mapping to one address.
-    """
+    """``'supabase/auth/table1'`` -> ``('supabase/auth', 'table1')``."""
     if value is None or not str(value).strip():
         raise InvalidTablePath("A table path is required.")
     clean = str(value).strip().replace("\\", "/")
@@ -497,12 +461,7 @@ def path_for(folder: str, name: str) -> str:
 
 
 def lakehouse_schemas(conn) -> list[str]:
-    """The lakehouse's own schemas, which is what a folder is.
-
-    A folder is a schema, so this is the catalog's answer to "which folders exist" — no
-    walk of the warehouse and no guessing from what happens to be on disk. ``main`` is the
-    root rather than a folder, so it is left out.
-    """
+    """The lakehouse's own schemas, which is what a folder is."""
     rows = conn.execute(
         f"SELECT schema_name FROM __ducklake_metadata_{SOURCE}.ducklake_schema "
         "WHERE end_snapshot IS NULL ORDER BY 1"
@@ -511,15 +470,7 @@ def lakehouse_schemas(conn) -> list[str]:
 
 
 def table_directory(root: Path, schema: str, table: str) -> Path:
-    """Where DuckLake keeps one table's Parquet: ``<root>/<schema>/<table>``.
-
-    Not part of the address (the catalog is), but the directory exists anyway, and
-    removing it once the table is gone is what keeps it out of anything that walks the
-    warehouse. Two caveats, both of which the caller's sweep has to live with: a nested
-    folder is one schema named with dots and DuckLake names *its* directory itself, and a
-    table that was swapped in from a load table keeps its files under the load table's
-    name — so this is where a table's files *start*, not always where they end up.
-    """
+    """Where DuckLake keeps one table's Parquet: ``<root>/<schema>/<table>``."""
     if schema == "main":
         return root / table
     return root / schema.replace(".", "/") / table
@@ -539,12 +490,7 @@ def fqn_for(rel_path: str) -> str:
 
 
 def sql_name_for(rel_path: str) -> str:
-    """The name DuckDB should register, quoted only where it must be.
-
-    A single folder is a schema (``lakehouse.supabase.table1``); anything deeper is
-    one schema named after the whole folder path, which the quotes allow to contain
-    dots (``lakehouse."supabase.auth".table1``).
-    """
+    """The name DuckDB should register, quoted only where it must be."""
     parts = _address_parts(rel_path)
     table = quote_ident(parts[-1])
     if len(parts) == 1:
@@ -558,28 +504,21 @@ def sql_name_for(rel_path: str) -> str:
 class TableFile:
     """One Parquet file, described by what the file itself says."""
 
-    path: str  # relative, POSIX: "supabase/auth/table1.parquet"
-    name: str  # "table1"
-    folder: str  # "supabase/auth", or "" at the root
-    fqn: str  # "lakehouse.supabase.auth.table1"
-    sql_name: str  # 'lakehouse."supabase.auth".table1'
+    path: str
+    name: str
+    folder: str
+    fqn: str
+    sql_name: str
     num_rows: int
     size_bytes: int
     modified_at: datetime
-    columns: tuple[dict, ...]  # footer columns: name, data_type, is_nullable, is_primary_key
-    # Whether ``SELECT * FROM table1`` may resolve to this table. True unless another
-    # folder holds the same name, where guessing would silently pick one of them.
+    columns: tuple[dict, ...]
     bare_alias: bool = True
 
 
 @dataclass(frozen=True)
 class WarehouseScan:
-    """Everything the warehouse holds, plus what could not be read and why.
-
-    Problems are reported rather than raised: one unreadable file must not make the
-    whole warehouse invisible, and a name collision has to be visible instead of
-    silently resolving to whichever file the walk happened to reach first.
-    """
+    """Everything the warehouse holds, plus what could not be read and why."""
 
     root: str
     tables: tuple[TableFile, ...]
@@ -593,14 +532,7 @@ _FOOTER_CACHE_LIMIT = 4096
 def read_footer(
     storage: WarehouseStorage, info: FileInfo
 ) -> tuple[tuple[dict, ...], int]:
-    """Reads a Parquet footer: column schema and row count, without the data.
-
-    The footer is a few kilobytes at the end of the file, so this is the cheapest
-    honest answer to "what is in this table". The result is cached against the file's
-    size and timestamp: a rewritten table changes at least one of them, so the cache
-    can never describe an older version of the file, and a scan of an unchanged
-    warehouse costs one ``stat`` per file instead of one read.
-    """
+    """Reads a Parquet footer: column schema and row count, without the data."""
     key = (info.path, info.size_bytes, info.modified_at.isoformat())
     cached = _FOOTER_CACHE.get(key)
     if cached is not None:
@@ -610,9 +542,6 @@ def read_footer(
 
     with storage.open_binary(info.path) as handle:
         metadata = pq.ParquetFile(handle).metadata
-    # pyarrow exposes the file schema as a Parquet schema; the Arrow view carries the
-    # column names and types the engine will actually query. The field names match what
-    # the catalog tree has always sent the UI, so nothing downstream has to change.
     arrow_schema = metadata.schema.to_arrow_schema()
     columns = tuple(
         {
@@ -648,13 +577,7 @@ def table_from_file(storage: WarehouseStorage, info: FileInfo) -> TableFile:
 
 
 def scan(storage: Optional[WarehouseStorage] = None) -> WarehouseScan:
-    """Everything the lakehouse holds, read from its catalog.
-
-    One query replaces a directory walk plus a footer read per file: DuckLake records
-    which tables exist, how many rows they hold and how many bytes they occupy. Folders
-    are schemas, so the address is still ``lakehouse.<schema>.<table>`` and a table's
-    path stays ``schema/table``.
-    """
+    """Everything the lakehouse holds, read from its catalog."""
     store = storage or warehouse_storage()
     tables: list[TableFile] = []
     problems: list[str] = []
@@ -669,8 +592,6 @@ def scan(storage: Optional[WarehouseStorage] = None) -> WarehouseScan:
             schema, name = row["schema"], row["table"]
             folder = "" if schema == "main" else schema
             rel = f"{folder}/{name}" if folder else name
-            # One query answered for every table; only a table it did not mention (or could
-            # not answer for) costs a DESCRIBE of its own.
             columns = columns_by_table.get((schema, name)) or lakehouse_columns(
                 conn, schema, name
             )
@@ -694,9 +615,6 @@ def scan(storage: Optional[WarehouseStorage] = None) -> WarehouseScan:
         conn.close()
 
     tables.sort(key=lambda table: table.path)
-
-    # A bare name is a convenience, not an address: register it only when exactly one
-    # table answers to it, so `SELECT * FROM orders` never silently picks a schema.
     tables = [
         replace(table, bare_alias=counts[table.name.lower()] == 1) for table in tables
     ]

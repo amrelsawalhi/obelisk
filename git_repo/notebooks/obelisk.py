@@ -14,11 +14,13 @@ from app.sdk.obelisk import (
     query,
     query_arrow,
     lazy_query,
+    iter_batches,
     save,
     materialize_sql,
     var,
     spark,
     TableWrapper,
+    LazyQueryBuilder,
     EagerReadTooLarge,
 )
 
@@ -27,10 +29,12 @@ __all__ = [
     "query",
     "query_arrow",
     "lazy_query",
+    "iter_batches",
     "save",
     "materialize_sql",
     "var",
     "spark",
     "TableWrapper",
+    "LazyQueryBuilder",
     "EagerReadTooLarge",
 ]

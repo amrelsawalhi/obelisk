@@ -995,6 +995,27 @@ async def update_pipeline(pipeline_id: str, req: PipelinePatch):
                 )
             data["name"] = data["name"].strip()
 
+        if "params" in data:
+            params_in = data.pop("params")
+            await session.execute(
+                delete(PipelineParam).where(PipelineParam.pipeline_id == pipeline.id)
+            )
+            if params_in:
+                for p in params_in:
+                    p_dict = p if isinstance(p, dict) else (p.model_dump() if hasattr(p, "model_dump") else p)
+                    name = str(p_dict.get("name", "")).strip()
+                    if not name:
+                        continue
+                    session.add(
+                        PipelineParam(
+                            pipeline_id=pipeline.id,
+                            name=name,
+                            type=p_dict.get("type", "string"),
+                            default_value=p_dict.get("default_value"),
+                            required=bool(p_dict.get("required", False)),
+                        )
+                    )
+
         for field, value in data.items():
             setattr(pipeline, field, value)
         pipeline.max_parallel = max(1, pipeline.max_parallel)

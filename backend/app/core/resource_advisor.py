@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import re
 import psutil
 from typing import Dict, Any, List
@@ -15,6 +16,17 @@ def _parse_size_to_mb(value: object) -> int | None:
         return None
     number = float(match.group(1))
     return int(number * _SIZE_UNITS_MB[match.group(2)])
+
+
+def _existing_path(path: object) -> str:
+    """Resolves to the nearest existing ancestor directory so disk_usage never fails on a not-yet-created leaf path."""
+    probe = Path(str(path or "."))
+    try:
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+    except Exception:
+        return "."
+    return str(probe)
 
 
 class ResourceAdvisor:
@@ -47,13 +59,30 @@ class ResourceAdvisor:
         }
 
     def get_disk_info(self, path: str = ".") -> Dict[str, Any]:
-        """Returns free disk space for deploy pre-flight checks."""
-        usage = psutil.disk_usage(path)
+        """Returns free disk space for deploy and ingestion pre-flight checks."""
+        usage = psutil.disk_usage(_existing_path(path))
         return {
+            "free_bytes": int(usage.free),
             "free_gb": round(usage.free / (1024 ** 3), 2),
             "total_gb": round(usage.total / (1024 ** 3), 2),
             "percent_used": usage.percent,
         }
+
+    def assert_disk_headroom(
+        self, path: str = ".", min_free_bytes: int = 512 * 1024 * 1024
+    ) -> None:
+        """Raises RuntimeError when free disk space on ``path`` falls below safety headroom."""
+        try:
+            free_bytes = int(psutil.disk_usage(_existing_path(path)).free)
+        except Exception:
+            return
+        if free_bytes < min_free_bytes:
+            free_mb = free_bytes // (1024 * 1024)
+            req_mb = min_free_bytes // (1024 * 1024)
+            raise RuntimeError(
+                f"Insufficient disk space on '{path}': {free_mb} MB free, "
+                f"at least {req_mb} MB required to prevent catalog corruption."
+            )
 
     def get_active_container_allocations(self) -> Dict[str, Any]:
         """Probes active Docker container memory allocations managed by Obelisk."""
@@ -61,8 +90,6 @@ class ResourceAdvisor:
         containers_info = []
 
         if self._docker_client is None:
-            # Lazy link to the live Docker manager: container allocations are probed
-            # from the real engine instead of always reporting zero.
             try:
                 from app.core.docker_manager import docker_mgr
                 self._docker_client = docker_mgr.client
@@ -101,17 +128,16 @@ class ResourceAdvisor:
         currently_allocated_gb = active["total_allocated_gb"]
         remaining_safe_gb = max(0.25, max_safe_gb - currently_allocated_gb)
 
-        # Baseline proportions based on Obelisk Master Plan
         defaults = {
             "postgres": {"min_mb": 512, "target_ratio": 0.20, "max_mb": 12288},
-                    "superset": {"min_mb": 512, "target_ratio": 0.10, "max_mb": 4096},
+            "superset": {"min_mb": 512, "target_ratio": 0.10, "max_mb": 4096},
             "clickhouse": {"min_mb": 512, "target_ratio": 0.15, "max_mb": 6144},
             "redpanda": {"min_mb": 256, "target_ratio": 0.05, "max_mb": 2048},
             "gitea": {"min_mb": 128, "target_ratio": 0.02, "max_mb": 512},
         }
 
         profile = defaults.get(
-            service_name.lower(), 
+            service_name.lower(),
             {"min_mb": 256, "target_ratio": 0.05, "max_mb": 2048}
         )
 
@@ -137,40 +163,29 @@ class ResourceAdvisor:
         }
 
     def get_duckdb_memory_limit(self, concurrent_slots: int = 4) -> str:
-        """Returns safe per-connection memory limit for DuckDB initialization.
-
-        The limit is a share of the RAM the host can still safely give away, divided by
-        the number of connections expected to be heavy at the same time. Giving every
-        connection 25% of total RAM (the previous rule) let four concurrent queries ask
-        for the whole machine.
-        """
+        """Returns safe per-connection memory limit for DuckDB initialization."""
         specs = self.get_host_specs()
         active = self.get_active_container_allocations()
         remaining_safe_gb = max(
             2.0, specs["max_safe_allocation_gb"] - active["total_allocated_gb"]
         )
         slots = max(1, int(concurrent_slots))
-        # Allocate at most 50% of remaining safe host RAM across concurrent DuckDB slots
         per_slot_gb = max(1, min(12, int((remaining_safe_gb * 0.50) / slots)))
         return f"{per_slot_gb}GB"
 
-    def get_duckdb_temp_limit(self, path: str, configured: str = "50GB") -> str:
-        """How much DuckDB may spill into its temp directory, given what is actually free.
-
-        ``DUCKDB_TEMP_SIZE_LIMIT`` is a fixed string, so it was right for exactly one disk.
-        On a 40 GB volume DuckDB believed it had 50 GB to spill into and died mid-query with
-        "could not write to file"; on a 4 TB volume it stopped at 50 GB for no reason. The
-        budget is now the configured ceiling *or* half the free space, whichever is smaller,
-        so a spill can always leave room for the lakehouse's own Parquet and the catalog.
-        """
+    def get_duckdb_temp_limit_mb(self, path: str, configured: str = "50GB") -> int:
+        """Numeric megabyte spill limit bounded by configured ceiling and 50% of free disk."""
         wanted = _parse_size_to_mb(configured) or 50 * 1024
         try:
-            free_bytes = int(psutil.disk_usage(path).free)
+            free_bytes = int(psutil.disk_usage(_existing_path(path)).free)
         except Exception:
-            return configured
-        # Half of what is free, never below the 1 GB DuckDB needs to be useful at all.
+            return wanted
         allowed_mb = max(1024, free_bytes // (1024 * 1024) // 2)
-        return f"{min(wanted, allowed_mb)}MB"
+        return min(wanted, allowed_mb)
+
+    def get_duckdb_temp_limit(self, path: str, configured: str = "50GB") -> str:
+        """How much DuckDB may spill into its temp directory, given what is actually free."""
+        return f"{self.get_duckdb_temp_limit_mb(path, configured)}MB"
 
     def get_spark_memory_limit(self) -> str:
         """Returns safe memory limit string for PySpark driver initialization (e.g. '2g', '4g')."""
@@ -178,5 +193,55 @@ class ResourceAdvisor:
         total_gb = specs["total_ram_gb"]
         limit_gb = max(1, min(8, int(total_gb * 0.20)))
         return f"{limit_gb}g"
+
+    def get_child_env_limits(self) -> Dict[str, str]:
+        """Environment variables that bound glibc arena fragmentation and thread oversubscription in child processes."""
+        cpu_cores = os.cpu_count() or 4
+        half_cores = str(max(1, cpu_cores // 2))
+        return {
+            "MALLOC_ARENA_MAX": "2",
+            "PYTHONMALLOC": "malloc",
+            "POLARS_MAX_THREADS": half_cores,
+            "OMP_NUM_THREADS": half_cores,
+            "NUMEXPR_MAX_THREADS": half_cores,
+            "OPENBLAS_NUM_THREADS": half_cores,
+        }
+
+    def make_posix_rlimit_preexec(
+        self,
+        *,
+        new_session: bool = False,
+        max_nofile: int = 8192,
+        max_memory_bytes: int | None = None,
+    ):
+        """Returns a POSIX preexec_fn that raises RLIMIT_NOFILE and applies optional RLIMIT_DATA caps."""
+        if os.name == "nt":
+            return None
+
+        env_cap_mb = os.environ.get("OBELISK_CHILD_MAX_RAM_MB", "").strip()
+        if max_memory_bytes is None and env_cap_mb.isdigit() and int(env_cap_mb) > 0:
+            max_memory_bytes = int(env_cap_mb) * 1024 * 1024
+
+        def _preexec() -> None:
+            if new_session:
+                try:
+                    os.setsid()
+                except Exception:
+                    pass
+            try:
+                import resource
+                soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+                target_nofile = min(max(soft, max_nofile), hard if hard != resource.RLIM_INFINITY else max_nofile)
+                if target_nofile > soft:
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (target_nofile, hard))
+                if max_memory_bytes and max_memory_bytes > 0:
+                    _, hard_mem = resource.getrlimit(resource.RLIMIT_DATA)
+                    cap = min(max_memory_bytes, hard_mem) if hard_mem != resource.RLIM_INFINITY else max_memory_bytes
+                    resource.setrlimit(resource.RLIMIT_DATA, (cap, hard_mem))
+            except Exception:
+                pass
+
+        return _preexec
+
 
 advisor = ResourceAdvisor()
