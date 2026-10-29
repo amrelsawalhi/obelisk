@@ -701,5 +701,53 @@ export const api = {
     return res.data;
   },
 
+  // Scripts Studio
+  listScripts: async (): Promise<{ scripts: Array<{ name: string; size_bytes: number; updated_at: string }>; total: number }> => {
+    const res = await apiClient.get('/scripts');
+    return res.data;
+  },
+
+  getScriptContent: async (name: string): Promise<{ name: string; content: string }> => {
+    const res = await apiClient.get('/scripts/content', { params: { name } });
+    return res.data;
+  },
+
+  saveScript: async (name: string, content: string): Promise<{ status: string; name: string; size_bytes: number; updated_at: string }> => {
+    const res = await apiClient.post('/scripts/save', { name, content });
+    return res.data;
+  },
+
+  createScript: async (name: string, content?: string): Promise<{ status: string; name: string }> => {
+    const res = await apiClient.post('/scripts/create', { name, content });
+    return res.data;
+  },
+
+  deleteScript: async (name: string): Promise<{ status: string; name: string }> => {
+    const res = await apiClient.delete(`/scripts/${name}`);
+    return res.data;
+  },
+
+  runScript: async (name: string, params?: Record<string, any>, args?: string[]): Promise<{ run_id: string; name: string; status: string }> => {
+    const res = await apiClient.post('/scripts/run', { name, params, args });
+    return res.data;
+  },
+
+  getScriptRunStatus: async (runId: string): Promise<{
+    run_id: string;
+    name: string;
+    status: 'running' | 'success' | 'failed' | 'killed';
+    exit_code: number | null;
+    duration_seconds: number;
+    logs: string[];
+    outputs: Record<string, any>;
+  }> => {
+    const res = await apiClient.get(`/scripts/runs/${runId}`);
+    return res.data;
+  },
+
+  killScriptRun: async (runId: string): Promise<{ status: string; run_id: string }> => {
+    const res = await apiClient.post(`/scripts/runs/${runId}/kill`);
+    return res.data;
+  },
 };
 

@@ -7,7 +7,6 @@ import {
   RefreshCw,
   Trash2,
   GitBranch,
-  Play,
   Copy,
   Check,
 } from 'lucide-react';
@@ -175,15 +174,6 @@ export const TerminalView: React.FC = () => {
     }
   };
 
-  const sendQuickCommand = (cmd: string) => {
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(`${cmd}\r`);
-      if (xtermInstance.current) {
-        xtermInstance.current.focus();
-      }
-    }
-  };
-
   return (
     <div className="flex-1 flex flex-col h-full min-h-0 bg-[#090d16] text-slate-100 overflow-hidden select-none">
       {/* Terminal Top Control Bar */}
@@ -226,25 +216,6 @@ export const TerminalView: React.FC = () => {
 
         {/* Action Controls */}
         <div className="flex items-center gap-2">
-          {/* Quick command buttons */}
-          <div className="hidden md:flex items-center gap-1.5 mr-2">
-            {[
-              { label: 'git status', cmd: 'git status' },
-              { label: 'dbt compile', cmd: 'dbt compile --project-dir dbt_project' },
-              { label: 'python scripts', cmd: 'python scripts/daily_kpi_summary.py' },
-            ].map((q) => (
-              <button
-                key={q.label}
-                onClick={() => sendQuickCommand(q.cmd)}
-                title={`Run: ${q.cmd}`}
-                className="flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800/60 hover:bg-slate-700 text-[10px] font-mono text-slate-300 border border-slate-700/40 transition-colors"
-              >
-                <Play className="w-2.5 h-2.5 text-sky-400" />
-                <span>{q.label}</span>
-              </button>
-            ))}
-          </div>
-
           <button
             onClick={handleCopySelection}
             title="Copy Selection"

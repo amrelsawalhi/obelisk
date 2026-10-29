@@ -19,6 +19,9 @@ const QueryStudio = React.lazy(() =>
 const DbtStudio = React.lazy(() =>
   import('./components/dbt/DbtStudio').then((m) => ({ default: m.DbtStudio })),
 );
+const ScriptsStudio = React.lazy(() =>
+  import('./components/scripts/ScriptsStudio').then((m) => ({ default: m.ScriptsStudio })),
+);
 const NotebooksView = React.lazy(() =>
   import('./components/notebooks/NotebooksView').then((m) => ({ default: m.NotebooksView })),
 );
@@ -29,9 +32,6 @@ const PipelinesView = React.lazy(() =>
 );
 const DashboardsView = React.lazy(() =>
   import('./components/dashboards/DashboardsView').then((m) => ({ default: m.DashboardsView })),
-);
-const FileManagerView = React.lazy(() =>
-  import('./components/files/FileManagerView').then((m) => ({ default: m.FileManagerView })),
 );
 const TerminalView = React.lazy(() =>
   import('./components/terminal/TerminalView').then((m) => ({ default: m.TerminalView })),
@@ -80,7 +80,7 @@ const RouteFallback: React.FC<{ label?: string }> = ({ label = 'Loading' }) => (
 const FRAME_HOSTING_TABS: NavigationTab[] = ['notebooks'];
 
 /** Parked views that hold unsaved work, so they are never evicted for a cheaper one. */
-const STATEFUL_WORKSPACES: NavigationTab[] = ['query', 'dbt', 'pipelines'];
+const STATEFUL_WORKSPACES: NavigationTab[] = ['query', 'dbt', 'scripts', 'pipelines'];
 
 /** How many views may stay parked behind the active one. */
 const MAX_PARKED_VIEWS = 3;
@@ -156,6 +156,8 @@ const AppLayout: React.FC = () => {
         return <QueryStudio initialSql={routeState.sql} />;
       case 'dbt':
         return <DbtStudio />;
+      case 'scripts':
+        return <ScriptsStudio />;
       case 'notebooks':
         return (
           <NotebooksView
@@ -176,8 +178,6 @@ const AppLayout: React.FC = () => {
             onDeploySuperset={() => navigate('/services', { state: { service: 'superset' } })}
           />
         );
-      case 'files':
-        return <FileManagerView />;
       case 'terminal':
         return <TerminalView />;
       case 'services':

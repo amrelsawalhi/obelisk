@@ -7,7 +7,11 @@ import {
   ExternalLink,
   RefreshCw,
   Server,
+  LayoutDashboard,
+  LineChart,
+  Table2,
 } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import { api } from '../../lib/api';
 import { serviceUrl } from '../../lib/urls';
 import type {
@@ -20,11 +24,11 @@ import type {
 const SUPERSET_IMAGE = 'apache/superset:4.1.1';
 
 /** The metric cards, in the order Superset's own navigation uses. */
-const METRICS: { key: string; label: string }[] = [
-  { key: 'dashboards', label: 'Dashboards' },
-  { key: 'charts', label: 'Charts' },
-  { key: 'datasets', label: 'Datasets' },
-  { key: 'databases', label: 'Databases' },
+const METRICS: { key: string; label: string; icon: LucideIcon }[] = [
+  { key: 'dashboards', label: 'Dashboards', icon: LayoutDashboard },
+  { key: 'charts', label: 'Charts', icon: LineChart },
+  { key: 'datasets', label: 'Datasets', icon: Table2 },
+  { key: 'databases', label: 'Databases', icon: Database },
 ];
 
 const ACTION_STYLES: Record<string, string> = {
@@ -54,14 +58,20 @@ interface DashboardsViewProps {
   onDeploySuperset: () => void;
 }
 
-const MetricCard: React.FC<{ label: string; value: number | null | undefined }> = ({
-  label,
-  value,
-}) => (
-  <div className="p-3.5 bg-white border border-slate-200 rounded-xl shadow-2xs">
-    <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">{label}</div>
-    <div className="mt-0.5 text-xl font-bold text-slate-900 tabular-nums">
-      {typeof value === 'number' ? value : '—'}
+const MetricCard: React.FC<{
+  label: string;
+  value: number | null | undefined;
+  icon: LucideIcon;
+}> = ({ label, value, icon: Icon }) => (
+  <div className="p-3.5 bg-white border border-slate-200 rounded-xl shadow-2xs flex items-center justify-between">
+    <div>
+      <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-400">{label}</div>
+      <div className="mt-0.5 text-xl font-bold text-slate-900 tabular-nums">
+        {typeof value === 'number' ? value : '—'}
+      </div>
+    </div>
+    <div className="w-8 h-8 rounded-lg bg-slate-50 border border-slate-100 flex items-center justify-center text-slate-400 shrink-0">
+      <Icon className="w-4 h-4" />
     </div>
   </div>
 );
@@ -176,33 +186,8 @@ export const DashboardsView: React.FC<DashboardsViewProps> = ({ onDeploySuperset
 
   return (
     <div className="flex-1 flex flex-col h-full bg-slate-50 overflow-hidden">
-      {/* Top Bar */}
-      <div className="h-14 border-b border-slate-200 bg-white px-6 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-3">
-          <span
-            className={`w-2.5 h-2.5 rounded-full ${
-              isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'
-            }`}
-          />
-          <span className="text-xs font-bold text-slate-800">
-            Apache Superset {isRunning ? 'Running' : 'Offline'}
-          </span>
-          <span className="text-[11px] font-mono text-slate-500 bg-slate-100 px-2 py-0.5 rounded border border-slate-200">
-            Port {port}
-          </span>
-        </div>
-
-        <button
-          onClick={() => load(true)}
-          title="Refresh status"
-          className="p-1.5 border border-slate-300 rounded-lg text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 shadow-2xs transition-colors"
-        >
-          <RefreshCw className={`w-3.5 h-3.5 ${loading || refreshing ? 'animate-spin' : ''}`} />
-        </button>
-      </div>
-
       {/* Main Content Area */}
-      <div className="flex-1 bg-slate-100 flex flex-col overflow-hidden relative">
+      <div className="flex-1 bg-slate-50 flex flex-col overflow-hidden relative">
         {error && (
           <div className="m-4 p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-700 flex items-center gap-2">
             <AlertCircle className="w-4 h-4 shrink-0" />
@@ -259,41 +244,42 @@ export const DashboardsView: React.FC<DashboardsViewProps> = ({ onDeploySuperset
           </div>
         ) : (
           <div className="flex-1 overflow-y-auto p-6 space-y-4">
-            {/* Launcher. This page links to Superset, it never frames it: the iframe it
-                replaced pointed at /superset, which Superset does not serve, so the page
-                said "not found" while the service was perfectly healthy. */}
+            {/* Launcher Card */}
             <section className="flex flex-wrap items-center justify-between gap-4 p-5 bg-white border border-slate-200 rounded-2xl shadow-2xs">
               <div className="flex items-center gap-3 min-w-0">
                 <div className="w-11 h-11 shrink-0 rounded-xl bg-sky-50 border border-sky-100 flex items-center justify-center text-sky-600">
                   <BarChart3 className="w-5 h-5" />
                 </div>
-                <div className="min-w-0">
+                <div className="flex items-center gap-2.5">
+                  <span
+                    className={`w-2.5 h-2.5 rounded-full ${
+                      isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'
+                    }`}
+                  />
                   <h3 className="text-sm font-bold text-slate-900 tracking-tight">
                     Apache Superset
                   </h3>
-                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] font-mono text-slate-500">
-                    <span>{SUPERSET_IMAGE}</span>
-                    <span className="text-slate-300">•</span>
-                    <span className="truncate">{baseUrl}</span>
-                    {supersetStatus?.live_docker_status ? (
-                      <>
-                        <span className="text-slate-300">•</span>
-                        <span>{supersetStatus.live_docker_status}</span>
-                      </>
-                    ) : null}
-                  </div>
                 </div>
               </div>
 
-              <a
-                href={baseUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="flex items-center gap-1.5 px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white rounded-xl text-xs font-semibold shadow-xs transition-colors"
-              >
-                <span>Open Superset</span>
-                <ExternalLink className="w-3.5 h-3.5" />
-              </a>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => load(true)}
+                  title="Refresh status"
+                  className="p-2 border border-slate-200 rounded-xl text-slate-700 hover:text-slate-900 bg-white hover:bg-slate-50 shadow-2xs transition-colors"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loading || refreshing ? 'animate-spin' : ''}`} />
+                </button>
+                <a
+                  href={baseUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-center gap-1.5 px-4 py-2 bg-sky-600 hover:bg-sky-700 text-white rounded-xl text-xs font-semibold shadow-xs transition-colors"
+                >
+                  <span>Open Superset</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              </div>
             </section>
 
             {/* Numbers come from Superset itself. When it cannot answer the page says
@@ -314,6 +300,7 @@ export const DashboardsView: React.FC<DashboardsViewProps> = ({ onDeploySuperset
                     key={metric.key}
                     label={metric.label}
                     value={inventory?.counts?.[metric.key] ?? null}
+                    icon={metric.icon}
                   />
                 ))}
               </div>

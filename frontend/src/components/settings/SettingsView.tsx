@@ -74,8 +74,8 @@ export const SettingsView: React.FC = () => {
   // the same payload Home reads; null means the probe failed, and the cards say so.
   const [telemetry, setTelemetry] = useState<TelemetryData | null>(null);
 
-  // Files and Terminal are opt-in (see `lib/devTools.ts`): the sidebar hides them
-  // until the operator asks for a raw view of git_repo/.
+  // Developer Terminal is opt-in (see `lib/devTools.ts`): the sidebar hides it
+  // until the operator enables shell access to the workspace container.
   const [devToolsEnabled, setDevToolsEnabled] = useDevToolsEnabled();
 
   // Destructive actions confirm in-app instead of in a browser dialog.
@@ -1157,18 +1157,16 @@ export const SettingsView: React.FC = () => {
               </div>
             </div>
 
-            {/* Files and Terminal are redundant with dbt Studio and Marimo unless asked for */}
+            {/* Developer Terminal is opt-in for shell access to the workspace container */}
             <div className="flex items-start justify-between gap-4 p-4 rounded-lg border border-slate-200 bg-slate-50">
               <div className="space-y-1">
                 <div className="text-xs font-bold text-slate-700 font-mono flex items-center gap-1.5">
                   <SquareTerminal className="w-3.5 h-3.5 text-slate-500" />
-                  Developer Raw Tools
+                  Developer Terminal
                 </div>
                 <div className="text-[11px] text-slate-500 leading-relaxed">
-                  Adds <b>Files</b> (a raw tree over <code className="font-mono">git_repo/</code>) and{' '}
-                  <b>Terminal</b> to the sidebar. Off by default: dbt Studio and Marimo already open
-                  the same scripts with their schema in view, and two trees over one folder is how a
-                  model gets edited in the wrong place.
+                  Adds an embedded <b>Terminal</b> to the sidebar under Platform for shell access to the
+                  workspace container and Obelisk CLI. Off by default.
                 </div>
               </div>
               <button
@@ -1179,7 +1177,7 @@ export const SettingsView: React.FC = () => {
                 className={`shrink-0 w-11 h-6 rounded-full transition-colors relative ${
                   devToolsEnabled ? 'bg-sky-600' : 'bg-slate-300'
                 }`}
-                title={devToolsEnabled ? 'Hide Files and Terminal' : 'Show Files and Terminal'}
+                title={devToolsEnabled ? 'Hide Terminal' : 'Show Terminal'}
               >
                 <span
                   className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow-sm transition-all ${

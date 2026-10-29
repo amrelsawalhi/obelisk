@@ -66,6 +66,10 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
       title: 'dbt Studio',
       subtitle: 'Jinja data models, live compiled SQL, and DAG lineage',
     },
+    scripts: {
+      title: 'Scripts Studio',
+      subtitle: 'Author, test, and run Python pipeline jobs and data quality gates',
+    },
     notebooks: {
       title: 'Notebooks',
       subtitle: 'Interactive exploratory data analysis powered by Marimo',
@@ -77,10 +81,6 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
     dashboards: {
       title: 'Dashboards',
       subtitle: 'Visual business intelligence and Superset analytics',
-    },
-    files: {
-      title: 'Repository Files',
-      subtitle: 'Workspace assets, dbt projects, SQL scripts, and notebooks',
     },
     terminal: {
       title: 'Developer Terminal',

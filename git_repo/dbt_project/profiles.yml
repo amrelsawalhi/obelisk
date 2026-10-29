@@ -9,7 +9,7 @@ obelisk:
       type: duckdb
       path: "{{ env_var('DBT_DUCKDB_PATH', 'dbt.duckdb') }}"
       schema: main
-      threads: 2
+      threads: 1
       settings:
         memory_limit: "{{ env_var('DBT_DUCKDB_MEMORY_LIMIT', '4GB') }}"
         max_temp_directory_size: "{{ env_var('DBT_DUCKDB_MAX_TEMP_SIZE', '25GB') }}"
@@ -34,6 +34,6 @@ obelisk:
       dbname: "{{ env_var('DBT_PG_DBNAME', 'sourcedb') }}"
       schema: public
       sslmode: "{{ env_var('DBT_PG_SSLMODE', 'disable') }}"
-      threads: 2
+      threads: 1
       connect_timeout: 10
       keepalives_idle: 0

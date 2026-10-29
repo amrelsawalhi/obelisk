@@ -12,9 +12,9 @@ import {
   Settings,
   X,
   ArrowRight,
-  FolderCode,
   SquareTerminal,
   Boxes,
+  FileCode2,
   Table2,
   Plug,
   Loader2,
@@ -67,10 +67,10 @@ const NAV_ACTIONS: { tab: NavigationTab; label: string; category: string; icon: 
   { tab: 'notebooks', label: 'Open Notebooks Workspace', category: 'Notebooks', icon: BookOpen },
   { tab: 'dashboards', label: 'Open Dashboards & BI', category: 'Dashboards', icon: BarChart3 },
   { tab: 'dbt', label: 'Open dbt Studio', category: 'dbt Studio', icon: Boxes },
+  { tab: 'scripts', label: 'Open Scripts Studio', category: 'Scripts', icon: FileCode2 },
   { tab: 'pipelines', label: 'Open Pipelines Orchestrator', category: 'Pipelines', icon: GitFork },
   { tab: 'services', label: 'Open Service Catalog', category: 'Service Catalog', icon: Server },
   { tab: 'settings', label: 'Open Platform Settings & Vault', category: 'Settings', icon: Settings },
-  { tab: 'files', label: 'Open Repository File Manager', category: 'Files', icon: FolderCode },
   { tab: 'terminal', label: 'Open Developer Terminal', category: 'Terminal', icon: SquareTerminal },
 ];
 

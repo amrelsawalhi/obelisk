@@ -7,9 +7,9 @@ import {
   BarChart3,
   Server,
   Settings,
-  FolderCode,
   SquareTerminal,
   Boxes,
+  FileCode2,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { ObeliskIcon } from '../common/ObeliskIcon';
@@ -20,10 +20,10 @@ export type NavigationTab =
   | 'catalog'
   | 'query'
   | 'dbt'
+  | 'scripts'
   | 'notebooks'
   | 'pipelines'
   | 'dashboards'
-  | 'files'
   | 'terminal'
   | 'services'
   | 'settings';
@@ -65,6 +65,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
       label: 'Build & Orchestrate',
       items: [
         { id: 'dbt', label: 'dbt Studio', icon: Boxes },
+        { id: 'scripts', label: 'Scripts', icon: FileCode2 },
         { id: 'pipelines', label: 'Pipelines', icon: GitFork },
       ],
     },
@@ -75,7 +76,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
         { id: 'settings', label: 'Settings', icon: Settings },
         ...(devToolsEnabled
           ? ([
-              { id: 'files', label: 'Files', icon: FolderCode },
               { id: 'terminal', label: 'Terminal', icon: SquareTerminal },
             ] as NavItem[])
           : []),
