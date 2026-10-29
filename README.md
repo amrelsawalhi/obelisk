@@ -13,7 +13,7 @@ Run a complete modern data stack on a workstation, a single server, or an air-ga
 [![React 18](https://img.shields.io/badge/Frontend-React%2018%20%2B%20Tailwind-61DAFB?logo=react&logoColor=black)](https://react.dev/)
 
 <p align="center">
-  <img src="docs/images/data_catalog.png" alt="Obelisk workspace: the data catalog with lakehouse folders and connected Postgres, MongoDB and Supabase sources, a 50-row Parquet preview, and the full tool rail -- plus the query studio, dbt studio, notebooks, pipelines, service catalog and terminal" width="100%">
+  <img src="docs/images/homepage.png" alt="Obelisk workspace: workspace overview, active pipelines, managed data services, and host resource telemetry" width="100%">
 </p>
 
 </div>
@@ -77,34 +77,54 @@ Postgres on `:5434` and MongoDB on `:27018`.
 tables in as Snappy Parquet with `snapshot`, `incremental` (watermark) or `upsert`
 (primary key) semantics. Attachable sources (Postgres, MySQL, MariaDB, and MongoDB) can also be queried live, uncopied.
 
-**Query Studio.** DuckDB in-process, CSV and Parquet export, a virtualized grid, and
-federated joins in one statement:
+**Query Studio.** DuckDB in-process analytical SQL, CSV and Parquet export, a virtualized grid, and
+cross-source federated joins in a single statement:
 
 ```sql
-SELECT c.region, count(*) AS events, round(sum(e.revenue), 2) AS revenue
-FROM pg_enterprise_warehouse.public.e2e_customers c
-JOIN bronze.e2e_clickstream e ON e.customer_id = c.customer_id
-GROUP BY 1 ORDER BY 1;
+SELECT 
+    c.company_name AS customer,
+    geo.Capital AS capital_city,
+    geo.Continent AS continent,
+    COUNT(o.order_id) AS orders,
+    ROUND(SUM(o.total_amount), 2) AS total_spend
+FROM pg_enterprise_warehouse.crm.customer c
+JOIN lakehouse.raw.sales_order o 
+    ON c.customer_id = o.customer_id
+JOIN read_csv('http://raw.githubusercontent.com/datasets/country-codes/master/data/country-codes.csv') geo
+    ON c.country = geo."ISO3166-1-Alpha-2"
+GROUP BY 1, 2, 3
+ORDER BY total_spend DESC
+LIMIT 5;
 ```
 
 <p align="center">
-  <img src="docs/images/hero_query_studio.png" alt="Query Studio: one federated join across Postgres and the lakehouse returning four regions in 314 ms, with Lakehouse, Supabase, Postgres and MongoDB in the schema explorer" width="100%">
+  <img src="docs/images/query_studio.png" alt="Query Studio: 3-way federated join across PostgreSQL CRM, local Lakehouse Parquet, and live HTTP CSV with schema explorer and results grid" width="100%">
 </p>
 
-**Pipelines.** A canvas with conditional edges; step **outputs** bound downstream
-(`{{steps.build.table}}`); retries with attempt history; SQL that materializes to a table;
-pipelines that run other pipelines with recorded lineage; logs that stream while a step is
-still running; durable run history and re-run-from-step.
+**Pipelines.** A visual DAG canvas with conditional branching; step **outputs** bound downstream
+(`{{steps.build.table}}`); retry policies; sub-pipeline triggers; and streaming step logs.
 
 <p align="center">
-  <img src="docs/images/pipelines.png" alt="Pipeline canvas and step inspector: six steps wired with conditional edges, a gate that retried and passed, and a SQL step materializing its output to a lakehouse table" width="100%">
+  <img src="docs/images/pipelines.png" alt="Pipeline canvas: DAG with conditional branching, quality gate script step, webhook alert on failure, and step inspector" width="100%">
 </p>
 
-**dbt Studio.** Edit, compile, preview and run models in the browser, with lineage. A
-`dbt_run` step can stage a lakehouse folder into the warehouse before it builds.
+**dbt Studio.** Edit, compile, preview, and run models in the browser with DAG lineage and 50-row instant data preview.
 
-**Notebooks.** Reactive Marimo notebooks saved as plain `.py` under `git_repo/notebooks/`,
-one click from any table, and runnable headlessly as a pipeline step.
+<p align="center">
+  <img src="docs/images/dbt_studio.png" alt="dbt Studio: Jinja SQL editor, model DAG lineage, compiled SQL viewer, and instant live data preview" width="100%">
+</p>
+
+**Notebooks.** Reactive Marimo notebooks saved as plain `.py` scripts under `git_repo/notebooks/`, querying the lakehouse via the Obelisk Python SDK (`obelisk.query`), runnable interactively or headlessly in pipelines.
+
+<p align="center">
+  <img src="docs/images/notebook.png" alt="Reactive Marimo Notebook: querying the Obelisk lakehouse and external databases using the Python SDK" width="100%">
+</p>
+
+**Scripts Studio & Quality Gates.** Author and execute standalone Python scripts, data quality gates, and automated alert handlers with live execution telemetry and console streaming.
+
+<p align="center">
+  <img src="docs/images/script_studio.png" alt="Scripts Studio: Python data quality gate execution console with parameter inputs and status checks" width="100%">
+</p>
 
 **Vault.** Variables and credentials encrypted at rest with Fernet and decrypted only in
 memory, at execution time: `obelisk.var("OPENAI_API_KEY")`.
@@ -113,10 +133,8 @@ memory, at execution time: `obelisk.var("OPENAI_API_KEY")`.
 
 ```bash
 cd backend
-python -m pytest tests -q                        # the backend suite, no external services needed
-# From the repo root the config must be named: python -m pytest -c backend/pyproject.toml
-python scripts/verify_pipelines.py               # every step type, every edge condition
-python scripts/e2e/verify_e2e.py --scale small   # full journey, live Postgres + Mongo
+python -m pytest tests -q                        # the backend test suite, no external services needed
+python scripts/preflight_port.py                 # port availability and preflight checks
 ```
 
 The end-to-end script seeds real sources, drives ingest, dbt and federated SQL, forces every
