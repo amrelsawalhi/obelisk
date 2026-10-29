@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, AliasChoices
 
 # Schemes that are recognised but cannot be served until the StorageProvider
 # seam lands (docs/architecture.md §7.1). They are rejected at startup instead
@@ -80,10 +80,12 @@ DEFAULT_MASTER_KEY = "dGhpcy1pcy1hLXNhbXBsZS0zMi1ieXRlLWtleS0xMjM0NTY="
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PASSWORD = "obelisk2026"
 
+_ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(str(_ROOT_ENV), ".env"),
         env_file_encoding="utf-8",
         extra="ignore"
     )
@@ -113,13 +115,53 @@ class Settings(BaseSettings):
     # route and every socket without editing a single handler.
     AUTH_ENABLED: bool = Field(
         default_factory=lambda: os.getenv("OBELISK_AUTH_ENABLED", "0").strip().lower()
-        in ("1", "true", "yes", "on")
+        in ("1", "true", "yes", "on"),
+        validation_alias=AliasChoices("AUTH_ENABLED", "OBELISK_AUTH_ENABLED"),
+    )
+    # Session cookie behaviour. ``Secure`` stays off by default because a LAN HTTP
+    # deployment is a supported install; anything served over HTTPS should set it to 1
+    # so the cookie never travels in clear text.
+    SESSION_SECURE_COOKIE: bool = Field(
+        default_factory=lambda: os.getenv("OBELISK_SESSION_SECURE_COOKIE", "0")
+        .strip()
+        .lower()
+        in ("1", "true", "yes", "on"),
+        validation_alias=AliasChoices("SESSION_SECURE_COOKIE", "OBELISK_SESSION_SECURE_COOKIE"),
+    )
+    # Session lifetime. A stolen cookie is valid until it expires, so keep this as
+    # short as the workflow tolerates.
+    SESSION_TTL_SECONDS: int = Field(
+        default_factory=lambda: int(os.getenv("OBELISK_SESSION_TTL_SECONDS", str(7 * 86400))),
+        validation_alias=AliasChoices("SESSION_TTL_SECONDS", "OBELISK_SESSION_TTL_SECONDS"),
+    )
+    # Login brute-force protection: after this many failures from one address, that
+    # address is locked out for AUTH_LOCKOUT_SECONDS.
+    AUTH_MAX_FAILED_ATTEMPTS: int = Field(
+        default_factory=lambda: int(os.getenv("OBELISK_AUTH_MAX_FAILED_ATTEMPTS", "10")),
+        validation_alias=AliasChoices("AUTH_MAX_FAILED_ATTEMPTS", "OBELISK_AUTH_MAX_FAILED_ATTEMPTS"),
+    )
+    AUTH_LOCKOUT_SECONDS: int = Field(
+        default_factory=lambda: int(os.getenv("OBELISK_AUTH_LOCKOUT_SECONDS", "300")),
+        validation_alias=AliasChoices("AUTH_LOCKOUT_SECONDS", "OBELISK_AUTH_LOCKOUT_SECONDS"),
+    )
+    # Allows testing auth locally with sample master key and default password without startup abort.
+    ALLOW_DEFAULT_CREDENTIALS: bool = Field(
+        default_factory=lambda: os.getenv("OBELISK_ALLOW_DEFAULT_CREDENTIALS", "0").strip().lower()
+        in ("1", "true", "yes", "on"),
+        validation_alias=AliasChoices("ALLOW_DEFAULT_CREDENTIALS", "OBELISK_ALLOW_DEFAULT_CREDENTIALS"),
     )
     # Extra browser origins allowed to open sockets, comma separated. Same-host,
     # loopback and Vite's dev server are always allowed; this is for a reverse proxy
     # that rewrites the Host header to something else.
     ALLOWED_ORIGINS: str = Field(
         default_factory=lambda: os.getenv("OBELISK_ALLOWED_ORIGINS", "")
+    )
+    # Comma-separated IPs/CIDRs of reverse proxies whose X-Forwarded-For may be
+    # believed. Empty means no proxy is trusted: a forwarded header is refused. Set
+    # this when the API sits behind Caddy/nginx on another host and the terminal is
+    # used without authentication (with auth on, sessions do the gating instead).
+    TRUSTED_PROXIES: str = Field(
+        default_factory=lambda: os.getenv("OBELISK_TRUSTED_PROXIES", "")
     )
 
     # ------------------------------------------------------------ terminal
@@ -211,6 +253,12 @@ class Settings(BaseSettings):
     DUCKDB_MAX_CONCURRENT_HEAVY: int = Field(
         default_factory=lambda: int(os.getenv("DUCKDB_MAX_CONCURRENT_HEAVY", "4"))
     )
+    # How many ingests may run at once. Each one holds a DuckDB connection and a heavy
+    # slot for its whole run, so this must stay below DUCKDB_MAX_CONCURRENT_HEAVY or the
+    # ingest queue simply waits on the slots instead of on this cap.
+    INGEST_MAX_CONCURRENT: int = Field(
+        default_factory=lambda: int(os.getenv("OBELISK_INGEST_MAX_CONCURRENT", "2"))
+    )
 
     # The SDK's eager readers (``to_polars``/``to_df``/``to_arrow``) pull a whole table into
     # memory. Past a point that is not a slow notebook cell, it is the kernel dying with
@@ -225,6 +273,13 @@ class Settings(BaseSettings):
     )
     SDK_EAGER_REFUSE_BYTES: int = Field(
         default_factory=lambda: int(os.getenv("OBELISK_SDK_EAGER_REFUSE_BYTES", "0"))
+    )
+    # The most rows ``obelisk.query()`` / ``query_arrow()`` will materialise. They build
+    # the whole result in memory; past the cap the SDK raises and points at
+    # ``iter_batches()``/``lazy_query()`` instead of taking the kernel with it. 0 removes
+    # the cap for an operator who knows what they are asking for.
+    SDK_QUERY_ROW_LIMIT: int = Field(
+        default_factory=lambda: int(os.getenv("OBELISK_SDK_QUERY_ROW_LIMIT", "1000000"))
     )
 
     @property
@@ -262,6 +317,15 @@ class Settings(BaseSettings):
     # so every notebook ever opened leaves a kernel (~155 MB) resident until the
     # backend restarts. 0 disables the expiry (pre-change behaviour).
     MARIMO_SESSION_TTL_SECONDS: int = 600
+
+    # Where the notebook server binds. Marimo's own default is loopback, and it is kept
+    # explicit here so a deployment cannot drift into exposing an unauthenticated
+    # ``edit`` server (which is remote code execution) just by publishing a port. A
+    # deployment that needs another container to reach it must publish it through a
+    # proxy that authenticates first.
+    MARIMO_HOST: str = Field(
+        default_factory=lambda: os.getenv("MARIMO_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    )
 
     # Docker network and host
     OBELISK_NET: str = "obelisk_net"

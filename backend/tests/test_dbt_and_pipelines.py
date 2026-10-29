@@ -16,6 +16,27 @@ from app.core.resource_advisor import advisor
 from app.engines.dbt_runner import dbt_runner
 
 
+def test_only_changed_tables_are_copied_to_the_warehouse():
+    """An unchanged lakehouse table must not be copied over TCP again."""
+    to_sync, unchanged = dbt_runner._sync_plan(
+        {"orders": (100, 2048), "customers": (5, 512), "fresh": None},
+        {"orders": (100, 2048), "customers": (6, 512)},
+    )
+
+    assert unchanged == ["orders"]
+    assert to_sync == ["customers", "fresh"], "an unreadable fingerprint must be copied"
+
+
+def test_a_forced_sync_copies_every_table():
+    to_sync, unchanged = dbt_runner._sync_plan(
+        {"orders": (100, 2048)}, {"orders": (100, 2048)}, force=True
+    )
+
+    assert unchanged == []
+    assert to_sync == ["orders"]
+
+
+
 def test_docker_manager_service_blueprints():
     """
     Verifies that localhost deployment blueprints for all 6 catalog services are configured

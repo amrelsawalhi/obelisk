@@ -200,8 +200,15 @@ def test_the_login_reads_credentials_from_settings():
     from app.api.routes_auth import LoginRequest, login
 
     class _Response:
+        def __init__(self) -> None:
+            self.headers: dict = {}
+
         def set_cookie(self, *args, **kwargs):
             pass
+
+    class _Request:
+        client = None
+        headers: dict = {}
 
     previous_user = settings.OBELISK_ADMIN_USER
     previous_password = settings.OBELISK_ADMIN_PASSWORD
@@ -209,7 +216,11 @@ def test_the_login_reads_credentials_from_settings():
     settings.OBELISK_ADMIN_PASSWORD = "only-in-dotenv"
     try:
         result = asyncio.run(
-            login(LoginRequest(username="ops", password="only-in-dotenv"), _Response())
+            login(
+                LoginRequest(username="ops", password="only-in-dotenv"),
+                _Request(),
+                _Response(),
+            )
         )
         assert result.user.username == "ops"
     finally:

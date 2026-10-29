@@ -11,9 +11,15 @@ the canonical list; this page explains what each one does and how the installs d
 | `DATABASE_URL` | `sqlite+aiosqlite:///<checkout>/data/obelisk.db` | The control-plane database: pipelines, runs, catalog, connections, variables. |
 | `OBELISK_MASTER_KEY` | a published sample key | Fernet key for the credential vault. **Change it before storing real credentials**; changing it later makes existing secrets unreadable. |
 | `OBELISK_ADMIN_USER` / `OBELISK_ADMIN_PASSWORD` | `admin` / `obelisk2026` | Credentials used once authentication is enforced. |
-| `OBELISK_AUTH_ENABLED` | `0` | `1` gates every `/api` route and every WebSocket behind a session. Startup refuses to continue if the admin password is still the shipped default. |
+| `OBELISK_AUTH_ENABLED` | `0` (compose: `1`) | `1` gates every `/api` route and every WebSocket behind a session. Startup refuses to continue if the admin password is still the shipped default. With it off, a deployment whose `ENVIRONMENT=production` and `HOST` is not loopback refuses to start until that exposure is made explicit. |
+| `OBELISK_ALLOW_UNAUTHENTICATED` | unset | The explicit opt-in for the case above: `1` lets a production, non-loopback instance serve an open API and logs a warning on every start. |
+| `OBELISK_SESSION_SECURE_COOKIE` | `0` | `1` marks the session cookie `Secure`. Off for LAN HTTP installs; on for anything served over HTTPS. |
+| `OBELISK_SESSION_TTL_SECONDS` | `604800` | Session lifetime. A stolen cookie is valid until it expires. |
+| `OBELISK_AUTH_MAX_FAILED_ATTEMPTS` / `OBELISK_AUTH_LOCKOUT_SECONDS` | `10` / `300` | Login brute-force protection: after N failures from one address, that address is locked out for the given seconds. |
+| `OBELISK_TRUSTED_PROXIES` | empty | Comma-separated IPs/CIDRs of reverse proxies whose `X-Forwarded-For` may be believed (used by the unauthenticated terminal gate). |
 | `OBELISK_ALLOWED_ORIGINS` | empty | Extra browser origins allowed to open sockets and send the session cookie, comma separated. Same-host, loopback and Vite's dev server are always allowed. Set this when a reverse proxy rewrites `Host`. |
-| `OBELISK_TERMINAL` | `1` | `0` disables the in-app terminal (a real shell on the host) without touching code. |
+| `OBELISK_TERMINAL` | `1` (compose: `0`) | `0` disables the in-app terminal (a real shell on the host) without touching code. While auth is off, the socket only accepts a loopback client. |
+| `MARIMO_HOST` | `127.0.0.1` (compose: `0.0.0.0`) | Where the headless notebook server binds. In the container it binds all interfaces so the Caddy gateway can reach it; the gateway authenticates `/notebooks/*` via `forward_auth` first, and the port is never published on the host. Outside the container keep it loopback unless something in front authenticates first. |
 | `MARIMO_SESSION_TTL_SECONDS` | `600` | How long a notebook kernel stays alive after its browser tab disconnects (`0` = never expire). |
 | `OBELISK_NET` | `obelisk_net` | Docker network used for companion services. |
 
@@ -23,7 +29,7 @@ the canonical list; this page explains what each one does and how the installs d
 | :--- | :--- |
 | `8000` | FastAPI control plane. In a production install this also serves the built SPA. |
 | `5173` | Vite dev server (development only). |
-| `2718` | Headless Marimo notebook server. |
+| `2718` | Headless Marimo notebook server. Runs with `--no-token`, so it is never published; Caddy reaches it inside the network and gates `/notebooks/*` behind `forward_auth`. |
 | `80` | Caddy gateway, when you deploy with Docker Compose. |
 | `5434` / `27018` | Demo sources: Postgres and MongoDB from `docker-compose.sources.yml`. |
 

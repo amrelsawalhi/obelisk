@@ -158,6 +158,17 @@ def _arrow_batch(columns: Iterable[str], rows: Sequence[Sequence[Any]]) -> pa.Ta
 def _normalize_cell(value: Any) -> Any:
     if isinstance(value, (dict, list)):
         return json.dumps(value, default=str)
+    # Oracle hands back a LOB *locator*, not the value. Without reading it the Arrow
+    # fallback stringifies the object's repr and writes "<oracledb.LOB object ...>" into
+    # the lakehouse, which looks like data and is not.
+    if hasattr(value, "read") and (
+        type(value).__module__.split(".")[0] in ("oracledb", "cx_Oracle")
+        or type(value).__name__ in ("LOB", "CLOB", "BLOB")
+    ):
+        try:
+            return value.read()
+        except Exception:
+            return str(value)
     if hasattr(value, "to_decimal") and callable(value.to_decimal):
         try:
             return value.to_decimal()
@@ -176,6 +187,22 @@ def _cells(row: Sequence[Any]) -> tuple:
 def _bt(value: object) -> str:
     """A MySQL identifier: backticks, with any embedded backtick doubled."""
     return "`" + str(value).replace("`", "``") + "`"
+
+
+def _order_by(column: Optional[str], limit: Optional[int], quote) -> str:
+    """Ascending watermark order for a bounded read.
+
+    A ``LIMIT`` with no ``ORDER BY`` returns whatever the source offers first. On an
+    incremental load that is not a prefix of history: the rows that arrive set the
+    watermark, and the rows that did not are never asked for again.
+    """
+    try:
+        bounded = bool(limit) and int(limit) > 0
+    except (TypeError, ValueError):
+        bounded = False
+    if not column or not bounded:
+        return ""
+    return f" ORDER BY {quote(column)} ASC"
 
 
 class IngestCancelled(RuntimeError):
@@ -231,13 +258,21 @@ class IngestEngine:
 
     @staticmethod
     def _max_watermark(conn, target: str, column: str):
-        """The highest watermark already stored, asked of the table itself."""
+        """The highest watermark already stored, asked of the table itself.
+
+        A failure here raises. Returning ``None`` would read as "nothing has ever been
+        loaded", and an incremental append with no watermark reads the whole source
+        again — silently duplicating data in a run that reports success.
+        """
         try:
             rows = conn.execute(
                 f"SELECT max({quote_ident(column)}) FROM {target}"
             ).fetchall()
-        except Exception:
-            return None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not read watermark {column!r} from {target}: {exc}. Refusing to "
+                "run an incremental load that cannot tell what it already holds."
+            ) from exc
         if not rows or rows[0][0] is None:
             return None
         return rows[0][0]
@@ -495,23 +530,47 @@ class IngestEngine:
             try:
                 return pa.concat_tables(tables, promote_options="permissive")
             except Exception:
-                # Fallback if schemas have incompatible types across batches (e.g. Decimal vs string)
+                # Only the columns that actually disagree are widened to text. The old
+                # fallback cast *every* non-string column, so one drifting column turned
+                # amounts and timestamps into strings that were then stored that way.
                 all_names: list[str] = []
                 for t in tables:
                     for col_name in t.column_names:
                         if col_name not in all_names:
                             all_names.append(col_name)
+                seen_types: dict[str, set[str]] = {name: set() for name in all_names}
+                for t in tables:
+                    for name in all_names:
+                        if name in t.column_names:
+                            seen_types[name].add(str(t.schema.field(name).type))
+                widened = {name for name, seen in seen_types.items() if len(seen) > 1}
                 normalized: list[pa.Table] = []
                 for t in tables:
-                    cols = []
-                    for col_name in all_names:
-                        if col_name in t.column_names:
-                            col = t[col_name]
-                            if not pa.types.is_string(col.type) and not pa.types.is_large_string(col.type):
-                                col = col.cast(pa.large_string())
-                            cols.append(col)
-                        else:
-                            cols.append(pa.nulls(t.num_rows, type=pa.large_string()))
+                    cols: list[pa.Array] = []
+                    for name in all_names:
+                        if name in widened:
+                            if name not in t.column_names:
+                                cols.append(pa.nulls(t.num_rows, type=pa.large_string()))
+                                continue
+                            col = t[name]
+                            try:
+                                cols.append(col.cast(pa.large_string()))
+                            except Exception:
+                                cols.append(
+                                    pa.array(
+                                        [None if v is None else str(v) for v in col.to_pylist()],
+                                        type=pa.large_string(),
+                                    )
+                                )
+                            continue
+                        if name in t.column_names:
+                            cols.append(t[name])
+                            continue
+                        sample = next(
+                            (u.schema.field(name).type for u in tables if name in u.column_names),
+                            pa.string(),
+                        )
+                        cols.append(pa.nulls(t.num_rows, type=sample))
                     normalized.append(pa.Table.from_arrays(cols, names=all_names))
                 return pa.concat_tables(normalized, promote_options="permissive")
 
@@ -519,6 +578,10 @@ class IngestEngine:
             nonlocal pending, pending_rows, pending_bytes
             if not pending:
                 return
+            # Committing a chunk writes new Parquet, and a delta can fill the volume
+            # between the run's start and this point. Checking here turns a full disk
+            # into one clear failure instead of a half-written table.
+            advisor.assert_disk_headroom(settings.duckdb_storage_path)
             chunk = _concat_pending(pending)
             pending, pending_rows, pending_bytes = [], 0, 0
             conn.register("_obelisk_batch", chunk)
@@ -566,11 +629,15 @@ class IngestEngine:
         exists: bool,
         write_strategy: str,
     ) -> tuple[str, bool, Optional[str]]:
-        """Where streamed batches land: ``(sink, create, load_table)``."""
-        if mode == "snapshot" or not exists or write_strategy == "upsert":
-            load = f"{table}{LOAD_TABLE_SUFFIX}"
-            return self._target_sql(schema, load), True, load
-        return target, False, None
+        """Where streamed batches land: ``(sink, create, load_table)``.
+
+        Every batched driver stages into ``{table}__obelisk_load``, appends included.
+        Writing straight into the live target meant a killed run left part of a delta
+        behind, and because the next run reads ``max(watermark)`` from the target, the
+        rows that never arrived were skipped for good.
+        """
+        load = f"{table}{LOAD_TABLE_SUFFIX}"
+        return self._target_sql(schema, load), True, load
 
     def _prune_load_directory(self, schema: str, directory: str) -> None:
         """Removes the directory a load table leaves behind once it is dropped."""
@@ -590,6 +657,38 @@ class IngestEngine:
             except Exception as rollback_error:
                 logger.warning(
                     "Rolling back the swap of %s failed as well: %s", target, rollback_error
+                )
+            raise
+        self._prune_load_directory(schema, f"{table}{LOAD_TABLE_SUFFIX}")
+
+    def _append_from_load(
+        self,
+        conn,
+        *,
+        schema: str,
+        staged: str,
+        target: str,
+        table: str,
+        schema_policy: str = "evolve",
+    ) -> None:
+        """Adds a staged delta to the live table in one transaction.
+
+        The schema evolution, the insert and the drop of the stage table commit
+        together, so a failed append leaves the target exactly as it was and the next
+        run's watermark is still the last row that actually arrived.
+        """
+        try:
+            conn.execute("BEGIN TRANSACTION;")
+            self._evolve_target_schema(conn, target, staged, schema_policy=schema_policy)
+            conn.execute(f"INSERT INTO {target} BY NAME SELECT * FROM {staged}")
+            conn.execute(f"DROP TABLE IF EXISTS {staged};")
+            conn.execute("COMMIT;")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK;")
+            except Exception as rollback_error:
+                logger.warning(
+                    "Rolling back the append into %s failed as well: %s", target, rollback_error
                 )
             raise
         self._prune_load_directory(schema, f"{table}{LOAD_TABLE_SUFFIX}")
@@ -722,15 +821,34 @@ class IngestEngine:
 
     @staticmethod
     def _deduped(primary_key: str, watermark_column: Optional[str], relation: str) -> str:
-        """One row per key from ``relation``, newest first."""
-        order = f"{quote_ident(watermark_column)} DESC NULLS LAST" if watermark_column else "1"
+        """One row per key from ``relation``, newest first.
+
+        The ranking relation reads only the key, the watermark and DuckDB's hidden
+        ``rowid``, so the sort DuckDB spills is a few narrow columns instead of every
+        payload column. The full row is then fetched once per key, by ``rowid``.
+
+        ``rowid`` is also the tiebreaker. Without one, two rows with the same watermark
+        were resolved by scan order, so the same staged data could produce a different
+        winner on the next run.
+        """
+        key = quote_ident(primary_key)
+        order = (
+            f"{quote_ident(watermark_column)} DESC NULLS LAST, rowid DESC"
+            if watermark_column
+            else "rowid DESC"
+        )
         return f"""
-            SELECT * EXCLUDE (_obelisk_rank) FROM (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY {quote_ident(primary_key)} ORDER BY {order}
-                ) AS _obelisk_rank
+            WITH _obelisk_ranked AS (
+                SELECT rowid AS _obelisk_rowid,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY {key} ORDER BY {order}
+                       ) AS _obelisk_rank
                 FROM {relation}
-            ) WHERE _obelisk_rank = 1
+            )
+            SELECT * FROM {relation}
+            WHERE rowid IN (
+                SELECT _obelisk_rowid FROM _obelisk_ranked WHERE _obelisk_rank = 1
+            )
         """
 
     # -- entry point -------------------------------------------------------
@@ -761,15 +879,8 @@ class IngestEngine:
         if primary_key:
             primary_key = validate_column(primary_key, what="primary key")
         self._require_primary_key(write_strategy, primary_key)
-        est_bytes = (
-            self._estimate_source_bytes(source_type, connection_params, entity)
-            if mode == "snapshot" and not limit
-            else 0
-        )
-        required_headroom = max(512 * 1024 * 1024, int(est_bytes * 0.40))
-        advisor.assert_disk_headroom(settings.duckdb_storage_path, min_free_bytes=required_headroom)
 
-        with table_ingest_lock(schema, table_stem):
+        with table_ingest_lock(schema, table_stem), duckdb_engine.heavy_slot():
             conn = duckdb_engine.get_connection()
             if on_connection is not None:
                 on_connection(conn)
@@ -779,6 +890,20 @@ class IngestEngine:
                 self._raise_if_cancelled(should_cancel)
                 conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema)};")
                 exists = self._exists(conn, schema, table_stem)
+
+                # Headroom for the copy this run is about to make. A run with a row limit
+                # reads a bounded slice and keeps only the floor; a snapshot, or the first
+                # load of a whole table, is sized from the source's own byte count. Doing
+                # this after ``exists`` means a first incremental load is covered too —
+                # it is a whole-table read, however it is labelled.
+                if not limit and (mode == "snapshot" or not exists):
+                    est_bytes = self._estimate_source_bytes(
+                        source_type, connection_params, entity
+                    )
+                    required_headroom = max(512 * 1024 * 1024, int(est_bytes * 0.40))
+                    advisor.assert_disk_headroom(
+                        settings.duckdb_storage_path, min_free_bytes=required_headroom
+                    )
 
                 watermark_value = None
                 if mode == "incremental" and watermark_column and exists:
@@ -842,11 +967,28 @@ class IngestEngine:
                                 schema_policy=schema_policy,
                             ):
                                 load_table = None
+                        elif mode == "incremental" and exists:
+                            self._append_from_load(
+                                conn,
+                                schema=schema,
+                                staged=sink,
+                                target=target,
+                                table=table_stem,
+                                schema_policy=schema_policy,
+                            )
+                            load_table = None
                         else:
                             self._swap_into_place(
                                 conn, schema=schema, staged=sink, target=target, table=table_stem
                             )
                             load_table = None
+
+                # The load is applied, so maintenance may compact again. Leaving the
+                # registration in place until the ``finally`` made the auto-compaction
+                # check dead code for every snapshot and upsert.
+                if registered_load is not None:
+                    unregister_active_load_table(schema, registered_load)
+                    registered_load = None
 
                 if extracted == 0:
                     if mode == "snapshot" and exists:
@@ -939,6 +1081,7 @@ class IngestEngine:
         mode: str,
         exists: bool,
         where: str = "",
+        order_clause: str = "",
         limit_clause: str = "",
         on_batch: Optional[Callable[[int], None]] = None,
         **kwargs,
@@ -971,7 +1114,7 @@ class IngestEngine:
                 return 0
             c.execute(
                 f"CREATE OR REPLACE TABLE {target} AS "
-                f"SELECT {projection} FROM {source_ref} {where}{limit_clause};"
+                f"SELECT {projection} FROM {source_ref} {where}{order_clause}{limit_clause};"
             )
             written = self._row_count(c, target)
         else:
@@ -979,7 +1122,8 @@ class IngestEngine:
             self._evolve_target_schema(c, target, source_ref, schema_policy=schema_policy)
             before = self._row_count(c, target)
             c.execute(
-                f"INSERT INTO {target} BY NAME SELECT {projection} FROM {source_ref} {where}{limit_clause};"
+                f"INSERT INTO {target} BY NAME SELECT {projection} FROM {source_ref} "
+                f"{where}{order_clause}{limit_clause};"
             )
             written = max(0, self._row_count(c, target) - before)
         if on_batch is not None:
@@ -1005,6 +1149,7 @@ class IngestEngine:
                 mode=mode,
                 exists=exists,
                 where=where,
+                order_clause=_order_by(watermark_column, limit, sql_ident),
                 limit_clause=limit_clause,
                 on_batch=on_batch,
                 schema_policy=kwargs.get("schema_policy", "evolve"),
@@ -1030,6 +1175,7 @@ class IngestEngine:
                 mode="snapshot",
                 exists=False,
                 where=where,
+                order_clause=_order_by(watermark_column, limit, sql_ident),
                 limit_clause=limit_clause,
                 on_batch=on_batch,
             )
@@ -1077,6 +1223,7 @@ class IngestEngine:
                     mode="snapshot" if create else "incremental",
                     exists=not create,
                     where=where,
+                    order_clause=_order_by(watermark_column, limit, sql_ident),
                     limit_clause=limit_clause,
                     on_batch=on_batch,
                     schema_policy=schema_policy,
@@ -1097,6 +1244,11 @@ class IngestEngine:
             database=connection_params["database"],
             cursorclass=pymysql.cursors.SSCursor,
             charset="utf8mb4",
+            # A streaming cursor can sit between two batches for a long time on a wide
+            # table; the driver's default read timeout would drop that connection and
+            # turn a working load into a failed one.
+            read_timeout=3600,
+            write_timeout=3600,
         )
         try:
             if "." in entity:
@@ -1115,7 +1267,10 @@ class IngestEngine:
                         (watermark_value,),
                     )
                 else:
-                    cur.execute(f"SELECT * FROM {table_ref}{limit_clause}")
+                    cur.execute(
+                        f"SELECT * FROM {table_ref}"
+                        f"{_order_by(watermark_column, limit, _bt)}{limit_clause}"
+                    )
                 columns = [desc[0] for desc in cur.description] if cur.description else []
 
                 def batches() -> Iterator[pa.Table]:
@@ -1175,7 +1330,10 @@ class IngestEngine:
 
             cursor = collection.find(query_filter).batch_size(BATCH_ROWS)
             if mode == "incremental" and watermark_column:
-                cursor = cursor.sort(watermark_column, 1)
+                # A sort with no usable index overflows Mongo's in-memory limit (100 MB)
+                # and aborts the load; letting it spill to disk is what keeps a large
+                # unindexed watermark scan working.
+                cursor = cursor.sort(watermark_column, 1).allow_disk_use(True)
             if limit and limit > 0:
                 cursor = cursor.limit(int(limit))
 
@@ -1230,7 +1388,10 @@ class IngestEngine:
                     [watermark_value],
                 )
             else:
-                cur.execute(f"SELECT * FROM {table_ref}{limit_clause}")
+                cur.execute(
+                    f"SELECT * FROM {table_ref}"
+                    f"{_order_by(watermark_column, limit, sql_ident)}{limit_clause}"
+                )
 
             columns = [desc[0].lower() for desc in cur.description] if cur.description else []
 
@@ -1320,6 +1481,7 @@ class IngestEngine:
                         mode="snapshot" if create else "incremental",
                         exists=not create,
                         where=where,
+                        order_clause=_order_by(watermark_column, limit, sql_ident),
                         limit_clause=limit_clause,
                         on_batch=on_batch,
                         schema_policy=schema_policy,

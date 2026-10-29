@@ -46,7 +46,22 @@ class DuckDBEngine:
     from contextlib import contextmanager
 
     @contextmanager
-    def _acquire_heavy_slot(self):
+    def heavy_slot(self):
+        """The shared heavy-work budget, for callers outside this class.
+
+        Every connection that can hold a large amount of memory - an ingest, an SDK
+        export, a dbt subprocess - takes one of these. The per-connection limit is
+        derived from the same slot count, so ``slots x memory_limit`` is the whole
+        budget rather than a limit that only queries happen to respect.
+        """
+        self.begin_heavy()
+        try:
+            yield
+        finally:
+            self.end_heavy()
+
+    def begin_heavy(self) -> None:
+        """Takes a heavy slot and counts it as active (for callers that cannot ``with``)."""
         with self._telemetry_lock:
             self._waiting_heavy_queries += 1
         self._heavy_semaphore.acquire()
@@ -54,12 +69,17 @@ class DuckDBEngine:
             self._waiting_heavy_queries = max(0, self._waiting_heavy_queries - 1)
             self._active_heavy_queries += 1
             self._total_queries_executed += 1
-        try:
+
+    def end_heavy(self) -> None:
+        """Releases a slot taken by :meth:`begin_heavy`."""
+        with self._telemetry_lock:
+            self._active_heavy_queries = max(0, self._active_heavy_queries - 1)
+        self._heavy_semaphore.release()
+
+    @contextmanager
+    def _acquire_heavy_slot(self):
+        with self.heavy_slot():
             yield
-        finally:
-            with self._telemetry_lock:
-                self._active_heavy_queries = max(0, self._active_heavy_queries - 1)
-            self._heavy_semaphore.release()
 
     def get_telemetry(self) -> Dict[str, Any]:
         """Live DuckDB engine concurrency, spill directory usage, and lakehouse headroom."""
@@ -97,7 +117,7 @@ class DuckDBEngine:
             "temp_spill_bytes": temp_bytes,
             "temp_spill_mb": round(temp_bytes / (1024 * 1024), 2),
             "temp_spill_limit": advisor.get_duckdb_temp_limit(
-                temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT
+                temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots
             ),
             "lakehouse_free_gb": disk.get("free_gb", 0.0),
             "lakehouse_percent_used": disk.get("percent_used", 0.0),
@@ -133,7 +153,7 @@ class DuckDBEngine:
             f"SET memory_limit = '{advisor.get_duckdb_memory_limit(slots)}';",
             f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
             "SET max_temp_directory_size = '"
-            f"{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT)}';",
+            f"{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots)}';",
             f"SET threads = {threads};",
             "SET preserve_insertion_order = false;",
             f"SET storage_directory = '{self._ensure_storage()}';",

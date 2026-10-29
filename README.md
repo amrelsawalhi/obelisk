@@ -115,6 +115,7 @@ memory, at execution time: `obelisk.var("OPENAI_API_KEY")`.
 ```bash
 cd backend
 python -m pytest tests -q                        # the backend suite, no external services needed
+# From the repo root the config must be named: python -m pytest -c backend/pyproject.toml
 python scripts/verify_pipelines.py               # every step type, every edge condition
 python scripts/e2e/verify_e2e.py --scale small   # full journey, live Postgres + Mongo
 ```

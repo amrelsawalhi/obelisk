@@ -11,7 +11,6 @@ import {
   BookOpen,
   Terminal,
   Plus,
-  Activity,
   Files,
   Archive,
   CheckCircle2,
@@ -23,6 +22,7 @@ import {
   X,
   RefreshCw,
   Server,
+  GitFork,
 } from 'lucide-react';
 import { useTelemetry } from '../../lib/useTelemetry';
 import { usePolling } from '../../lib/viewActivity';
@@ -304,14 +304,14 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         {/* Pipelines */}
         <div
           onClick={() => onNavigate('pipelines')}
-          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-indigo-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
+          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-sky-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
               Pipelines
             </span>
-            <span className="p-1.5 rounded-lg bg-indigo-50 text-indigo-600 border border-indigo-100/80 group-hover:scale-105 transition-transform">
-              <Clock className="w-3.5 h-3.5" />
+            <span className="p-1.5 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80 group-hover:scale-105 transition-transform">
+              <GitFork className="w-3.5 h-3.5" />
             </span>
           </div>
           <div className="text-2xl font-extrabold font-mono text-slate-900 mt-1">
@@ -334,13 +334,13 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         {/* dbt Models */}
         <div
           onClick={() => onNavigate('dbt')}
-          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-purple-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
+          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-sky-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
               dbt Models
             </span>
-            <span className="p-1.5 rounded-lg bg-purple-50 text-purple-600 border border-purple-100/80 group-hover:scale-105 transition-transform">
+            <span className="p-1.5 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80 group-hover:scale-105 transition-transform">
               <Layers className="w-3.5 h-3.5" />
             </span>
           </div>
@@ -357,13 +357,13 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         {/* Notebooks */}
         <div
           onClick={() => onNavigate('notebooks')}
-          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-amber-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
+          className="px-4 py-3 rounded-xl border border-slate-200/90 bg-white hover:border-sky-300 hover:shadow-md transition-all cursor-pointer group shadow-xs flex flex-col justify-between"
         >
           <div className="flex items-center justify-between">
             <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
               Notebooks
             </span>
-            <span className="p-1.5 rounded-lg bg-amber-50 text-amber-600 border border-amber-100/80 group-hover:scale-105 transition-transform">
+            <span className="p-1.5 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80 group-hover:scale-105 transition-transform">
               <BookOpen className="w-3.5 h-3.5" />
             </span>
           </div>
@@ -388,8 +388,8 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
         {/* Card Header */}
         <div className="p-4 border-b border-slate-100 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">
-            <span className="p-2 rounded-lg bg-indigo-50 text-indigo-600 border border-indigo-100/80">
-              <Activity className="w-4 h-4" />
+            <span className="p-2 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80">
+              <GitFork className="w-4 h-4" />
             </span>
             <div>
               <div className="flex items-center gap-2">
@@ -408,7 +408,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
 
           <button
             onClick={() => onNavigate('pipelines')}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-xs font-semibold transition-all shadow-2xs"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 hover:bg-sky-700 active:bg-sky-800 text-white rounded-lg text-xs font-semibold transition-all shadow-2xs"
           >
             <Plus className="w-3.5 h-3.5" />
             <span>Create Pipeline</span>
@@ -501,15 +501,20 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
       {/* 3. Two-Column Layout: Managed Services (2/3) + Stacked Engine & Storage Cards (1/3) */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Managed Services Grid (Left Column 2/3) */}
-        <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex flex-col justify-between h-full space-y-4">
+        <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex flex-col space-y-4">
           <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-            <div>
-              <h3 className="text-sm font-bold text-slate-900 tracking-tight">
-                Managed Services & Data Engines
-              </h3>
-              <p className="text-xs text-slate-500">
-                {runningServicesCount} of {serviceCatalog.length} services currently active
-              </p>
+            <div className="flex items-center gap-2.5">
+              <span className="p-2 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80">
+                <Server className="w-4 h-4" />
+              </span>
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 tracking-tight">
+                  Managed Services & Data Engines
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {runningServicesCount} of {serviceCatalog.length} services currently active
+                </p>
+              </div>
             </div>
             <button
               onClick={() => onNavigate('services')}
@@ -610,11 +615,15 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
           {/* Card 1: Compute & System Resources */}
           <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex-1 flex flex-col justify-between space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div className="flex items-center gap-2">
-                <Activity className="w-4 h-4 text-sky-600" />
-                <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                  Compute & Resources
-                </h3>
+              <div className="flex items-center gap-2.5">
+                <span className="p-2 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80">
+                  <Cpu className="w-4 h-4" />
+                </span>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 tracking-tight">
+                    Compute & Resources
+                  </h3>
+                </div>
               </div>
               <span className="text-[11px] font-medium text-emerald-700 bg-emerald-50 border border-emerald-200/80 px-2 py-0.5 rounded-full flex items-center gap-1.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -652,13 +661,19 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                 <div>
                   <div className="flex justify-between text-xs mb-1.5">
                     <span className="text-slate-600 font-medium flex items-center gap-1">
-                      <Cpu className="w-3.5 h-3.5 text-amber-600" /> Host CPU ({telemetry.cpu_count} Cores)
+                      <Cpu className="w-3.5 h-3.5 text-sky-600" /> Host CPU ({telemetry.cpu_count} Cores)
                     </span>
                     <span className="font-mono font-bold text-slate-900">{telemetry.cpu_percent}%</span>
                   </div>
                   <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
                     <div
-                      className="h-full rounded-full bg-amber-500 transition-all duration-500"
+                      className={`h-full rounded-full transition-all duration-500 ${
+                        telemetry.cpu_percent > 85
+                          ? 'bg-red-500'
+                          : telemetry.cpu_percent > 65
+                            ? 'bg-amber-500'
+                            : 'bg-sky-600'
+                      }`}
                       style={{ width: `${Math.min(telemetry.cpu_percent, 100)}%` }}
                     />
                   </div>
@@ -682,11 +697,15 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
           {/* Card 2: Lakehouse Storage & Engine Health */}
           <div className="bg-white rounded-xl border border-slate-200/90 p-5 shadow-xs flex-1 flex flex-col justify-between space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div className="flex items-center gap-2">
-                <Database className="w-4 h-4 text-emerald-600" />
-                <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                  Lakehouse Storage
-                </h3>
+              <div className="flex items-center gap-2.5">
+                <span className="p-2 rounded-lg bg-sky-50 text-sky-600 border border-sky-100/80">
+                  <Database className="w-4 h-4" />
+                </span>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 tracking-tight">
+                    Lakehouse Storage
+                  </h3>
+                </div>
               </div>
               <span className="text-[10px] font-mono text-slate-600 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-md font-semibold">
                 Parquet Native
@@ -697,7 +716,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
               {/* Storage Footprint */}
               <div className="p-3 rounded-lg bg-slate-50/70 border border-slate-200/70">
                 <div className="flex items-center gap-1.5 text-[11px] text-slate-500 font-medium mb-1">
-                  <Archive className="w-3.5 h-3.5 text-emerald-600" />
+                  <Archive className="w-3.5 h-3.5 text-sky-600" />
                   <span>Data Size</span>
                 </div>
                 <div className="text-base font-bold font-mono text-slate-900">

@@ -17,6 +17,7 @@ which table at which version.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
 import logging
 import os
 from pathlib import Path
@@ -127,17 +128,86 @@ _TABLE_INGEST_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 
 CATALOG_BUSY_TIMEOUT_MS = 15_000
 
+ACTIVE_LOAD_DIR = ".obelisk/active_loads"
+
+
+def _active_load_lock_path(schema: str, table: str) -> Path:
+    """Where one load table's cross-process lock lives."""
+    from app.config import settings
+
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{schema}__{table}")
+    return Path(settings.lakehouse_root_path) / ACTIVE_LOAD_DIR / f"{safe}.lock"
+
+
+def _write_active_load_lock(schema: str, table: str) -> None:
+    """Records this process as the owner of a live load table.
+
+    The in-memory registry only protects loads inside this interpreter. The maintenance
+    CLI runs in another one, so it saw an empty set and dropped tables a running ingest
+    was still writing into.
+    """
+    path = _active_load_lock_path(schema, table)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "schema": schema,
+                "table": table,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        scratch = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        scratch.write_text(payload, encoding="utf-8")
+        os.replace(scratch, path)
+    except Exception as exc:
+        logger.debug("Could not write the active load lock for %s.%s: %s", schema, table, exc)
+
+
+def _remove_active_load_lock(schema: str, table: str) -> None:
+    try:
+        _active_load_lock_path(schema, table).unlink(missing_ok=True)
+    except Exception as exc:
+        logger.debug("Could not remove the active load lock for %s.%s: %s", schema, table, exc)
+
+
+def _lock_owner_is_alive(schema: str, table: str) -> bool:
+    """Whether another live *process* still owns this load table."""
+    path = _active_load_lock_path(schema, table)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except Exception:
+        # An unreadable lock counts as held: dropping a live load costs the data,
+        # while leaving an orphan costs one more sweep.
+        return True
+    try:
+        pid = int(payload.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        import psutil
+
+        return psutil.pid_exists(pid)
+    except Exception:
+        return True
+
 
 def register_active_load_table(schema: str, table: str) -> None:
     """Marks ``(schema, table)`` as an active in-flight load table protected from maintenance."""
     with _LOAD_REGISTRY_LOCK:
         _ACTIVE_LOAD_TABLES.add((str(schema), str(table)))
+    _write_active_load_lock(str(schema), str(table))
 
 
 def unregister_active_load_table(schema: str, table: str) -> None:
     """Releases active protection on ``(schema, table)`` once ingestion finishes."""
     with _LOAD_REGISTRY_LOCK:
         _ACTIVE_LOAD_TABLES.discard((str(schema), str(table)))
+    _remove_active_load_lock(str(schema), str(table))
 
 _COMMIT_COUNTER_LOCK = threading.Lock()
 _COMMIT_COUNTER = 0
@@ -278,7 +348,7 @@ def lakehouse_connection():
         for stmt in (
             f"SET memory_limit = '{advisor.get_duckdb_memory_limit(slots)}';",
             f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
-            f"SET max_temp_directory_size = '{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT)}';",
+            f"SET max_temp_directory_size = '{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots)}';",
             f"SET threads = {threads};",
             "SET preserve_insertion_order = false;",
         ):
@@ -336,7 +406,9 @@ def load_tables(conn) -> list[tuple[str, str]]:
     return [
         (str(schema), str(table))
         for schema, table, *_rest in _live_table_rows(conn)
-        if str(table).endswith(LOAD_TABLE_SUFFIX) and (str(schema), str(table)) not in active
+        if str(table).endswith(LOAD_TABLE_SUFFIX)
+        and (str(schema), str(table)) not in active
+        and not _lock_owner_is_alive(str(schema), str(table))
     ]
 
 

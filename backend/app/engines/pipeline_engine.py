@@ -1761,10 +1761,27 @@ class PipelineEngine:
             return await self._materialize_sql(sql, materialize, log, timeout)
 
         attachments = await self._live_attachments(sql)
-        result = await asyncio.wait_for(
-            asyncio.to_thread(duckdb_engine.execute_query, sql, attachments),
-            timeout=timeout,
-        )
+        live: List[Any] = []
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: duckdb_engine.execute_query(
+                        sql, attachments, on_connection=live.append
+                    )
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            # wait_for gives up on the future, not on DuckDB: the C++ query keeps
+            # running in its thread and a retry starts a second copy of the same work.
+            # Interrupting the live connection is what actually ends it.
+            for live_conn in live:
+                try:
+                    live_conn.interrupt()
+                except Exception:
+                    pass
+            raise
+
         rows = (result or {}).get("row_count", 0)
         columns = (result or {}).get("columns", [])
         log.append(f"Query OK: {rows} row(s), columns={columns}")
@@ -1810,11 +1827,25 @@ class PipelineEngine:
             raise ValueError(f"Invalid materialize target: {exc}") from exc
         rel_path = path_for(folder, name)
 
+        live: List[Any] = []
+
         def _write() -> Dict[str, Any]:
-            saved = sdk.materialize_sql(sql, rel_path)
+            saved = sdk.materialize_sql(sql, rel_path, on_connection=live.append)
             return {"rows": int(saved["num_rows"]), "saved": saved}
 
-        outcome = await asyncio.wait_for(asyncio.to_thread(_write), timeout=timeout)
+        try:
+            outcome = await asyncio.wait_for(asyncio.to_thread(_write), timeout=timeout)
+        except asyncio.TimeoutError:
+            # wait_for gives up on the future, not on DuckDB: the C++ query keeps
+            # running in its thread and a retry starts a second copy of the same work.
+            # Interrupting the live connection is what actually ends it.
+            for live_conn in live:
+                try:
+                    live_conn.interrupt()
+                except Exception:
+                    pass
+            raise
+
         # The published value is the name a later step can query, so binding a table
         # needs no knowledge of how the materialiser spelled it.
         table_name = outcome["saved"]["sql_name"]

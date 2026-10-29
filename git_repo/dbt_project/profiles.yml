@@ -10,12 +10,21 @@ obelisk:
       path: "{{ env_var('DBT_DUCKDB_PATH', 'dbt.duckdb') }}"
       schema: main
       threads: 2
+      settings:
+        memory_limit: "{{ env_var('DBT_DUCKDB_MEMORY_LIMIT', '4GB') }}"
+        max_temp_directory_size: "{{ env_var('DBT_DUCKDB_MAX_TEMP_SIZE', '25GB') }}"
+        preserve_insertion_order: false
       extensions:
         - ducklake
       attach:
         - path: "ducklake:sqlite:{{ env_var('DBT_LAKEHOUSE_CATALOG') }}"
           alias: lakehouse
           is_ducklake: true
+          # DuckLake refuses to create a catalog without a data path, so `dbt compile`
+          # on a fresh install failed before any ingestion had created one. The runner
+          # exports the same path the app writes Parquet to.
+          options:
+            data_path: "{{ env_var('DBT_LAKEHOUSE_DATA_PATH', 'data/lakehouse') }}"
     dev:
       type: postgres
       host: "{{ env_var('DBT_PG_HOST', 'localhost') }}"

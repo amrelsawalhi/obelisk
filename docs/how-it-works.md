@@ -147,16 +147,24 @@ and stopped by the application lifespan.
 
 ## Security posture
 
-- **No authentication is enforced yet.** The seam is wired (`require_principal`,
-  `authorize_websocket`) but `OBELISK_AUTH_ENABLED` defaults to off, so treat the API as
-  trusted-network only. Enabling it also refuses to start while the admin password is still
-  the shipped default.
+- **Authentication is supported end to end.** The UI has a login screen (`/login`), the API
+  issues an HttpOnly session cookie, and `require_principal`/`authorize_websocket` enforce it
+  once `OBELISK_AUTH_ENABLED=1` (the Compose default). It defaults to off in a source
+  checkout, where the API must be treated as trusted-network only. Enabling it refuses to
+  start while the admin password is still the shipped default.
+- **An open API cannot reach the network by accident.** With auth off, startup refuses a
+  production deployment whose `HOST` is not loopback unless
+  `OBELISK_ALLOW_UNAUTHENTICATED=1` says so explicitly.
+- **The gateway authenticates the side doors.** Caddy runs `forward_auth` against
+  `/api/auth/verify` before proxying `/notebooks/*` and `/gitea/*`, so the unauthenticated
+  Marimo editor and the git host sit behind the same session as the API.
 - **WebSocket origins are checked even while auth is off**, which is what stops a page on
   another site from driving this backend through the operator's browser.
 - **The terminal is a real host shell.** It is origin-gated, capped at four sessions, idle-timed
-  at 15 minutes and audited; `OBELISK_TERMINAL=0` removes it entirely.
-- **CORS** is a wildcard while auth is off, and an explicit origin set once it is on -- a
-  wildcard cannot carry a session cookie.
+  at 15 minutes and audited; `OBELISK_TERMINAL=0` removes it entirely. While auth is off, it
+  only accepts a loopback client, and the Compose file defaults it to off.
+- **CORS** is an explicit origin set in both modes (never a wildcard), because a wildcard
+  cannot carry a session cookie anyway.
 
 ## Known limits
 

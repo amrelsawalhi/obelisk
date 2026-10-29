@@ -7,7 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.config import settings
-from app.core.security import authorize_websocket
+from app.core.security import auth_enabled, authorize_websocket, unauthenticated_terminal_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +275,29 @@ async def terminal_websocket(websocket: WebSocket):
 
     if not settings.TERMINAL_ENABLED:
         await websocket.close(code=1008, reason="The terminal is disabled on this deployment.")
+        return
+
+    # A shell with no login is only acceptable from the machine itself. Origin checking
+    # alone is not enough: a non-browser client (curl, the SDK, a script) sends no
+    # ``Origin`` at all, so before this gate any client that could reach the port got a
+    # shell as the backend's OS user. Behind a reverse proxy the peer address lies, so
+    # forwarded headers are only believed from configured trusted proxies, and the
+    # client they forward for must still be loopback.
+    peer = websocket.client.host if websocket.client else None
+    if not auth_enabled() and not unauthenticated_terminal_allowed(peer, websocket.headers):
+        logger.warning(
+            "Refused terminal from %s (X-Forwarded-For=%r): AUTH_ENABLED is off and the "
+            "client is not a local, unproxied caller.",
+            peer,
+            websocket.headers.get("x-forwarded-for"),
+        )
+        await websocket.close(
+            code=1008,
+            reason=(
+                "The terminal is only available from this machine while authentication "
+                "is disabled. Enable authentication to use it remotely."
+            ),
+        )
         return
 
     principal = await authorize_websocket(websocket, "terminal")

@@ -177,8 +177,13 @@ def test_chunks_are_committed_together_not_once_per_batch(lake) -> None:
     assert _snapshots(conn) - before == 4
 
 
-def test_the_sink_follows_the_mode_and_the_write_strategy(lake) -> None:
-    """An upsert and a snapshot load beside their target; an append goes straight in."""
+def test_the_sink_is_always_beside_the_target(lake) -> None:
+    """Every batched strategy stages in ``*__obelisk_load`` first.
+
+    An incremental append used to write straight into the live table, so a run killed
+    half way left part of the delta behind; the next run read its watermark from those
+    rows and skipped the rest of the source for good.
+    """
     engine, _conn, schema = lake
     target = engine._target_sql(schema, "orders")
     load = engine._target_sql(schema, f"orders{LOAD_TABLE_SUFFIX}")
@@ -206,7 +211,7 @@ def test_the_sink_follows_the_mode_and_the_write_strategy(lake) -> None:
     assert engine._batch_sink(
         schema=schema, table="orders", target=target,
         mode="incremental", exists=True, write_strategy="append",
-    ) == (target, False, None)
+    ) == (load, True, f"orders{LOAD_TABLE_SUFFIX}")
 
 
 # ---------------------------------------------------------------------------

@@ -180,8 +180,9 @@ async def _register_service_connection(
     record = (
         await db.execute(select(Connection).where(Connection.service_name == bp.name))
     ).scalar_one_or_none()
+    conn_name = getattr(bp, "default_connection_name", None) or f"obelisk_{bp.name}"
     values = {
-        "name": f"{bp.display_name} (local)",
+        "name": conn_name,
         "source_type": bp.provides,
         "host": "localhost",
         "port": host_port,

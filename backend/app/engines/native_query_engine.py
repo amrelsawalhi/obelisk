@@ -16,6 +16,54 @@ _READ_ONLY_SQL_RE = re.compile(
 )
 
 
+def _has_multiple_statements(sql: str) -> bool:
+    """Whether ``sql`` holds more than one statement.
+
+    A plain ``";" in sql`` test answers yes for ``WHERE note LIKE '%;%'``, which sent
+    that query down the client-side path and buffered its whole result in libpq's heap.
+    Semicolons inside string literals, dollar-quoted bodies and comments are not
+    statement separators, so they are skipped here.
+    """
+    text = sql or ""
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "-" and text.startswith("--", index):
+            newline = text.find("\n", index)
+            index = length if newline == -1 else newline + 1
+            continue
+        if char == "/" and text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = length if end == -1 else end + 2
+            continue
+        if char == "$":
+            closing = text.find("$", index + 1)
+            if closing != -1:
+                body = text[index + 1 : closing]
+                if body == "" or body.replace("_", "").isalnum():
+                    tag = text[index : closing + 1]
+                    end = text.find(tag, closing + 1)
+                    index = length if end == -1 else end + len(tag)
+                    continue
+        if char in ("'", '"'):
+            quote = char
+            index += 1
+            while index < length:
+                if text[index] == quote:
+                    if index + 1 < length and text[index + 1] == quote:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            continue
+        if char == ";":
+            return bool(text[index + 1 :].strip())
+        index += 1
+    return False
+
+
 def _json_serializable(val: Any) -> Any:
     if val is None:
         return None
@@ -69,12 +117,11 @@ class NativeQueryEngine:
         # Use a server-side named cursor when max_rows > 0 and the query is a single read-only
         # SELECT/WITH/VALUES statement so libpq streams only max_rows + 1 tuples rather than
         # buffering the entire table in client C heap inside cur.execute().
-        stripped_body = clean_sql.rstrip(";").strip()
         use_server_cursor = bool(
             max_rows
             and max_rows > 0
             and _READ_ONLY_SQL_RE.match(clean_sql)
-            and ";" not in stripped_body
+            and not _has_multiple_statements(clean_sql)
         )
 
         conn = psycopg2.connect(

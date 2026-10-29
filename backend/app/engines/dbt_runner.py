@@ -48,6 +48,10 @@ DBT_SCRATCH_DB = "dbt_scratch.duckdb"
 # Prefix of the per-invocation target directory. Every dbt process gets its own.
 DBT_RUN_TARGET_PREFIX = "dbt_run_"
 
+# The table in a Postgres warehouse schema that records what was last copied there, so
+# an unchanged lakehouse table is not copied again on every build.
+SYNC_STATE_TABLE = "_obelisk_sync_state"
+
 # dbt subcommands that accept ``--target-path``. ``deps``, ``debug``, ``clean`` and
 # ``version`` do not, and dbt exits with "No such option" when the flag is passed, so the
 # isolation flag is only added where dbt understands it.
@@ -359,12 +363,18 @@ class DbtRunner:
         postgres_params: Dict[str, Any],
         table_names: Optional[List[str]] = None,
         folder: Optional[str] = None,
+        force: bool = False,
     ) -> Dict[str, Any]:
         """Copies one folder's Parquet files into the matching warehouse schema.
 
         The folder is the schema — ``marts/sales`` → ``marts__sales``, flattened
         because Postgres schemas cannot nest — and the files come from that same
         folder, so the path is the only thing that decides where data lives.
+
+        Each schema records what it last received in ``_obelisk_sync_state``. A table
+        whose (row count, byte size) in the lakehouse has not changed since the last
+        copy is skipped, so a build no longer rewrites hundreds of gigabytes of
+        unchanged data over TCP. ``force=True`` copies every table regardless.
         """
         target_folder = (folder or self._dbt_folders()["staging"]).strip().strip("/")
         store = warehouse_storage()
@@ -406,9 +416,13 @@ class DbtRunner:
 
         schema = sql_ident(schema_name)
 
+        from app.core.catalog import lakehouse_tables
         from app.engines.duckdb_engine import duckdb_engine
+
         conn = duckdb_engine.get_connection()
+        duckdb_engine.begin_heavy()
         synced_info = []
+        skipped_tables = 0
 
         try:
             conn.execute("LOAD postgres;")
@@ -427,32 +441,105 @@ class DbtRunner:
             # The folder's own schema, created on first use. `schema` is already quoted.
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {alias}.{schema};")
 
-            for table in target_tables:
-                table_name = table.name
-                query = f"""
-                    CREATE OR REPLACE TABLE {alias}.{schema}.{sql_ident(table_name)} AS
-                    SELECT * FROM {table.sql_name};
-                """
-                conn.execute(query)
+            # What the lakehouse says each table is, from DuckLake's own statistics. An
+            # unchanged (rows, bytes) pair means the same data is already in Postgres,
+            # so copying hundreds of gigabytes over TCP — and counting it afterwards —
+            # would be work with nothing to show for it.
+            facts = {
+                str(row["table"]): (int(row["num_rows"]), int(row["size_bytes"]))
+                for row in lakehouse_tables(conn)
+                if str(row["schema"]) == schema_key
+            }
 
-                # Get row count
+            state_address = f"{alias}.{schema}.{sql_ident(SYNC_STATE_TABLE)}"
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {state_address} ("
+                "table_name VARCHAR, num_rows BIGINT, size_bytes BIGINT, synced_at VARCHAR)"
+            )
+            state: Dict[str, tuple[int, int]] = {}
+            try:
+                for row in conn.execute(
+                    f"SELECT table_name, num_rows, size_bytes FROM {state_address}"
+                ).fetchall():
+                    state[str(row[0])] = (int(row[1] or 0), int(row[2] or 0))
+            except Exception as exc:
+                # A state table this build cannot read is no reason to skip the sync;
+                # every table simply looks changed.
+                logger.debug("Could not read the Postgres sync state: %s", exc)
+
+            to_sync, unchanged = self._sync_plan(
+                {table.name: facts.get(table.name) for table in target_tables},
+                state,
+                force=force,
+            )
+            skipped_tables = len(unchanged)
+            by_name = {table.name: table for table in target_tables}
+
+            for table_name in to_sync:
+                table = by_name[table_name]
+                conn.execute(
+                    f"CREATE OR REPLACE TABLE {alias}.{schema}.{sql_ident(table_name)} AS "
+                    f"SELECT * FROM {table.sql_name};"
+                )
+
                 cnt_row = conn.execute(
                     f"SELECT COUNT(*) FROM {alias}.{schema}.{sql_ident(table_name)};"
                 ).fetchone()
                 cnt = cnt_row[0] if cnt_row else 0
+                size_bytes = facts.get(table_name, (0, 0))[1]
+                conn.execute(
+                    f"DELETE FROM {state_address} WHERE table_name = {sql_string(table_name)}"
+                )
+                conn.execute(
+                    f"INSERT INTO {state_address} VALUES ("
+                    f"{sql_string(table_name)}, {int(cnt or 0)}, {int(size_bytes)}, "
+                    f"{sql_string(datetime.now(timezone.utc).isoformat())})"
+                )
                 synced_info.append({"table": table_name, "rows": cnt})
+
+            if table_names is None:
+                keep = {table.name for table in target_tables}
+                for stored in list(state):
+                    if stored not in keep:
+                        conn.execute(
+                            f"DELETE FROM {state_address} "
+                            f"WHERE table_name = {sql_string(stored)}"
+                        )
 
             conn.execute(f"DETACH {alias};")
         finally:
             conn.close()
+            duckdb_engine.end_heavy()
 
         return {
             "status": "success",
             "folder": target_folder,
             "schema": schema_name,
             "synced_tables": len(synced_info),
+            "skipped_tables": skipped_tables,
             "tables": synced_info,
         }
+
+    @staticmethod
+    def _sync_plan(
+        source: Dict[str, Optional[tuple[int, int]]],
+        state: Dict[str, tuple[int, int]],
+        force: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        """Splits a folder's tables into ``(must copy, already current)``.
+
+        The fingerprint is the lakehouse's own ``(row count, byte size)``. A table
+        whose fingerprint cannot be read is copied: an unnecessary copy is slow, a
+        skipped one is wrong.
+        """
+        to_sync: list[str] = []
+        unchanged: list[str] = []
+        for name, fingerprint in sorted(source.items()):
+            if not force and fingerprint is not None and state.get(name) == fingerprint:
+                unchanged.append(name)
+            else:
+                to_sync.append(name)
+        return to_sync, unchanged
 
     # ------------------------------------------------------------ dbt scratch space
     def _scratch_paths(self) -> tuple[Path, Path]:
@@ -573,6 +660,13 @@ class DbtRunner:
         # dbt process is not locked out by the first one holding the shared scratch file.
         env["DBT_DUCKDB_PATH"] = scratch_db.as_posix()
 
+        from app.engines.duckdb_engine import duckdb_engine
+
+        # A dbt run is a whole DuckDB process holding the same per-slot budget as an
+        # in-process connection, so it takes one. Otherwise the host runs
+        # ``slots + 1`` processes that each believe they own an equal share of it.
+        duckdb_engine.begin_heavy()
+
         start_time = time.time()
         try:
             kept: List[str] = []
@@ -586,6 +680,9 @@ class DbtRunner:
                 bufsize=1,
                 env=env,
                 cwd=str(self.dbt_project_dir),
+                # rlimits plus a parent-death signal: a dbt child must not outlive the
+                # backend that started it.
+                preexec_fn=advisor.make_posix_rlimit_preexec(),
             )
             if on_process is not None:
                 try:
@@ -609,6 +706,7 @@ class DbtRunner:
             if isolates_artifacts:
                 self._publish_dbt_artifacts(scratch_target, self.dbt_project_dir / "target")
             self._discard_scratch(scratch_target if isolates_artifacts else None, scratch_db)
+            duckdb_engine.end_heavy()
 
         duration = round(time.time() - start_time, 2)
         success = exit_code == 0
@@ -1156,7 +1254,9 @@ class DbtRunner:
             slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
             env["DBT_DUCKDB_MEMORY_LIMIT"] = advisor.get_duckdb_memory_limit(slots)
             env["DBT_DUCKDB_MAX_TEMP_SIZE"] = advisor.get_duckdb_temp_limit(
-                settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT
+                settings.duckdb_temp_path.as_posix(),
+                settings.DUCKDB_TEMP_SIZE_LIMIT,
+                slots,
             )
 
         return env
@@ -1296,10 +1396,21 @@ class DbtRunner:
         cmd.extend(["--vars", json.dumps(dbt_vars)])
 
         env = os.environ.copy()
+        from app.core.resource_advisor import advisor
+
+        for key, value in advisor.get_child_env_limits().items():
+            env.setdefault(key, value)
         if env_vars:
             env.update(env_vars)
         # This run's own DuckDB file: the shared one locked out every other dbt process.
         env["DBT_DUCKDB_PATH"] = scratch_db.as_posix()
+
+        from app.engines.duckdb_engine import duckdb_engine
+
+        # A dbt run is a whole DuckDB process holding the same per-slot budget as an
+        # in-process connection, so it takes one. Otherwise the host runs
+        # ``slots + 1`` processes that each believe they own an equal share of it.
+        duckdb_engine.begin_heavy()
 
         start_time = time.time()
         try:
@@ -1309,11 +1420,15 @@ class DbtRunner:
                 text=True,
                 env=env,
                 cwd=str(self.dbt_project_dir),
+                # rlimits plus a parent-death signal: a dbt child must not outlive the
+                # backend that started it.
+                preexec_fn=advisor.make_posix_rlimit_preexec(),
             )
         finally:
             if owns_target:
                 self._publish_dbt_artifacts(scratch_target, self.dbt_project_dir / "target")
             self._discard_scratch(scratch_target if owns_target else None, scratch_db)
+            duckdb_engine.end_heavy()
         duration_sec = round(time.time() - start_time, 2)
         duration_ms = int(duration_sec * 1000)
 

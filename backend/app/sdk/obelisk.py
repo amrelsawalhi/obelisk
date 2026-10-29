@@ -510,9 +510,34 @@ def _attachments_for_sql(sql: str) -> list:
     return attachments
 
 
+def _eager_row_limit() -> int:
+    """The most rows an eager reader will materialise (0 = no ceiling).
+
+    ``query()`` and ``query_arrow()`` build the whole result in memory, so past the cap
+    the right tool is ``iter_batches()`` (streams batches) or ``lazy_query()`` (Polars
+    pushes the work down). Failing with that instruction beats the kernel dying.
+    """
+    try:
+        return max(0, int(getattr(settings, "SDK_QUERY_ROW_LIMIT", 1_000_000)))
+    except (TypeError, ValueError):
+        return 1_000_000
+
+
+def _refuse_oversized(table: pa.Table, limit: int, reader: str) -> pa.Table:
+    """Raises when ``table`` holds more rows than an eager reader may return."""
+    if limit and table.num_rows > limit:
+        raise RuntimeError(
+            f"obelisk.{reader}() would return more than {limit:,} rows. Use "
+            "obelisk.iter_batches() or obelisk.lazy_query() for a result this size, "
+            "or raise OBELISK_SDK_QUERY_ROW_LIMIT deliberately."
+        )
+    return table
+
+
 def query(sql: str) -> pl.DataFrame:
     """Executes SQL query using DuckDB in-process engine and returns a Polars DataFrame."""
     conn = duckdb_engine.get_connection()
+    duckdb_engine.begin_heavy()
     try:
         storage_path = duckdb_engine._ensure_storage()
         for attachment in _attachments_for_sql(sql):
@@ -521,10 +546,13 @@ def query(sql: str) -> pl.DataFrame:
         rel = conn.sql(exec_sql)
         if rel is None:
             return pl.DataFrame()
-        arrow_table = rel.arrow()
-        return pl.from_arrow(arrow_table)
+        limit = _eager_row_limit()
+        res = (rel.limit(limit + 1) if limit else rel).arrow()
+        table = res.read_all() if hasattr(res, "read_all") else res
+        return pl.from_arrow(_refuse_oversized(table, limit, "query"))
     finally:
         conn.close()
+        duckdb_engine.end_heavy()
 
 
 def lazy_query(sql: str) -> pl.LazyFrame:
@@ -545,6 +573,7 @@ def lazy_query(sql: str) -> pl.LazyFrame:
 def query_arrow(sql: str) -> pa.Table:
     """Executes SQL query using DuckDB in-process engine and returns a PyArrow Table."""
     conn = duckdb_engine.get_connection()
+    duckdb_engine.begin_heavy()
     try:
         storage_path = duckdb_engine._ensure_storage()
         for attachment in _attachments_for_sql(sql):
@@ -553,18 +582,20 @@ def query_arrow(sql: str) -> pa.Table:
         rel = conn.sql(exec_sql)
         if rel is None:
             return pa.Table.from_arrays([], names=[])
-        res = rel.arrow()
-        if hasattr(res, "read_all"):
-            return res.read_all()
-        return res
+        limit = _eager_row_limit()
+        res = (rel.limit(limit + 1) if limit else rel).arrow()
+        table = res.read_all() if hasattr(res, "read_all") else res
+        return _refuse_oversized(table, limit, "query_arrow")
     finally:
         conn.close()
+        duckdb_engine.end_heavy()
 
 
 def iter_batches(sql: str, batch_size: int = 100_000):
     """Streams federated SQL results as PyArrow RecordBatches in O(batch_size) RAM."""
     step = max(1, int(batch_size))
     conn = duckdb_engine.get_connection()
+    duckdb_engine.begin_heavy()
     try:
         storage_path = duckdb_engine._ensure_storage()
         for attachment in _attachments_for_sql(sql):
@@ -590,6 +621,7 @@ def iter_batches(sql: str, batch_size: int = 100_000):
                     yield batch
     finally:
         conn.close()
+        duckdb_engine.end_heavy()
 
 
 def _coerce_to_arrow(df: Any) -> pa.Table:
@@ -618,26 +650,31 @@ def save(df: Any, target: str) -> Dict[str, Any]:
     arrow_table = _coerce_to_arrow(df)
     advisor.assert_disk_headroom(settings.duckdb_storage_path)
 
-    from app.core.catalog import quote_ident
+    from app.core.catalog import quote_ident, table_ingest_lock
 
     address = f"{SOURCE}.{quote_ident(schema_name)}.{quote_ident(stem)}"
-    conn = duckdb_engine.get_connection()
-    try:
-        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema_name)};")
-        conn.register("_obelisk_save_src", arrow_table)
+    # Lock order matches ingestion: the table first, then a heavy slot. Taking them the
+    # other way round deadlocks against an ingest that holds the table and waits for a
+    # slot this notebook would be holding.
+    with table_ingest_lock(schema_name, stem), duckdb_engine.heavy_slot():
+        conn = duckdb_engine.get_connection()
         try:
-            conn.execute(
-                f"CREATE OR REPLACE TABLE {address} AS SELECT * FROM _obelisk_save_src;"
-            )
-            from app.core.catalog import record_lakehouse_commit
-            record_lakehouse_commit(conn)
-        finally:
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema_name)};")
+            conn.register("_obelisk_save_src", arrow_table)
             try:
-                conn.unregister("_obelisk_save_src")
-            except Exception:
-                pass
-    finally:
-        conn.close()
+                conn.execute(
+                    f"CREATE OR REPLACE TABLE {address} AS SELECT * FROM _obelisk_save_src;"
+                )
+                from app.core.catalog import record_lakehouse_commit
+
+                record_lakehouse_commit(conn)
+            finally:
+                try:
+                    conn.unregister("_obelisk_save_src")
+                except Exception:
+                    pass
+        finally:
+            conn.close()
 
     num_rows = int(arrow_table.num_rows)
     fqn = fqn_for(f"{rel_path}.parquet")
@@ -663,9 +700,15 @@ def save(df: Any, target: str) -> Dict[str, Any]:
     }
 
 
-def materialize_sql(sql: str, target: str) -> Dict[str, Any]:
-    """Materializes a SQL query directly into a DuckLake table."""
-    from app.core.catalog import quote_ident
+def materialize_sql(
+    sql: str, target: str, on_connection: Optional[Any] = None
+) -> Dict[str, Any]:
+    """Materializes a SQL query directly into a DuckLake table.
+
+    ``on_connection`` is handed the live connection so a caller (the pipeline
+    orchestrator) can interrupt a statement that outlives its timeout.
+    """
+    from app.core.catalog import quote_ident, table_ingest_lock
 
     folder, stem = split_table_path(target)
     schema_name = folder.replace("/", ".") if folder else "main"
@@ -673,21 +716,27 @@ def materialize_sql(sql: str, target: str) -> Dict[str, Any]:
     address = f"{SOURCE}.{quote_ident(schema_name)}.{quote_ident(stem)}"
     advisor.assert_disk_headroom(settings.duckdb_storage_path)
 
-    conn = duckdb_engine.get_connection()
-    try:
-        storage_path = duckdb_engine._ensure_storage()
-        for attachment in _attachments_for_sql(sql):
-            duckdb_engine.attach(conn, attachment)
-        exec_sql = (
-            duckdb_engine._prepare_sql_and_views(conn, sql, storage_path).strip().rstrip(";")
-        )
-        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema_name)};")
-        conn.execute(f"CREATE OR REPLACE TABLE {address} AS {exec_sql};")
-        from app.core.catalog import record_lakehouse_commit
-        record_lakehouse_commit(conn)
-        num_rows = int(conn.execute(f"SELECT count(*) FROM {address};").fetchone()[0])
-    finally:
-        conn.close()
+    with table_ingest_lock(schema_name, stem), duckdb_engine.heavy_slot():
+        conn = duckdb_engine.get_connection()
+        if on_connection is not None:
+            on_connection(conn)
+        try:
+            storage_path = duckdb_engine._ensure_storage()
+            for attachment in _attachments_for_sql(sql):
+                duckdb_engine.attach(conn, attachment)
+            exec_sql = (
+                duckdb_engine._prepare_sql_and_views(conn, sql, storage_path)
+                .strip()
+                .rstrip(";")
+            )
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema_name)};")
+            conn.execute(f"CREATE OR REPLACE TABLE {address} AS {exec_sql};")
+            from app.core.catalog import record_lakehouse_commit
+
+            record_lakehouse_commit(conn)
+            num_rows = int(conn.execute(f"SELECT count(*) FROM {address};").fetchone()[0])
+        finally:
+            conn.close()
 
     fqn = fqn_for(f"{rel_path}.parquet")
     sql_name = sql_name_for(f"{rel_path}.parquet")

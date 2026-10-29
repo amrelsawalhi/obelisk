@@ -47,6 +47,7 @@ from app.core.resource_advisor import advisor
 from app.core.docker_manager import docker_mgr
 from app.core.security import (
     assert_credentials_are_not_shipped_defaults,
+    assert_deployment_is_safe,
     authorize_websocket,
     require_principal,
 )
@@ -68,10 +69,49 @@ if not _app_logger.handlers:
     # migration config's level, which is WARN.
     _app_logger.propagate = False
 
+
+async def _ensure_initial_user() -> None:
+    """Headless auto-provisioning:
+
+    If the users table is completely empty and non-default credentials are provided
+    via settings/env (or explicitly allowed defaults), seed the initial admin account
+    so headless environments (CI, Docker compose, test harnesses) can authenticate
+    immediately without manual web UI interaction.
+    """
+    try:
+        from app.database import AsyncSessionLocal
+        from app.models.user import User
+        from app.core.password import hash_password
+        from sqlalchemy import select, func
+
+        async with AsyncSessionLocal() as session:
+            user_count = await session.scalar(select(func.count()).select_from(User))
+            if (user_count or 0) == 0:
+                admin_user = (getattr(settings, "OBELISK_ADMIN_USER", "") or "").strip()
+                admin_password = getattr(settings, "OBELISK_ADMIN_PASSWORD", "") or ""
+                is_default_pw = admin_password in ("admin", "obelisk2026")
+                allow_default = getattr(settings, "ALLOW_DEFAULT_CREDENTIALS", False)
+
+                if admin_user and admin_password and (not is_default_pw or allow_default):
+                    user = User(
+                        username=admin_user,
+                        password_hash=hash_password(admin_password),
+                        role="admin",
+                    )
+                    session.add(user)
+                    await session.commit()
+                    _app_logger.info("Auto-provisioned initial admin user %r from environment.", admin_user)
+                else:
+                    _app_logger.info("No registered users. Awaiting Initial Admin Setup via UI.")
+    except Exception as exc:
+        _app_logger.warning("Could not check initial user setup on boot: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Refuse to start in the one configuration that only looks secure.
     assert_credentials_are_not_shipped_defaults()
+    assert_deployment_is_safe()
     # One process owns this data directory. Nothing below enforces it: SQLite tolerates
     # another writer, DuckDB opens the same Parquet files, and DuckLake accepts a second
     # connection against the same catalog (proven in the format spike). Two backends on
@@ -96,6 +136,7 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(duckdb_engine.install_community_extensions)
         # Initialize SQLite database and enforce WAL mode
         await init_db()
+        await _ensure_initial_user()
         # Close out runs killed by the previous shutdown and reload recent history, so a
         # restart no longer erases every job and dbt run (audit M3/H10).
         from app.services.state import restore_task_history

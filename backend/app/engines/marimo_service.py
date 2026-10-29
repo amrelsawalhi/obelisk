@@ -117,6 +117,8 @@ class MarimoService:
             "marimo",
             "edit",
             str(self.notebooks_dir),
+            "--host",
+            str(settings.MARIMO_HOST),
             "--port",
             str(self.port),
             "--headless",

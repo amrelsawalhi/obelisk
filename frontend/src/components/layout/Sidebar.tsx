@@ -86,7 +86,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ activeTab, onSelectTab }) => {
   return (
     <aside className="w-64 border-r border-slate-200 bg-white flex flex-col select-none shrink-0">
       {/* Brand Header */}
-      <div className="h-16 border-b border-slate-200 flex items-center px-4 gap-3 bg-gradient-to-b from-slate-50/50 to-transparent">
+      <div className="h-16 flex items-center px-4 gap-3 bg-gradient-to-b from-slate-50/50 to-transparent">
         <div className="w-9 h-9 rounded-xl bg-white border border-slate-200/90 shadow-2xs flex items-center justify-center shrink-0 ring-2 ring-slate-100">
           <ObeliskIcon className="w-6.5 h-6.5" />
         </div>

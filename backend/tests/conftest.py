@@ -44,6 +44,12 @@ os.environ["DATABASE_URL"] = (
     f"sqlite+aiosqlite:///{(_TEST_DB_DIR / 'obelisk.db').as_posix()}"
 )
 os.environ.setdefault("OBELISK_MASTER_KEY", "dGhpcy1pcy1hLXNhbXBsZS0zMi1ieXRlLWtleS0xMjM0NTY=")
+os.environ["OBELISK_AUTH_ENABLED"] = "0"
+os.environ["OBELISK_ALLOW_DEFAULT_CREDENTIALS"] = "0"
+
+from app.config import settings
+settings.AUTH_ENABLED = False
+settings.ALLOW_DEFAULT_CREDENTIALS = False
 
 # On Windows, configure DOCKER_HOST if needed so docker.from_env() reaches WSL daemon
 if os.name == "nt" and "DOCKER_HOST" not in os.environ:
@@ -127,6 +133,33 @@ def prepare_test_db():
     # Ensure data directory exists
     Path("data").mkdir(parents=True, exist_ok=True)
     asyncio.run(init_db())
+    yield
+
+
+@pytest.fixture(autouse=True)
+async def ensure_test_admin_user():
+    """Seeds default admin in User table if not present so test suites can authenticate."""
+    from app.database import AsyncSessionLocal
+    from app.models.user import User
+    from app.core.password import hash_password
+    from sqlalchemy import select
+
+    try:
+        async with AsyncSessionLocal() as session:
+            existing = await session.scalar(
+                select(User).where(User.username == settings.OBELISK_ADMIN_USER)
+            )
+            if not existing:
+                session.add(
+                    User(
+                        username=settings.OBELISK_ADMIN_USER,
+                        password_hash=hash_password(settings.OBELISK_ADMIN_PASSWORD),
+                        role="admin",
+                    )
+                )
+                await session.commit()
+    except Exception:
+        pass
     yield
 
 

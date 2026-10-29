@@ -1,4 +1,4 @@
-﻿// Strict TypeScript interfaces matching FastAPI Pydantic v2 schemas 1:1
+// Strict TypeScript interfaces matching FastAPI Pydantic v2 schemas 1:1
 
 export interface HostSpecs {
   total_ram_bytes: number;
@@ -954,5 +954,27 @@ export interface LakehouseMaintenanceResult {
   keep_days: number;
   before: LakehouseCatalogCounts;
   after: LakehouseCatalogCounts;
+}
+
+
+// --- Authentication ---------------------------------------------------------
+
+export interface AuthStatusResponse {
+  auth_enabled: boolean;
+  needs_setup?: boolean;
+  session_ttl_seconds: number;
+  terminal_enabled: boolean;
+}
+
+export interface UserSession {
+  username: string;
+  role: string;
+  authenticated: boolean;
+}
+
+export interface LoginResponse {
+  access_token: string;
+  token_type: string;
+  user: UserSession;
 }
 

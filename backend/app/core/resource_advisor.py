@@ -173,19 +173,32 @@ class ResourceAdvisor:
         per_slot_gb = max(1, min(12, int((remaining_safe_gb * 0.50) / slots)))
         return f"{per_slot_gb}GB"
 
-    def get_duckdb_temp_limit_mb(self, path: str, configured: str = "50GB") -> int:
-        """Numeric megabyte spill limit bounded by configured ceiling and 50% of free disk."""
+    def get_duckdb_temp_limit_mb(
+        self, path: str, configured: str = "50GB", concurrent_slots: int = 1
+    ) -> int:
+        """Numeric spill limit for *one connection*.
+
+        The configured ceiling and the 50%-of-free-disk bound are budgets for the whole
+        process, so they are divided by the number of connections that may spill at the
+        same time. Without the division four connections could each spill 50% of free
+        disk, i.e. twice the volume.
+        """
         wanted = _parse_size_to_mb(configured) or 50 * 1024
+        slots = max(1, int(concurrent_slots))
         try:
             free_bytes = int(psutil.disk_usage(_existing_path(path)).free)
         except Exception:
-            return wanted
-        allowed_mb = max(1024, free_bytes // (1024 * 1024) // 2)
-        return min(wanted, allowed_mb)
+            allowed_mb = wanted
+        else:
+            allowed_mb = max(1024, free_bytes // (1024 * 1024) // 2)
+        total_mb = min(wanted, allowed_mb)
+        return max(1, total_mb // slots)
 
-    def get_duckdb_temp_limit(self, path: str, configured: str = "50GB") -> str:
-        """How much DuckDB may spill into its temp directory, given what is actually free."""
-        return f"{self.get_duckdb_temp_limit_mb(path, configured)}MB"
+    def get_duckdb_temp_limit(
+        self, path: str, configured: str = "50GB", concurrent_slots: int = 1
+    ) -> str:
+        """How much one DuckDB connection may spill, given what is actually free."""
+        return f"{self.get_duckdb_temp_limit_mb(path, configured, concurrent_slots)}MB"
 
     def get_spark_memory_limit(self) -> str:
         """Returns safe memory limit string for PySpark driver initialization (e.g. '2g', '4g')."""
@@ -228,6 +241,18 @@ class ResourceAdvisor:
                     os.setsid()
                 except Exception:
                     pass
+            # If the control plane is OOM-killed or restarted, an orphaned dbt/Python
+            # child would keep writing into the lakehouse and collide with the recovery
+            # sweep that starts on the next boot. PR_SET_PDEATHSIG has the kernel end it
+            # instead. Linux-only and best effort, so failure is ignored.
+            try:
+                import ctypes
+                import signal
+
+                libc = ctypes.CDLL("libc.so.6", use_errno=True)
+                libc.prctl(1, int(signal.SIGTERM))  # PR_SET_PDEATHSIG
+            except Exception:
+                pass
             try:
                 import resource
                 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)

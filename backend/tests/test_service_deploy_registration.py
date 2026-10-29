@@ -40,7 +40,7 @@ from app.models.connection import Connection
 from app.models.service_config import ServiceConfig
 
 SERVICE = "postgres"
-EXPECTED_NAME = f"{get_blueprint(SERVICE).display_name} (local)"
+EXPECTED_NAME = get_blueprint(SERVICE).default_connection_name or f"obelisk_{SERVICE}"
 
 
 class _Container:

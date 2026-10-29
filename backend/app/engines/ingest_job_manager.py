@@ -9,6 +9,7 @@ from typing import Callable, Dict, Any, List, Optional, AsyncGenerator
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 
+from app.config import settings
 from app.engines.ingest_engine import ingest_engine
 from app.services.state import task_history
 
@@ -85,6 +86,41 @@ class IngestJobManager:
         self._last_persist: Dict[str, float] = {}
         self._live_connections: Dict[str, Any] = {}
         self._connection_lock = threading.Lock()
+        # Created lazily so the semaphore binds to the loop that actually runs the job.
+        self._ingest_semaphore: Optional[asyncio.Semaphore] = None
+
+    def _ingest_slots(self) -> asyncio.Semaphore:
+        """The cap on ingests writing into DuckDB at the same time.
+
+        Each ingest holds a connection and a heavy slot for its whole run. Without a
+        cap, a handful of queued requests each opened one and the machine was asked for
+        several times the memory the slot count had budgeted.
+        """
+        if self._ingest_semaphore is None:
+            self._ingest_semaphore = asyncio.Semaphore(
+                max(1, int(getattr(settings, "INGEST_MAX_CONCURRENT", 2)))
+            )
+        return self._ingest_semaphore
+
+    async def _run_ingest(self, **kwargs: Any) -> Dict[str, Any]:
+        """Runs one table's ingest on a worker thread, inside the ingest concurrency cap."""
+        async with self._ingest_slots():
+            return await asyncio.to_thread(ingest_engine.ingest_entity, **kwargs)
+
+    def _persist_soon(self, job: IngestJob) -> None:
+        """Persists history without blocking the event loop when there is one.
+
+        SQLite is single-writer, so a dbt child holding the file blocks this write for
+        up to the busy timeout (plus retries). Running that on the loop froze every HTTP
+        and WebSocket response for the same span. From a sync caller — a worker thread
+        or a test — it still writes inline.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._persist(job)
+            return
+        loop.run_in_executor(None, self._persist, job)
 
     def _attach_connection(self, job_id: str, conn: Any) -> None:
         """Remembers a job's live connection. Called from the ingestion thread."""
@@ -179,7 +215,7 @@ class IngestJobManager:
             percent=0,
         )
         self._jobs[job_id] = job
-        self._persist(job)
+        self._persist_soon(job)
         return job
 
     def append_log(self, job_id: str, message: str):
@@ -237,7 +273,7 @@ class IngestJobManager:
             job.percent = min(100, int((done / job.total_tables) * 100))
 
         if persist:
-            self._persist(job)
+            self._persist_soon(job)
 
         event_payload = json.dumps({
             "type": "progress",
@@ -289,7 +325,7 @@ class IngestJobManager:
         job.is_cancelled = True
         job.status = "cancelled"
         job.completed_at = datetime.now(timezone.utc).isoformat()
-        self._persist(job)
+        self._persist_soon(job)
 
         with self._connection_lock:
             live = self._live_connections.get(job_id)
@@ -392,8 +428,7 @@ class IngestJobManager:
 
             self.update_progress(job_id, current_phase="Staging rows into the lakehouse")
 
-            res = await asyncio.to_thread(
-                ingest_engine.ingest_entity,
+            res = await self._run_ingest(
                 source_type=job.source_type,
                 connection_params=connection_params,
                 entity=entity,
@@ -492,8 +527,7 @@ class IngestJobManager:
 
                 table_start = time.time()
                 try:
-                    res = await asyncio.to_thread(
-                        ingest_engine.ingest_entity,
+                    res = await self._run_ingest(
                         source_type=job.source_type,
                         connection_params=connection_params,
                         entity=table_name,

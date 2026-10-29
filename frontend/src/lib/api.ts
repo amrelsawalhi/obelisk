@@ -46,7 +46,11 @@ import type {
   LakehouseMaintenanceResult,
   SupersetInventory,
   SupersetSyncReport,
+  AuthStatusResponse,
+  UserSession,
+  LoginResponse,
 } from './types';
+import { emitLoggedOut } from './authEvents';
 
 const CLIENT_ID_STORAGE_KEY = 'obelisk_client_id';
 
@@ -81,7 +85,42 @@ export const apiClient = axios.create({
   withCredentials: true,
 });
 
+// A 401 anywhere else means the session expired or was revoked. The auth context
+// listens for this and the gate sends the browser to /login, remembering where it
+// was. /auth/* itself is exempt: a failed login must not look like a logout.
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const status = error?.response?.status;
+    const url: string = error?.config?.url ?? '';
+    if (status === 401 && !url.startsWith('/auth/')) {
+      emitLoggedOut();
+    }
+    return Promise.reject(error);
+  },
+);
+
 export const api = {
+  // Authentication
+  getAuthStatus: async (): Promise<AuthStatusResponse> => {
+    const res = await apiClient.get<AuthStatusResponse>('/auth/status');
+    return res.data;
+  },
+  setupAdmin: async (username: string, password: string): Promise<LoginResponse> => {
+    const res = await apiClient.post<LoginResponse>('/auth/setup', { username, password });
+    return res.data;
+  },
+  getAuthMe: async (): Promise<UserSession> => {
+    const res = await apiClient.get<UserSession>('/auth/me');
+    return res.data;
+  },
+  login: async (username: string, password: string): Promise<LoginResponse> => {
+    const res = await apiClient.post<LoginResponse>('/auth/login', { username, password });
+    return res.data;
+  },
+  logout: async (): Promise<void> => {
+    await apiClient.post('/auth/logout');
+  },
   // Services & Resource Advisor
   getHardwareSpecs: async (): Promise<HostSpecs> => {
     const res = await apiClient.get<HostSpecs>('/services/advisor/specs');

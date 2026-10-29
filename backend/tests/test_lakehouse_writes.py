@@ -46,8 +46,9 @@ def _batch(ids, amounts, stamps):
 def _write(engine, conn, schema, batch, mode, strategy="append", key=None, watermark=None):
     """Streams one batch into the sink the strategy picks, then applies it.
 
-    That is the path an ingest takes: a snapshot and an upsert stream into a load table
-    beside the target, and only an append writes into the target as it arrives.
+    That is the path an ingest takes: every strategy streams into a load table beside
+    the target, and only then is the delta swapped in (snapshot, first load), appended
+    in one transaction (incremental append) or merged (upsert).
     """
     engine._require_primary_key(strategy, key)
     target = f"lakehouse.{schema}.orders"
@@ -61,8 +62,7 @@ def _write(engine, conn, schema, batch, mode, strategy="append", key=None, water
         write_strategy=strategy,
     )
     assert engine._stage_batches(conn, [batch], sink=sink, create=create) == batch.num_rows
-    if load is None:
-        return
+    assert load is not None, "a batched load always stages beside its target"
     if strategy == "upsert":
         engine._upsert_from_load(
             conn,
@@ -74,6 +74,10 @@ def _write(engine, conn, schema, batch, mode, strategy="append", key=None, water
             exists=exists,
             primary_key=key,
             watermark_column=watermark,
+        )
+    elif mode == "incremental" and exists:
+        engine._append_from_load(
+            conn, schema=schema, staged=sink, target=target, table="orders"
         )
     else:
         engine._swap_into_place(

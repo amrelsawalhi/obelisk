@@ -52,6 +52,7 @@ class ServiceBlueprint:
     # once it is ready. Declared once here, and the deploy path registers the Connection
     # from it — no per-service boolean to remember and no second way to describe a source.
     provides: Optional[str] = None
+    default_connection_name: Optional[str] = None # SQL identifier used when registering Connection (e.g. obelisk_postgres)
     web_ui: bool = False                         # primary host port serves a browsable web UI
     web_ui_path: Optional[str] = None             # relative gateway subpath (e.g. "/gitea") served by Caddy / Vite proxy
     post_start_commands: List[str] = field(default_factory=list)  # exec'd after container start (init flows)
@@ -69,7 +70,7 @@ class ServiceBlueprint:
 _BLUEPRINTS: List[ServiceBlueprint] = [
     ServiceBlueprint(
         name="postgres",
-        display_name="obelisk_postgres",
+        display_name="PostgreSQL",
         description="Relational warehouse for dbt marts and staging.",
         category="Warehouse",
         image="postgres:16-alpine",
@@ -85,6 +86,7 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
         credential_username="postgres",
         credential_database="obelisk",
         provides="postgres",
+        default_connection_name="obelisk_postgres",
     ),
     ServiceBlueprint(
         name="clickhouse",

@@ -22,8 +22,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, Iterable, Mapping, Optional
 from urllib.parse import urlparse
@@ -59,6 +61,27 @@ LOOPBACK_ORIGIN_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 def auth_enabled() -> bool:
     return bool(getattr(settings, "AUTH_ENABLED", False))
+
+
+def is_loopback_client(host: Optional[str]) -> bool:
+    """Whether a socket peer address is this machine.
+
+    The terminal hands out a real shell, so while auth is off it is only offered to a
+    client that is already on the box. ``TestClient``/ASGI transports report a name
+    rather than an address; that is not loopback, and the terminal is refused there
+    unless somebody explicitly authenticates.
+    """
+    if not host:
+        return False
+    normalized = str(host).strip().strip("[]").lower()
+    if normalized.startswith("::ffff:"):
+        normalized = normalized[len("::ffff:"):]
+    if normalized in LOOPBACK_ORIGIN_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def _b64_encode(data: bytes) -> str:
@@ -158,6 +181,7 @@ def require_principal(connection: HTTPConnection) -> Dict[str, Any]:
 
 
 DEFAULT_ADMIN_PASSWORD = config_defaults.DEFAULT_ADMIN_PASSWORD
+ALLOW_DEFAULT_CREDENTIALS_ENV = "OBELISK_ALLOW_DEFAULT_CREDENTIALS"
 
 
 def assert_credentials_are_not_shipped_defaults() -> None:
@@ -169,6 +193,11 @@ def assert_credentials_are_not_shipped_defaults() -> None:
     value set in ``.env`` counts — reading ``os.environ`` directly ignored it.
     """
     if not auth_enabled():
+        return
+    if (
+        getattr(settings, "ALLOW_DEFAULT_CREDENTIALS", False)
+        or os.getenv(ALLOW_DEFAULT_CREDENTIALS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    ):
         return
 
     problems: list[str] = []
@@ -183,6 +212,106 @@ def assert_credentials_are_not_shipped_defaults() -> None:
             "(OBELISK_ADMIN_USER, OBELISK_ADMIN_PASSWORD, OBELISK_MASTER_KEY) in .env or "
             "the environment before exposing this instance."
         )
+
+
+UNAUTHENTICATED_OPT_IN_ENV = "OBELISK_ALLOW_UNAUTHENTICATED"
+
+
+def assert_deployment_is_safe() -> None:
+    """Refuse an unauthenticated API that the network can reach.
+
+    Auth is off by default so a single-operator install works without a login. That is
+    only safe while the API is private: on ``0.0.0.0`` every route — ingestion, SQL,
+    file writes, service deployment — answers anyone who can reach the port. A
+    production-labelled deployment therefore has to choose one of three explicit
+    states: authentication on, a loopback bind, or a stated opt-in.
+    """
+    if auth_enabled():
+        return
+    if (getattr(settings, "ENVIRONMENT", "") or "").strip().lower() not in (
+        "production",
+        "prod",
+    ):
+        return
+
+    opt_in = os.getenv(UNAUTHENTICATED_OPT_IN_ENV, "").strip().lower()
+    host = (getattr(settings, "HOST", "") or "").strip()
+    # An empty HOST means uvicorn's "all interfaces" default — same exposure as 0.0.0.0.
+    effective_host = host or "0.0.0.0"
+    if (
+        not is_loopback_client(effective_host)
+        and opt_in not in ("1", "true", "yes", "on")
+    ):
+        raise RuntimeError(
+            f"AUTH_ENABLED is off while ENVIRONMENT=production and HOST={host or '(empty)'!r}: "
+            "every API route is open to anyone who can reach it. Set OBELISK_AUTH_ENABLED=1 "
+            "(with a real OBELISK_ADMIN_PASSWORD and OBELISK_MASTER_KEY), bind "
+            "HOST=127.0.0.1, or set "
+            f"{UNAUTHENTICATED_OPT_IN_ENV}=1 if this port is genuinely private."
+        )
+    if opt_in in ("1", "true", "yes", "on"):
+        logger.warning(
+            "Serving an unauthenticated API on %s because %s=1 is set. Any client that "
+            "can reach this port has full control of the instance.",
+            effective_host,
+            UNAUTHENTICATED_OPT_IN_ENV,
+        )
+
+
+def configured_trusted_proxies() -> list[Any]:
+    """The proxy addresses whose ``X-Forwarded-For`` this instance may believe."""
+    raw = (getattr(settings, "TRUSTED_PROXIES", "") or "").strip()
+    networks = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            logger.warning("Ignoring unparseable trusted proxy %r", item)
+    return networks
+
+
+def peer_is_trusted_proxy(host: Optional[str]) -> bool:
+    """Whether the TCP peer is one of the configured reverse proxies."""
+    if not host:
+        return False
+    normalized = host.strip().strip("[]").lower()
+    if normalized.startswith("::ffff:"):
+        normalized = normalized[len("::ffff:"):]
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return any(address in network for network in configured_trusted_proxies())
+
+
+def unauthenticated_terminal_allowed(peer: Optional[str], headers: Mapping[str, str]) -> bool:
+    """While auth is off, whether this client may open the shell socket.
+
+    The peer address alone is not enough behind a proxy: a proxy running on this machine
+    makes every connection look loopback. So a forwarding header arriving from a peer
+    that is not a configured trusted proxy is refused outright, and a header from a
+    trusted proxy is resolved to the client it forwards for — which must still be
+    loopback.
+    """
+    forwarded = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
+    if not forwarded:
+        return is_loopback_client(peer)
+    if not peer_is_trusted_proxy(peer):
+        return False
+    trusted = configured_trusted_proxies()
+    for hop in reversed([part.strip() for part in forwarded.split(",") if part.strip()]):
+        try:
+            address = ipaddress.ip_address(hop.strip("[]"))
+        except ValueError:
+            return is_loopback_client(hop)
+        if trusted and any(address in network for network in trusted):
+            continue
+        return address.is_loopback
+    # Every hop is a trusted proxy: the caller is unknown, so it is not loopback.
+    return False
 
 
 def configured_origins() -> list[str]:

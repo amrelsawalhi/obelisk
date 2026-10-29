@@ -1,5 +1,17 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Search, HardDrive, Cpu, Activity, ChevronDown, ExternalLink } from 'lucide-react';
+import {
+  Search,
+  HardDrive,
+  Cpu,
+  Activity,
+  ChevronDown,
+  ExternalLink,
+  ShieldCheck,
+  LogOut,
+  Server,
+} from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../../context/AuthContext';
 import { useTelemetry } from '../../lib/useTelemetry';
 import { MOD_KEY } from '../../lib/platform';
 import type { NavigationTab } from './Sidebar';
@@ -12,21 +24,30 @@ interface HeaderProps {
 
 export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavigate }) => {
   const { telemetry, isLive } = useTelemetry();
-  const [isTelemetryOpen, setIsTelemetryOpen] = useState(false);
-  const popoverRef = useRef<HTMLDivElement>(null);
+  const { user, authEnabled, logout } = useAuth();
+  const navigate = useNavigate();
 
-  // Close popover when clicking outside
+  const [isTelemetryOpen, setIsTelemetryOpen] = useState(false);
+  const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
+
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close popovers when clicking outside
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
         setIsTelemetryOpen(false);
       }
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
+        setIsUserMenuOpen(false);
+      }
     };
-    if (isTelemetryOpen) {
+    if (isTelemetryOpen || isUserMenuOpen) {
       document.addEventListener('mousedown', handleClickOutside);
     }
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [isTelemetryOpen]);
+  }, [isTelemetryOpen, isUserMenuOpen]);
 
   const titles: Record<NavigationTab, { title: string; subtitle: string }> = {
     home: {
@@ -184,13 +205,19 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
                   <div>
                     <div className="flex justify-between text-slate-600 mb-1">
                       <span className="flex items-center gap-1 font-medium text-slate-700">
-                        <Cpu className="w-3.5 h-3.5 text-amber-600" /> Host CPU ({telemetry.cpu_count} Cores)
+                        <Cpu className="w-3.5 h-3.5 text-sky-600" /> Host CPU ({telemetry.cpu_count} Cores)
                       </span>
                       <span className="font-mono font-bold text-slate-900">{telemetry.cpu_percent}%</span>
                     </div>
                     <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
                       <div
-                        className="h-full rounded-full bg-amber-500 transition-all duration-300"
+                        className={`h-full rounded-full transition-all duration-300 ${
+                          telemetry.cpu_percent > 85
+                            ? 'bg-red-500'
+                            : telemetry.cpu_percent > 65
+                              ? 'bg-amber-500'
+                              : 'bg-sky-600'
+                        }`}
                         style={{ width: `${Math.min(telemetry.cpu_percent, 100)}%` }}
                       />
                     </div>
@@ -223,8 +250,8 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
 
                   {/* Active Containers */}
                   <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-slate-600">
-                    <span className="flex items-center gap-1 font-medium">
-                      <Activity className="w-3.5 h-3.5 text-emerald-600" /> Active Services
+                    <span className="flex items-center gap-1 font-medium text-slate-700">
+                      <Server className="w-3.5 h-3.5 text-sky-600" /> Active Services
                     </span>
                     <span className="font-mono font-bold text-slate-800 bg-slate-100 px-2 py-0.5 rounded text-[11px]">
                       {telemetry.active_containers_count} running
@@ -251,6 +278,78 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
             </div>
           )}
         </div>
+
+        {/* User Account Popover */}
+        {authEnabled && user && (
+          <div className="relative" ref={userMenuRef}>
+            <button
+              onClick={() => setIsUserMenuOpen((prev) => !prev)}
+              aria-label="User account menu"
+              className={`flex items-center gap-2 pl-2 pr-2.5 py-1.5 rounded-lg border text-xs font-medium transition-all shadow-2xs ${
+                isUserMenuOpen
+                  ? 'bg-slate-100 border-slate-300 text-slate-900 ring-2 ring-sky-500/10'
+                  : 'bg-white hover:bg-slate-50 border-slate-200 text-slate-700'
+              }`}
+            >
+              <div className="w-5.5 h-5.5 rounded-md bg-sky-100 border border-sky-200/80 flex items-center justify-center text-[10px] font-bold text-sky-800 shrink-0 uppercase">
+                {user.username.slice(0, 2)}
+              </div>
+              <span className="font-semibold text-slate-800 max-w-[120px] truncate">
+                {user.username}
+              </span>
+              <ChevronDown
+                className={`w-3.5 h-3.5 text-slate-400 transition-transform ${
+                  isUserMenuOpen ? 'rotate-180' : ''
+                }`}
+              />
+            </button>
+
+            {/* User Dropdown Menu */}
+            {isUserMenuOpen && (
+              <div className="absolute right-0 mt-2 w-56 rounded-xl bg-white border border-slate-200 shadow-xl p-2 z-50 text-xs animate-in fade-in-50 zoom-in-95 duration-100">
+                {/* User Info Header */}
+                <div className="px-3 py-2 border-b border-slate-100 mb-1">
+                  <div className="font-bold text-slate-900 truncate">{user.username}</div>
+                  <div className="flex items-center gap-1.5 mt-1">
+                    <span className="text-[10px] font-semibold text-sky-700 bg-sky-50 border border-sky-200/70 px-1.5 py-0.5 rounded-md uppercase">
+                      {user.role}
+                    </span>
+                    <span className="text-[10px] text-slate-400">Authenticated</span>
+                  </div>
+                </div>
+
+                {/* Navigation Links */}
+                {onNavigate && (
+                  <button
+                    onClick={() => {
+                      setIsUserMenuOpen(false);
+                      onNavigate('settings');
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-slate-700 hover:bg-slate-50 rounded-lg transition-colors text-left font-medium"
+                  >
+                    <ShieldCheck className="w-4 h-4 text-slate-400" />
+                    <span>Settings & Security</span>
+                  </button>
+                )}
+
+                {/* Sign Out Action */}
+                <div className="pt-1 mt-1 border-t border-slate-100">
+                  <button
+                    onClick={async () => {
+                      setIsUserMenuOpen(false);
+                      await logout();
+                      navigate('/login', { replace: true });
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-rose-600 hover:bg-rose-50 rounded-lg transition-colors text-left font-medium"
+                  >
+                    <LogOut className="w-4 h-4 text-rose-500" />
+                    <span>Sign out</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </header>
   );

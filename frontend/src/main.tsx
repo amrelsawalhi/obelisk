@@ -19,6 +19,7 @@ import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
 
 import { App } from './App';
+import { AuthProvider } from './context/AuthContext';
 import { IngestProvider } from './context/IngestContext';
 import './index.css';
 
@@ -39,9 +40,11 @@ loader.config({ monaco });
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
   <React.StrictMode>
     <BrowserRouter>
-      <IngestProvider>
-        <App />
-      </IngestProvider>
+      <AuthProvider>
+        <IngestProvider>
+          <App />
+        </IngestProvider>
+      </AuthProvider>
     </BrowserRouter>
   </React.StrictMode>
 );

@@ -15,7 +15,14 @@
     # Flask 404 for every page. There is deliberately no /superset route here.
 
     # Reactive Marimo Notebook Server (Configured with --base-url /notebooks)
+    # Marimo runs with --no-token, so the gateway authenticates every request before
+    # it is proxied. /api/auth/verify answers 204 only for a valid session (and for
+    # everyone while OBELISK_AUTH_ENABLED=0, so this stays a no-op on a local install).
     handle /notebooks/* {
+        forward_auth obelisk-core:8000 {
+            uri /api/auth/verify
+            copy_headers X-Obelisk-User X-Obelisk-Role
+        }
         reverse_proxy obelisk-core:2718
     }
 
@@ -24,8 +31,14 @@
     # subpath in ROOT_URL only prefixes the links Gitea *generates*. The proxy
     # must therefore strip /gitea before forwarding. Bare /gitea is normalized to
     # /gitea/ so the prefix matcher below applies (the UI links to "/gitea").
+    # The same session gate as /notebooks applies: Gitea is only reachable once
+    # the Obelisk session check passes (it then has its own login).
     redir /gitea /gitea/ 308
     handle_path /gitea/* {
+        forward_auth obelisk-core:8000 {
+            uri /api/auth/verify
+            copy_headers X-Obelisk-User X-Obelisk-Role
+        }
         reverse_proxy obelisk_gitea:3000
     }
 

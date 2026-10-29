@@ -45,6 +45,9 @@ const SettingsView = React.lazy(() =>
 
 import { TAB_PATHS, tabFromPath } from './lib/navigation';
 import type { NavigationTab } from './components/layout/Sidebar';
+import { AuthGate } from './components/auth/AuthGate';
+import { LoginPage } from './components/auth/LoginPage';
+import { SetupPage } from './components/auth/SetupPage';
 
 interface RouteState {
   sql?: string;
@@ -244,8 +247,24 @@ const AppLayout: React.FC = () => {
 export const App: React.FC = () => (
   <React.Suspense fallback={<RouteFallback label="Loading editor" />}>
     <Routes>
-      <Route path="/query/popout" element={<QueryStudio isPopout />} />
-      <Route path="*" element={<AppLayout />} />
+      <Route
+        path="/query/popout"
+        element={
+          <AuthGate>
+            <QueryStudio isPopout />
+          </AuthGate>
+        }
+      />
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/setup" element={<SetupPage />} />
+      <Route
+        path="*"
+        element={
+          <AuthGate>
+            <AppLayout />
+          </AuthGate>
+        }
+      />
     </Routes>
   </React.Suspense>
 );

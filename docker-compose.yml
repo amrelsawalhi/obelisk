@@ -7,7 +7,9 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
-      - "2718:2718"
+      # 2718 is deliberately not published. Marimo runs with --no-token (an
+      # unauthenticated editor, i.e. remote code execution) and binds loopback inside
+      # this container; publishing it put that editor on the host's network.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data
@@ -21,9 +23,30 @@ services:
       # container's writable layer and vanished whenever the container was recreated.
       - STORAGE_URI=file:///app/data/lakehouse
       - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:////app/data/obelisk.db}
-      - OBELISK_MASTER_KEY=${OBELISK_MASTER_KEY:-dGhpcy1pcy1hLXNhbXBsZS0zMi1ieXRlLWtleS0xMjM0NTY=}
+      # Required: this key encrypts every stored connection credential. Booting with the
+      # sample key shipped in .env.example would leave the vault readable to anyone who
+      # gets a copy of the database.
+      - OBELISK_MASTER_KEY=${OBELISK_MASTER_KEY:?Set OBELISK_MASTER_KEY to a 32-byte urlsafe base64 value}
       - OBELISK_ADMIN_USER=${OBELISK_ADMIN_USER:-admin}
       - OBELISK_ADMIN_PASSWORD=${OBELISK_ADMIN_PASSWORD:-obelisk2026}
+      # This container binds 0.0.0.0, so an open API here is reachable from the
+      # network. Authentication is on by default and the UI has a login screen;
+      # a LAN deployment that really wants to stay open sets
+      # OBELISK_AUTH_ENABLED=0 AND OBELISK_ALLOW_UNAUTHENTICATED=1 explicitly.
+      - OBELISK_AUTH_ENABLED=${OBELISK_AUTH_ENABLED:-1}
+      - OBELISK_ALLOW_UNAUTHENTICATED=${OBELISK_ALLOW_UNAUTHENTICATED:-0}
+      # An unauthenticated terminal on a published port is a shell for anyone who can
+      # reach it. It stays off unless the operator asks for it, and the WebSocket itself
+      # still refuses non-loopback clients while auth is off.
+      - OBELISK_TERMINAL=${OBELISK_TERMINAL:-0}
+      # All interfaces *inside* the container so the gateway can reach it. It is never
+      # published on the host, and /notebooks/* is behind forward_auth in the Caddyfile,
+      # so this is not an exposure.
+      - MARIMO_HOST=${MARIMO_HOST:-0.0.0.0}
+      # The resource budget the whole platform is sized against.
+      - DUCKDB_MAX_CONCURRENT_HEAVY=${DUCKDB_MAX_CONCURRENT_HEAVY:-4}
+      - OBELISK_INGEST_MAX_CONCURRENT=${OBELISK_INGEST_MAX_CONCURRENT:-2}
+      - DUCKDB_TEMP_SIZE_LIMIT=${DUCKDB_TEMP_SIZE_LIMIT:-50GB}
       - OBELISK_NET=obelisk_net
     networks:
       - obelisk_net

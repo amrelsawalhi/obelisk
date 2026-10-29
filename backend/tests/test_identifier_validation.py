@@ -212,17 +212,25 @@ async def test_deleting_an_ordinary_table_still_works() -> None:
 
 
 def test_a_hostile_watermark_cannot_choose_the_answer() -> None:
-    """The payload that used to return 42 no longer resolves to a column at all."""
+    """The payload that used to return 42 is refused, not answered.
+
+    Reading the watermark is what decides where an incremental run starts, so a value
+    that cannot be read is a failed run. It used to come back as ``None``, which reads
+    as "nothing is stored yet" and appends the whole source again.
+    """
     layer = unique_name("zzid")
     address = write_table(f"{layer}/w.parquet", pa.table({"x": [1]}))
 
     conn = duckdb_engine.get_connection()
     try:
-        value = IngestEngine._max_watermark(
-            conn, address, 'x") AS v FROM (SELECT 42 AS x) --'
-        )
+        with pytest.raises(RuntimeError, match="watermark") as failure:
+            IngestEngine._max_watermark(
+                conn, address, 'x") AS v FROM (SELECT 42 AS x) --'
+            )
+        # The crafted name appears in DuckDB's binder message, but it never becomes the
+        # answer: the read is refused, so no watermark is returned at all.
+        assert "Refusing to run" in str(failure.value)
     finally:
         conn.close()
 
     drop_schema(layer)
-    assert value is None, "a crafted column name must not become a query"
