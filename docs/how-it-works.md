@@ -17,7 +17,7 @@ where the seams sit. It describes the shipped code, not an aspiration.
 | `backend/alembic/` | Migrations. They run on startup, so an upgrade is "replace the code, restart". |
 | `frontend/src/` | React 18 + Vite SPA. Monaco for SQL and dbt, xterm for the terminal, lazy-loaded. |
 | `git_repo/` | The code the platform runs: `scripts/`, `notebooks/`, `dbt_project/`. |
-| `data/` | `obelisk.db` (the brain) and `lakehouse/<folder>/<table>.parquet` (the warehouse). |
+| `data/` | `obelisk.db` (the brain) and `lakehouse/` (DuckLake catalog at `.obelisk/catalog.sqlite` + Parquet partitions). |
 
 ## The seams
 
@@ -28,19 +28,21 @@ bypassed a seam.
 ### 1. Storage (`core/storage.py`)
 
 `STORAGE_URI` resolves to one `warehouse_storage()` object that lists, reads, writes and
-deletes Parquet. Writes are atomic (one file, one replace), which is what makes "the file is
-the table" safe to build on: a reader sees the old file or the new one.
+deletes Parquet. Writes are atomic (staging files, atomic swap), which is what makes "the file is
+the table" safe to build on: a reader sees the old state or the new one.
 
 Nothing else in the codebase touches the filesystem for warehouse data.
 
-### 2. The catalog is a projection (`core/catalog.py`)
+### 2. DuckLake Catalog (`core/catalog.py`)
 
-There is no `layers` table and no registration step. A table's address *is* its path, and
-`scan()` walks the storage seam to build the catalog. A table can therefore never be listed
-with no file behind it, and deleting a file deletes the table.
+The lakehouse runs on DuckLake: a SQLite-backed catalog at `data/lakehouse/.obelisk/catalog.sqlite`
+paired with multi-file Parquet partitions on disk. DuckDB attaches to the catalog directly
+(`ATTACH 'lakehouse/.obelisk/catalog.sqlite' AS lakehouse (TYPE SQLITE)`), providing zero-copy metadata
+reads, unified schema introspection, and ACID write semantics without external metastores.
 
-`catalog_objects` still exists as a projection of *external* sources (what `reconcile`
-discovered on a connection), and is rebuilt rather than hand-maintained.
+The catalog projection walks folders and schemas, projecting external sources and DuckLake tables
+consistently into Query Studio, dbt Studio, and the SDK. `catalog_objects` tracks projections of
+external sources discovered on connections.
 
 ### 3. Query (`engines/duckdb_engine.py`)
 
@@ -87,8 +89,8 @@ A connection is data, not behaviour. `resolve_source` answers how a source is re
 
 | Driver | Meaning |
 | :--- | :--- |
-| `attach` | DuckDB reads it live (Postgres): zero copy, always fresh, read-only. |
-| `sdk` | Reachable only through a client library (MySQL, Oracle, SQL Server, MongoDB): rows must be pulled. |
+| `attach` | DuckDB reads it live (Postgres, MySQL, MariaDB, MongoDB): zero copy, always fresh, read-only. |
+| `sdk` | Reachable only through a client library (Oracle, SQL Server): rows must be pulled. |
 | `http` | A REST/ERP endpoint: one request per pull. |
 
 Adding a driver is an edit in one place, and every caller inherits it.
@@ -171,7 +173,7 @@ and stopped by the application lifespan.
 Stated plainly, because a document that only lists strengths is not useful.
 
 - **SQLite is the brain.** One writer, WAL mode, fine for a single host; not a cluster.
-- **Incremental upsert rewrites the whole table file.** Cheap at gigabytes, not at terabytes.
-- **Auth is a seam, not a feature.** No users table, no login screen, no roles.
+- **Incremental upsert rewrites the target table partition.** Efficient for tens of gigabytes; partitioned splits are planned for multi-terabyte tables.
+- **Single-node scale ceiling.** Sized and validated for up to 1 TB out-of-core on a single workstation or server.
 - **Scripts and notebooks run unsandboxed** as the backend's operating-system user.
 - **CI is parked** while the platform is in development; the local suite is the gate.

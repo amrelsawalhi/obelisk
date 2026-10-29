@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import os
 import threading
@@ -7,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, Depends, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -21,6 +23,7 @@ from app.core.security import (  # noqa: F401
     DEFAULT_EXPIRATION_SECONDS,
     auth_enabled,
     create_token,
+    peer_is_trusted_proxy,
     verify_token,
 )
 
@@ -72,10 +75,24 @@ def get_current_user(request: Request) -> Dict[str, Any]:
 _LOGIN_ATTEMPTS_LOCK = threading.Lock()
 _LOGIN_ATTEMPTS: Dict[str, list[float]] = {}
 _LOGIN_LOCKED_UNTIL: Dict[str, float] = {}
+_SETUP_LOCK = asyncio.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else None
+    if not peer:
+        return "unknown"
+    if peer_is_trusted_proxy(peer):
+        forwarded = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+        if forwarded:
+            hops = [part.strip() for part in forwarded.split(",") if part.strip()]
+            if hops:
+                return hops[-1]
+    return peer
 
 
 def _login_key(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+    return _client_ip(request)
 
 
 def _prune_login_attempts(window: float = 600.0) -> None:
@@ -107,38 +124,47 @@ async def initial_setup(
     """Initial admin setup. Allowed ONLY when the users table is completely empty."""
     response.headers["Cache-Control"] = "no-store"
 
-    session, must_close = await _resolve_session(db)
-    try:
-        user_count = await session.scalar(select(func.count()).select_from(User))
-        if user_count and user_count > 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Initial setup has already been completed. Please sign in.",
-            )
-
-        clean_user = req.username.strip()
-        if not clean_user or len(clean_user) < 3:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username must be at least 3 characters long.",
-            )
-        if len(req.password) < 8:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Password must be at least 8 characters long.",
-            )
-
-        user = User(
-            username=clean_user,
-            password_hash=hash_password(req.password),
-            role="admin",
+    clean_user = req.username.strip()
+    if not clean_user or len(clean_user) < 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username must be at least 3 characters long.",
         )
-        session.add(user)
-        await session.commit()
-        await session.refresh(user)
-    finally:
-        if must_close:
-            await session.close()
+    if len(req.password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters long.",
+        )
+
+    async with _SETUP_LOCK:
+        session, must_close = await _resolve_session(db)
+        try:
+            user_count = await session.scalar(select(func.count()).select_from(User))
+            if user_count and user_count > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Initial setup has already been completed. Please sign in.",
+                )
+
+            hashed = await asyncio.to_thread(hash_password, req.password)
+            user = User(
+                username=clean_user,
+                password_hash=hashed,
+                role="admin",
+            )
+            session.add(user)
+            try:
+                await session.commit()
+                await session.refresh(user)
+            except IntegrityError:
+                await session.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Initial setup has already been completed. Please sign in.",
+                )
+        finally:
+            if must_close:
+                await session.close()
 
     token = create_token(
         {"sub": user.username, "role": user.role},
@@ -201,7 +227,9 @@ async def login(
     username = req.username.strip()
 
     if user:
-        authenticated = verify_password(req.password, user.password_hash)
+        authenticated = await asyncio.to_thread(
+            verify_password, req.password, user.password_hash
+        )
         user_role = user.role
         username = user.username
     elif (
@@ -291,7 +319,7 @@ async def auth_status(db: AsyncSession = Depends(get_db)):
 
     return {
         "auth_enabled": auth_enabled(),
-        "needs_setup": (user_count or 0) == 0,
+        "needs_setup": auth_enabled() and (user_count or 0) == 0,
         "session_ttl_seconds": int(
             getattr(settings, "SESSION_TTL_SECONDS", DEFAULT_EXPIRATION_SECONDS)
         ),

@@ -405,18 +405,59 @@ class DuckDBEngine:
         return self._normalize_parquet_paths(self._rewrite_names(sql, names))
 
     @staticmethod
+    def _assert_safe_query_paths(sql: str) -> None:
+        """Blocks arbitrary file reading/writing outside allowed workspace roots."""
+        pattern = re.compile(
+            r"\b(?:read_csv|read_csv_auto|read_json|read_text|read_blob|copy\s+.*?to)\s*\(\s*['\"]([^'\"]+)['\"]",
+            re.IGNORECASE,
+        )
+        lakehouse_root = settings.lakehouse_root_path.resolve()
+        temp_root = settings.duckdb_temp_path.resolve()
+        git_root = settings.git_repo_path.resolve()
+
+        for match in pattern.finditer(sql):
+            raw_path = match.group(1).strip()
+            if raw_path.startswith(("http://", "https://", "s3://", "gs://", "abfss://")):
+                continue
+            if ".." in raw_path or Path(raw_path).is_absolute() or re.match(r"^[A-Za-z]:[/\\]", raw_path):
+                resolved = Path(raw_path).resolve()
+                is_allowed = False
+                for root in (lakehouse_root, temp_root, git_root):
+                    try:
+                        resolved.relative_to(root)
+                        is_allowed = True
+                        break
+                    except ValueError:
+                        continue
+                if not is_allowed:
+                    raise PermissionError(f"Access to path '{raw_path}' is forbidden: outside allowed workspace storage.")
+
+    @staticmethod
     def _normalize_parquet_paths(sql: str) -> str:
         """Turns a relative ``read_parquet('...')`` argument into an absolute path."""
         lakehouse_root_posix = settings.lakehouse_root_path.resolve().as_posix()
+        lakehouse_root = settings.lakehouse_root_path.resolve()
+        temp_root = settings.duckdb_temp_path.resolve()
+        git_root = settings.git_repo_path.resolve()
 
         def _replace_parquet_path(m: re.Match) -> str:
             path_str = m.group(1).strip()
-            if (
-                path_str.startswith(("http://", "https://", "s3://", "gs://", "abfss://"))
-                or Path(path_str).is_absolute()
-                or re.match(r"^[A-Za-z]:[/\\]", path_str)
-            ):
+            if path_str.startswith(("http://", "https://", "s3://", "gs://", "abfss://")):
                 return f"read_parquet('{path_str}')"
+            if Path(path_str).is_absolute() or re.match(r"^[A-Za-z]:[/\\]", path_str):
+                resolved = Path(path_str).resolve()
+                is_allowed = False
+                for root in (lakehouse_root, temp_root, git_root):
+                    try:
+                        resolved.relative_to(root)
+                        is_allowed = True
+                        break
+                    except ValueError:
+                        continue
+                if not is_allowed:
+                    raise PermissionError(f"Access to path '{path_str}' is forbidden: outside allowed workspace storage.")
+                return f"read_parquet('{resolved.as_posix()}')"
+
             clean_subpath = re.sub(
                 r"^(?:/?data/lakehouse/|lakehouse/)", "", path_str, flags=re.IGNORECASE
             )
@@ -438,6 +479,7 @@ class DuckDBEngine:
         on_connection: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Executes a SQL query against DuckDB in a thread-safe synchronous runner."""
+        self._assert_safe_query_paths(sql)
         start_time = time.time()
         storage_path = self._ensure_storage()
         with self._acquire_heavy_slot():

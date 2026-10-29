@@ -339,7 +339,7 @@ export const IngestActivityDock: React.FC = () => {
         {showLogs && (
           <div
             ref={terminalRef}
-            className="bg-slate-950 text-slate-200 font-mono text-[11px] p-3 rounded-xl overflow-y-auto flex-1 space-y-1 shadow-inner border border-slate-800 custom-scrollbar select-text"
+            className="bg-slate-950 text-slate-100 font-mono text-[11px] p-3 rounded-xl overflow-y-auto flex-1 space-y-1 shadow-inner border border-slate-800 custom-scrollbar select-text"
           >
             {activeLogs.length === 0 ? (
               <div className="text-slate-500 italic py-2">
@@ -358,10 +358,10 @@ export const IngestActivityDock: React.FC = () => {
                       isError
                         ? 'text-rose-400 font-semibold'
                         : isCheck
-                        ? 'text-emerald-400 font-semibold'
+                        ? 'text-white font-semibold'
                         : isStart
                         ? 'text-sky-300'
-                        : 'text-slate-300'
+                        : 'text-slate-100'
                     }`}
                   >
                     {log}

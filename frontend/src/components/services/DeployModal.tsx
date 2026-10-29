@@ -384,7 +384,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({
                 )}
                 {progress?.logs && progress.logs.length > 0 ? (
                   progress.logs.map((line, idx) => (
-                    <div key={idx} className="text-slate-300 whitespace-pre-wrap leading-relaxed">
+                    <div key={idx} className="text-slate-100 whitespace-pre-wrap leading-relaxed">
                       {line}
                     </div>
                   ))
@@ -393,7 +393,7 @@ export const DeployModal: React.FC<DeployModalProps> = ({
                 ) : null}
 
                 {isCompleted && (
-                  <div className="text-emerald-400 font-semibold pt-1">
+                  <div className="text-white font-semibold pt-1">
                     ✓ Deployment completed successfully. Ready on port {hostPort}.
                   </div>
                 )}

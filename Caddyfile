@@ -4,8 +4,20 @@
 }
 
 :80 {
+    # Global security headers
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
     # Obelisk REST API Backend
     handle /api/* {
+        reverse_proxy obelisk-core:8000
+    }
+
+    # WebSockets (telemetry, events, etc.)
+    handle /ws/* {
         reverse_proxy obelisk-core:8000
     }
 

@@ -16,12 +16,25 @@ the canonical list; this page explains what each one does and how the installs d
 | `OBELISK_SESSION_SECURE_COOKIE` | `0` | `1` marks the session cookie `Secure`. Off for LAN HTTP installs; on for anything served over HTTPS. |
 | `OBELISK_SESSION_TTL_SECONDS` | `604800` | Session lifetime. A stolen cookie is valid until it expires. |
 | `OBELISK_AUTH_MAX_FAILED_ATTEMPTS` / `OBELISK_AUTH_LOCKOUT_SECONDS` | `10` / `300` | Login brute-force protection: after N failures from one address, that address is locked out for the given seconds. |
-| `OBELISK_TRUSTED_PROXIES` | empty | Comma-separated IPs/CIDRs of reverse proxies whose `X-Forwarded-For` may be believed (used by the unauthenticated terminal gate). |
+| `OBELISK_ALLOW_DEFAULT_CREDENTIALS` | `0` | Allows running with sample master key and default password in test/dev without startup abort. |
+| `OBELISK_TRUSTED_PROXIES` | empty | Comma-separated IPs/CIDRs of reverse proxies whose `X-Forwarded-For` may be believed (used by the unauthenticated terminal gate and rate limiting). |
 | `OBELISK_ALLOWED_ORIGINS` | empty | Extra browser origins allowed to open sockets and send the session cookie, comma separated. Same-host, loopback and Vite's dev server are always allowed. Set this when a reverse proxy rewrites `Host`. |
 | `OBELISK_TERMINAL` | `1` (compose: `0`) | `0` disables the in-app terminal (a real shell on the host) without touching code. While auth is off, the socket only accepts a loopback client. |
 | `MARIMO_HOST` | `127.0.0.1` (compose: `0.0.0.0`) | Where the headless notebook server binds. In the container it binds all interfaces so the Caddy gateway can reach it; the gateway authenticates `/notebooks/*` via `forward_auth` first, and the port is never published on the host. Outside the container keep it loopback unless something in front authenticates first. |
 | `MARIMO_SESSION_TTL_SECONDS` | `600` | How long a notebook kernel stays alive after its browser tab disconnects (`0` = never expire). |
+| `OBELISK_SERVICE_BIND_HOST` | `127.0.0.1` | Network interface to bind managed Docker database and service containers. |
 | `OBELISK_NET` | `obelisk_net` | Docker network used for companion services. |
+| `DUCKDB_THREADS` | auto | DuckDB worker threads limit. |
+| `DUCKDB_TEMP_SIZE_LIMIT` | `50GB` | Maximum disk spill headroom allocated for out-of-core DuckDB operations. |
+| `DUCKDB_MAX_QUERY_ROWS` | `10000` | Display limit for interactive JSON query studio responses. Full results stream to disk for exports. |
+| `DUCKDB_MAX_CONCURRENT_HEAVY` | `4` | Maximum concurrent heavy DuckDB queries permitted before queuing on the slot semaphore. |
+| `OBELISK_INGEST_MAX_CONCURRENT` | `2` | Maximum concurrent table ingestion jobs. |
+| `OBELISK_ALLOW_COMMUNITY_EXTENSIONS` | `true` | Allows unsigned community extensions (such as the Mongo scanner) in DuckDB. |
+| `OBELISK_SDK_EAGER_WARN_BYTES` | `2147483648` (2 GiB) | SDK eager reader (`to_polars`, `to_arrow`) memory warning threshold. |
+| `OBELISK_SDK_EAGER_REFUSE_BYTES` | `0` (dynamic) | SDK eager reader memory refusal ceiling (`0` derives safe ceiling from host RAM). |
+| `OBELISK_SDK_QUERY_ROW_LIMIT` | `1000000` | Maximum rows `obelisk.query()` materializes before raising and pointing to `iter_batches()`. |
+| `DOCKER_HOST` | unset | Custom Docker daemon socket path. |
+| `SPARK_REMOTE_URL` | unset | Remote Spark Connect cluster URL (e.g., `sc://...`). |
 
 ## Ports
 
@@ -38,7 +51,7 @@ the canonical list; this page explains what each one does and how the installs d
 | Path | Contents |
 | :--- | :--- |
 | `data/obelisk.db` (+ `-wal`, `-shm`) | The control-plane database. Back this up; everything else is rebuildable. |
-| `data/lakehouse/<folder>/<table>.parquet` | The warehouse itself. One file per table, one directory per folder. |
+| `data/lakehouse/` | Parquet warehouse tables and DuckLake SQLite catalog at `.obelisk/catalog.sqlite`. |
 | `git_repo/` | Code the platform runs: `scripts/`, `notebooks/`, `dbt_project/`. Version-control it. |
 
 ## Installs

@@ -11,7 +11,7 @@ export const AuthGate: React.FC<{ children: React.ReactNode }> = ({ children }) 
   const { status, authEnabled } = useAuth();
   const location = useLocation();
 
-  if (authEnabled && status === 'loading') {
+  if (status === 'loading') {
     return (
       <div className="h-screen flex items-center justify-center bg-white">
         <div className="flex items-center gap-2 text-xs text-slate-500">

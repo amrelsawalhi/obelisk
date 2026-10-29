@@ -161,8 +161,13 @@ class DockerManager:
             env = dict(bp.env)
             if environment:
                 env.update(environment)
+            bind_host = getattr(
+                settings,
+                "OBELISK_SERVICE_BIND_HOST",
+                os.environ.get("OBELISK_SERVICE_BIND_HOST", "127.0.0.1"),
+            )
             port_bindings = {
-                c_port: ("0.0.0.0", h_port) for c_port, h_port in bp.ports.items()
+                c_port: (bind_host, h_port) for c_port, h_port in bp.ports.items()
             }
             if ports:
                 port_bindings.update(ports)

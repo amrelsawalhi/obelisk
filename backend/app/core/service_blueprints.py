@@ -99,9 +99,18 @@ _BLUEPRINTS: List[ServiceBlueprint] = [
         primary_host_port=8123,
         volume_name="obelisk_clickhouse_data",
         volume_path="/var/lib/clickhouse",
+        env={
+            "CLICKHOUSE_USER": "default",
+            "CLICKHOUSE_PASSWORD": "__GENERATED__",
+            "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT": "1",
+        },
         readiness=ReadinessProbe(kind="http", host_port=8123, path="/ping", expected_status=200),
         probe_timeout_seconds=90,
         image_size_gb=2.5,
+        credential_username="default",
+        credential_database="default",
+        provides="clickhouse",
+        default_connection_name="obelisk_clickhouse",
     ),
     ServiceBlueprint(
         name="redpanda",

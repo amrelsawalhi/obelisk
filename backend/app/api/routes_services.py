@@ -551,6 +551,10 @@ async def deploy_local_service(
                 # Consumed by the `superset fab create-admin` post-start command
                 env_override["SUPERSET_ADMIN_USER"] = username
                 env_override["SUPERSET_ADMIN_PASSWORD"] = password
+            elif svc_name == "clickhouse":
+                env_override["CLICKHOUSE_USER"] = username
+                env_override["CLICKHOUSE_PASSWORD"] = password
+                env_override["CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT"] = "1"
 
             credentials = DeployedCredentials(username=username, password=password,
                                               database=database, host="localhost", port=host_port)

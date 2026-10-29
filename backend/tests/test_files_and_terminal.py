@@ -28,6 +28,18 @@ async def test_file_manager_crud_and_security():
         resp_sec2 = await client.get("/api/files/content", params={"path": "../backend/app/main.py"})
         assert resp_sec2.status_code == 403
 
+        # Sensitive and protected files security checks (should return 403)
+        resp_env = await client.get("/api/files/content", params={"path": ".env"})
+        assert resp_env.status_code == 403
+        assert "Access denied" in resp_env.json()["detail"]
+
+        resp_env_sub = await client.get("/api/files/content", params={"path": "subdir/.env.local"})
+        assert resp_env_sub.status_code == 403
+
+        resp_prot = await client.post("/api/files/save", json={"path": "notebooks/obelisk.py", "content": "hacked"})
+        assert resp_prot.status_code == 403
+        assert "protected system file" in resp_prot.json()["detail"]
+
         # 3. Create a new test file
         test_file_path = "scripts/_test_crud_unit.py"
         resp_create = await client.post("/api/files/create", json={"path": test_file_path, "type": "file"})

@@ -779,7 +779,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             {/* Modal Header */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-slate-900">
               <div className="flex items-center gap-2.5 min-w-0">
-                <Terminal className="w-4 h-4 text-emerald-400 shrink-0" />
+                <Terminal className="w-4 h-4 text-sky-400 shrink-0" />
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-bold text-slate-100 font-mono truncate">
@@ -811,8 +811,8 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
                 >
                   {copiedLogs ? (
                     <>
-                      <Check className="w-3 h-3 text-emerald-400" />
-                      <span className="text-emerald-400">Copied</span>
+                      <Check className="w-3 h-3 text-sky-400" />
+                      <span className="text-sky-400">Copied</span>
                     </>
                   ) : (
                     <>
@@ -855,7 +855,7 @@ export const HomeView: React.FC<HomeViewProps> = ({ onNavigate }) => {
             </div>
 
             {/* Modal Body */}
-            <pre className="flex-1 overflow-auto p-4 text-[11px] leading-relaxed font-mono text-emerald-300/90 bg-slate-950 whitespace-pre-wrap select-text custom-scrollbar">
+            <pre className="flex-1 overflow-auto p-4 text-[11px] leading-relaxed font-mono text-slate-100 bg-slate-950 whitespace-pre-wrap select-text custom-scrollbar">
               {runLogsLoading ? (
                 <div className="flex items-center gap-2 text-slate-400">
                   <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />

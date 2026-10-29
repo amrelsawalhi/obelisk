@@ -37,20 +37,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       try {
         const status = await api.getAuthStatus();
         if (cancelled) return;
-        if (status.needs_setup) {
-          setState({
-            status: 'needs_setup',
-            user: null,
-            authEnabled: true,
-          });
-          return;
-        }
         if (!status.auth_enabled) {
           // A single-operator install: everyone is the local admin, no login wall.
           setState({
             status: 'authenticated',
             user: { username: 'local', role: 'admin' },
             authEnabled: false,
+          });
+          return;
+        }
+        if (status.needs_setup) {
+          setState({
+            status: 'needs_setup',
+            user: null,
+            authEnabled: true,
           });
           return;
         }

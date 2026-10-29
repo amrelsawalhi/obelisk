@@ -1734,11 +1734,22 @@ class PipelineEngine:
         headers = render(args.get("headers") or {})
         url = render_plain_step_refs(step.target, parents)
         log.append(f"$ {method} {url}")
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.request(method, url, json=body, headers=headers)
-        log.append(f"HTTP {response.status_code}: {response.text[:2000]}")
-        if response.status_code >= 400:
-            raise RuntimeError(f"Webhook returned HTTP {response.status_code}.")
+        allow_failure = bool(args.get("allow_failure") or args.get("ignore_error"))
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.request(method, url, json=body, headers=headers)
+            log.append(f"HTTP {response.status_code}: {response.text[:2000]}")
+            if response.status_code >= 400:
+                if allow_failure:
+                    log.append(f"Webhook returned HTTP {response.status_code}, ignored because allow_failure=true.")
+                    return {}
+                raise RuntimeError(f"Webhook returned HTTP {response.status_code}.")
+            return {"status": response.status_code, "body": response.text}
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            if allow_failure:
+                log.append(f"Webhook connection failed ({exc}), ignored because allow_failure=true.")
+                return {}
+            raise
 
     async def _run_raw_sql(
         self,

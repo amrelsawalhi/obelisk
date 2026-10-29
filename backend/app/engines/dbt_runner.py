@@ -1251,12 +1251,17 @@ class DbtRunner:
             # The lake's data path is where its Parquet goes; the profile passes it on
             # attach so a fresh install lands in the same directory as ingestion does.
             env["DBT_LAKEHOUSE_DATA_PATH"] = settings.duckdb_storage_path
-            slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
-            env["DBT_DUCKDB_MEMORY_LIMIT"] = advisor.get_duckdb_memory_limit(slots)
+            # In dbt, DuckDB runs on a dedicated database instance (dbt.duckdb) where
+            # both memory_limit and max_temp_directory_size govern the whole process.
+            # Sizing with concurrent_slots=1 ensures multi-million-row mart transforms
+            # (which aggregate 37M rows with quantiles and window functions across 2 threads)
+            # have sufficient memory (at least 4GB) and spill headroom rather than starving on 1/slots.
+            dbt_mem = advisor.get_duckdb_memory_limit(concurrent_slots=1)
+            env["DBT_DUCKDB_MEMORY_LIMIT"] = dbt_mem if (int(dbt_mem.rstrip("GB")) >= 4) else "4GB"
             env["DBT_DUCKDB_MAX_TEMP_SIZE"] = advisor.get_duckdb_temp_limit(
                 settings.duckdb_temp_path.as_posix(),
                 settings.DUCKDB_TEMP_SIZE_LIMIT,
-                slots,
+                concurrent_slots=1,
             )
 
         return env
@@ -1552,8 +1557,7 @@ class DbtRunner:
             res["target"] = target
             return res
         else:
-            from app.engines.duckdb_engine import DuckDBEngine
-            duck_engine = DuckDBEngine()
+            from app.engines.duckdb_engine import duckdb_engine as duck_engine
             wrapped_sql = f"SELECT * FROM (\n{compiled_sql}\n) AS _subq LIMIT {limit};"
             res = duck_engine.execute_query(wrapped_sql)
             res["model_name"] = clean_name

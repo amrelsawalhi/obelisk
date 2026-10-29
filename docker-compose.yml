@@ -6,7 +6,7 @@ services:
     container_name: obelisk-core
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
       # 2718 is deliberately not published. Marimo runs with --no-token (an
       # unauthenticated editor, i.e. remote code execution) and binds loopback inside
       # this container; publishing it put that editor on the host's network.

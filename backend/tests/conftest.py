@@ -116,7 +116,7 @@ def enforce_anti_mock_ast_check():
                             )
 
                 # Check for monkeypatch fixture parameter in test functions
-                elif isinstance(node, ast.FunctionDef):
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     for arg in node.args.args:
                         if arg.arg == "monkeypatch":
                             pytest.fail(

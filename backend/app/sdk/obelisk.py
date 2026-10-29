@@ -40,9 +40,8 @@ from app.core.catalog import (
 )
 from app.core.resource_advisor import advisor
 from app.core.storage import warehouse_storage
-from app.engines.duckdb_engine import DuckDBEngine
+from app.engines.duckdb_engine import duckdb_engine
 
-duckdb_engine = DuckDBEngine()
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -50,6 +49,8 @@ __all__ = [
     "query",
     "query_arrow",
     "lazy_query",
+    "iter_batches",
+    "LazyQueryBuilder",
     "save",
     "materialize_sql",
     "spark",

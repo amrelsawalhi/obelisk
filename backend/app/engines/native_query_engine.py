@@ -265,6 +265,13 @@ class NativeQueryEngine:
                         dict(zip(cols, (_json_serializable(v) for v in raw))) for raw in raw_rows
                     ]
 
+                    if truncated:
+                        try:
+                            # Abort connection immediately to avoid draining remaining socket buffer
+                            conn.close()
+                        except Exception:
+                            pass
+
                     return {
                         "columns": cols,
                         "rows": rows,

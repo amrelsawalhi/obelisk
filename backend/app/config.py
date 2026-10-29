@@ -330,6 +330,9 @@ class Settings(BaseSettings):
     # Docker network and host
     OBELISK_NET: str = "obelisk_net"
     DOCKER_HOST: str | None = Field(default_factory=lambda: os.getenv("DOCKER_HOST", None))
+    OBELISK_SERVICE_BIND_HOST: str = Field(
+        default_factory=lambda: os.getenv("OBELISK_SERVICE_BIND_HOST", "127.0.0.1")
+    )
 
     # Optional remote Spark cluster URL (e.g., sc://...)
     SPARK_REMOTE_URL: str | None = Field(default_factory=lambda: os.getenv("SPARK_REMOTE_URL", None))

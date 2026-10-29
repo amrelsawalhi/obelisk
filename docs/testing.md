@@ -5,7 +5,7 @@
 There are no mocks in this suite, and the suite enforces that on itself: an autouse fixture
 in `tests/conftest.py` parses every file under `backend/app` and `backend/tests` with `ast`
 and fails the session if it finds `unittest.mock`, `pytest_mock`, `MagicMock`, `AsyncMock`,
-`Mock`, `patch` or a `monkeypatch` parameter.
+`Mock`, `patch` or a `monkeypatch` parameter in either synchronous or asynchronous test functions.
 
 So the tests exercise real DuckDB relations, real Parquet files, a real SQLite database, the
 real FastAPI app and real child processes. When a dependency genuinely is not available on
@@ -29,7 +29,7 @@ lifecycle test) delete what they created.
 ```bash
 cd backend
 python -m pytest tests -q
-# 210 passed, 2 skipped when this was written
+# 470 passed, 15 skipped across 485 collected tests
 ```
 
 On Windows the two skips are usually the Docker-container tests and the Spark path (no JVM);

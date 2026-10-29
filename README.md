@@ -27,11 +27,10 @@ it in-process with DuckDB, and runs dbt, notebooks and scripts on a schedule. No
 warehouse, no cluster to operate, no egress bill.
 
 - **In-process DuckDB over Parquet.** Vectorized analytical SQL straight off the files.
-- **The catalog is a projection.** A table address *is* its folder (`lakehouse.raw.orders`).
-  Nothing is registered, so a table can never be listed with no file behind it.
+- **The catalog is powered by DuckLake.** Backed by `data/lakehouse/.obelisk/catalog.sqlite`, pairing SQLite metadata with multi-file Parquet partitions for zero-copy queries and atomic commits.
 - **One orchestrator, in-process.** Scripts, notebooks, dbt, raw SQL, webhooks and other
   pipelines, wired with `success` / `failure` / `completion` / `skipped` edges.
-- **Federation when you need it.** Postgres sources attach live into DuckDB, so one query
+- **Federation when you need it.** External sources (Postgres, MySQL, MariaDB, and MongoDB) attach live into DuckDB, so one query
   can join them to lakehouse tables. The editor and every pipeline step share the resolver.
 - **Batteries included.** Monaco SQL studio, dbt Studio with lineage, reactive Marimo
   notebooks stored as `.py`, an encrypted vault, and hardware-aware container sizing.
@@ -40,9 +39,9 @@ warehouse, no cluster to operate, no egress bill.
 
 Under active development.
 
-**No authentication is enforced yet.** The seam exists (`OBELISK_AUTH_ENABLED`) and every
-request already resolves a principal, but until you turn it on, treat the API as
-trusted-network only.
+**Authentication & Access Control.** Obelisk includes full session authentication (`OBELISK_AUTH_ENABLED=1` in Docker Compose),
+an initial setup wizard (`/setup`), scrypt password hashing, and role-based session tokens. On standalone single-operator checkouts,
+`OBELISK_AUTH_ENABLED=0` allows local access without a login wall.
 
 The in-app terminal is a **real shell on the host** -- origin-gated, session-capped and
 audited, but a shell. Set `OBELISK_TERMINAL=0` to remove it on a shared deployment.
@@ -76,7 +75,7 @@ Postgres on `:5434` and MongoDB on `:27018`.
 
 **Catalog and ingest.** Introspect lakehouse folders and connected databases, then stream
 tables in as Snappy Parquet with `snapshot`, `incremental` (watermark) or `upsert`
-(primary key) semantics. Attachable sources (Postgres) can also be queried live, uncopied.
+(primary key) semantics. Attachable sources (Postgres, MySQL, MariaDB, and MongoDB) can also be queried live, uncopied.
 
 **Query Studio.** DuckDB in-process, CSV and Parquet export, a virtualized grid, and
 federated joins in one statement:

@@ -35,6 +35,7 @@ tbl.to_arrow()          # PyArrow Table      (eager)
 tbl.to_df()             # pandas DataFrame   (eager)
 tbl.to_duckdb()         # DuckDB relation (optionally pass a connection)
 tbl.to_spark()          # Spark DataFrame via Arrow, when a JVM is available
+tbl.iter_batches()      # Generator yielding PyArrow RecordBatches (streaming)
 ```
 
 The eager three load the whole table into memory, so they are guarded: a warning at 2 GB of
@@ -70,6 +71,17 @@ df = obelisk.query("""
 
 Use `query_arrow` when the next hop is Arrow-native (Spark, Polars, another engine) and
 you would rather not round-trip through a DataFrame.
+
+## `iter_batches(sql, batch_size=100_000)` / `tbl.iter_batches(batch_size=100_000)`
+
+Streams query results or table rows out of DuckDB as PyArrow `RecordBatch` instances
+in a generator loop. Table names and external sources resolve identically to `query()`.
+This keeps memory usage constant and small, enabling sub-terabyte out-of-core pipelines:
+
+```python
+for batch in obelisk.iter_batches("SELECT * FROM lakehouse.raw.orders", batch_size=50_000):
+    process_batch(batch)
+```
 
 ## `save(df, target) -> dict`
 

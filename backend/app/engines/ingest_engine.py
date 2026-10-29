@@ -18,6 +18,7 @@ import json
 import logging
 from pathlib import Path
 import re
+import threading
 import uuid
 from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Sequence
 
@@ -203,6 +204,21 @@ def _order_by(column: Optional[str], limit: Optional[int], quote) -> str:
     if not column or not bounded:
         return ""
     return f" ORDER BY {quote(column)} ASC"
+
+
+_SCHEMA_CREATE_LOCK = threading.Lock()
+
+
+def _ensure_schema(conn, schema: str) -> None:
+    """Ensures schema exists in DuckLake catalog safely without concurrent transaction conflicts."""
+    with _SCHEMA_CREATE_LOCK:
+        try:
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema)};")
+        except Exception as exc:
+            if "another transaction has created a schema with this name already" in str(exc):
+                pass
+            else:
+                raise
 
 
 class IngestCancelled(RuntimeError):
@@ -888,7 +904,7 @@ class IngestEngine:
             registered_load: Optional[str] = None
             try:
                 self._raise_if_cancelled(should_cancel)
-                conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema)};")
+                _ensure_schema(conn, schema)
                 exists = self._exists(conn, schema, table_stem)
 
                 # Headroom for the copy this run is about to make. A run with a row limit

@@ -21,7 +21,24 @@ IGNORED_NAMES = {
     ".vscode",
     "target",
     "logs",
+    ".env",
 }
+
+PROTECTED_PATHS = {
+    "notebooks/obelisk.py",
+}
+
+
+def _is_ignored_name(name: str) -> bool:
+    return name in IGNORED_NAMES or name == ".env" or name.startswith(".env.")
+
+
+def _assert_not_protected(norm_rel: str) -> None:
+    if norm_rel in PROTECTED_PATHS or norm_rel.rstrip("/") in PROTECTED_PATHS:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied: '{norm_rel}' is a protected system file",
+        )
 
 
 MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB safety limit for web editor
@@ -88,11 +105,18 @@ def _resolve_safe_path(rel_path: str) -> tuple[Path, str]:
 
     # Security check: must reside inside root
     try:
-        target.relative_to(root)
+        rel_obj = target.relative_to(root)
     except ValueError:
         raise HTTPException(status_code=403, detail="Access denied: path is outside git_repo")
 
-    norm_rel = target.relative_to(root).as_posix()
+    # Reject any path containing ignored or sensitive segments
+    for part in rel_obj.parts:
+        if _is_ignored_name(part):
+            raise HTTPException(
+                status_code=403, detail=f"Access denied: access to '{part}' is forbidden"
+            )
+
+    norm_rel = rel_obj.as_posix()
     return target, norm_rel
 
 
@@ -107,7 +131,13 @@ def _build_tree(directory: Path, root: Path) -> list[dict]:
         return items
 
     for entry in entries:
-        if entry.name in IGNORED_NAMES or entry.name.endswith(".pyc"):
+        if _is_ignored_name(entry.name) or entry.name.endswith(".pyc"):
+            continue
+
+        try:
+            resolved_entry = entry.resolve()
+            resolved_entry.relative_to(root)
+        except (ValueError, RuntimeError):
             continue
 
         rel_posix = entry.relative_to(root).as_posix()
@@ -226,6 +256,7 @@ def save_file(req: SaveFileRequest):
     timestamp, so a second editor is told rather than silently overwritten.
     """
     target, norm_rel = _resolve_safe_path(req.path)
+    _assert_not_protected(norm_rel)
 
     if target.is_dir():
         raise HTTPException(status_code=400, detail="Target path is a directory, not a file")
@@ -253,6 +284,7 @@ def create_file_or_dir(req: CreateFileRequest):
     Creates a new file or directory inside git_repo/.
     """
     target, norm_rel = _resolve_safe_path(req.path)
+    _assert_not_protected(norm_rel)
 
     if not norm_rel:
         raise HTTPException(status_code=400, detail="Cannot create root git_repo")
@@ -280,6 +312,8 @@ def rename_file(req: RenameFileRequest):
     """
     old_target, old_rel = _resolve_safe_path(req.old_path)
     new_target, new_rel = _resolve_safe_path(req.new_path)
+    _assert_not_protected(old_rel)
+    _assert_not_protected(new_rel)
 
     if not old_rel:
         raise HTTPException(status_code=400, detail="Cannot rename root git_repo")
@@ -306,6 +340,7 @@ def delete_file(req: DeleteFileRequest):
     Deletes a file or directory inside git_repo/.
     """
     target, norm_rel = _resolve_safe_path(req.path)
+    _assert_not_protected(norm_rel)
 
     if not norm_rel:
         raise HTTPException(status_code=400, detail="Cannot delete root git_repo")

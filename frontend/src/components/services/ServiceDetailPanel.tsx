@@ -453,7 +453,7 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
           <div className="bg-slate-950 rounded-xl border border-slate-700 w-full max-w-4xl h-[70vh] flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-700 bg-slate-900">
               <div className="flex items-center gap-2 text-xs font-mono text-slate-200">
-                <Terminal className="w-4 h-4 text-emerald-400" />
+                <Terminal className="w-4 h-4 text-sky-400" />
                 Logs — {service.name} (last 200 lines)
               </div>
               <div className="flex items-center gap-2">
@@ -461,7 +461,7 @@ export const ServiceDetailPanel: React.FC<ServiceDetailPanelProps> = ({
                 <button onClick={() => setLogsOpen(false)} className="px-2 py-1 rounded text-[11px] text-slate-300 hover:text-white hover:bg-slate-700">Close ✕</button>
               </div>
             </div>
-            <pre className="flex-1 overflow-auto p-4 text-[11px] leading-relaxed font-mono text-emerald-300 whitespace-pre-wrap">
+            <pre className="flex-1 overflow-auto p-4 text-[11px] leading-relaxed font-mono text-slate-100 whitespace-pre-wrap">
               {logsLoading ? 'Loading logs...' : logsText}
             </pre>
           </div>
