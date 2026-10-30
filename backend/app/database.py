@@ -1,5 +1,7 @@
 import asyncio
+import logging
 import os
+import sqlite3
 from pathlib import Path
 from typing import AsyncGenerator
 from sqlalchemy import event
@@ -12,6 +14,10 @@ from sqlalchemy.pool import NullPool
 from app.config import settings
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
+logger = logging.getLogger(__name__)
+
+_SQLITE_JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+_SQLITE_SYNCHRONOUS_MODES = {"OFF", "NORMAL", "FULL", "EXTRA"}
 
 
 def run_migrations() -> None:
@@ -61,17 +67,44 @@ engine = create_async_engine(
 
 @event.listens_for(engine.sync_engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
+    """Applies the operator-selected SQLite durability settings to every connection.
+
+    WAL is the right default for a local disk. Some virtual filesystems reject WAL's
+    shared-memory mapping or fsync; interpolating an unvalidated env value into a
+    PRAGMA is not acceptable, so only the documented modes are allowed. On failure the
+    error names the two settings that let an operator choose a supported mode.
     """
-    Enforce WAL journal mode and foreign key constraints on SQLite connections.
-    """
+    journal_mode = str(settings.SQLITE_JOURNAL_MODE or "WAL").strip().upper()
+    synchronous = str(settings.SQLITE_SYNCHRONOUS or "NORMAL").strip().upper()
+    if journal_mode not in _SQLITE_JOURNAL_MODES:
+        raise RuntimeError(
+            f"OBELISK_SQLITE_JOURNAL_MODE={journal_mode!r} is invalid; expected one of "
+            f"{sorted(_SQLITE_JOURNAL_MODES)}."
+        )
+    if synchronous not in _SQLITE_SYNCHRONOUS_MODES:
+        raise RuntimeError(
+            f"OBELISK_SQLITE_SYNCHRONOUS={synchronous!r} is invalid; expected one of "
+            f"{sorted(_SQLITE_SYNCHRONOUS_MODES)}."
+        )
     cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL;")
-    cursor.execute("PRAGMA synchronous=NORMAL;")
-    cursor.execute("PRAGMA foreign_keys=ON;")
-    # Commit connections wait for a writer instead of failing immediately.
-    # Several processes (API, SDK, step children) share this file.
-    cursor.execute("PRAGMA busy_timeout=15000;")
-    cursor.close()
+    try:
+        try:
+            cursor.execute(f"PRAGMA journal_mode={journal_mode};")
+        except sqlite3.OperationalError as exc:
+            raise RuntimeError(
+                f"SQLite cannot use journal_mode={journal_mode} at {settings.sqlite_db_path}. "
+                "WAL needs a POSIX filesystem with shared-memory mmap and fsync support. "
+                "Use local ext4/XFS storage, or explicitly set "
+                "OBELISK_SQLITE_JOURNAL_MODE=DELETE and "
+                "OBELISK_SQLITE_SYNCHRONOUS=OFF for a non-durable virtual filesystem."
+            ) from exc
+        cursor.execute(f"PRAGMA synchronous={synchronous};")
+        cursor.execute("PRAGMA foreign_keys=ON;")
+        # Commit connections wait for a writer instead of failing immediately.
+        # Several processes (API, SDK, step children) share this file.
+        cursor.execute("PRAGMA busy_timeout=15000;")
+    finally:
+        cursor.close()
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,

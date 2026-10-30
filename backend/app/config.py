@@ -242,6 +242,20 @@ class Settings(BaseSettings):
     DUCKDB_TEMP_SIZE_LIMIT: str = Field(
         default_factory=lambda: os.getenv("DUCKDB_TEMP_SIZE_LIMIT", "50GB")
     )
+    # Upper bound on files rewritten by one automatic or API-triggered compaction run.
+    # A scheduled maintenance job can drain a larger backlog off-peak.
+    LAKEHOUSE_COMPACT_MAX_FILES: int = Field(
+        default_factory=lambda: int(os.getenv("OBELISK_LAKEHOUSE_COMPACT_MAX_FILES", "50"))
+    )
+    # SQLite pragmas for the control plane. WAL requires shared-memory mmap and fsync;
+    # some virtual/network filesystems reject both. These are explicit so an operator
+    # can choose a mode the filesystem supports instead of receiving an opaque I/O error.
+    SQLITE_JOURNAL_MODE: str = Field(
+        default_factory=lambda: os.getenv("OBELISK_SQLITE_JOURNAL_MODE", "WAL")
+    )
+    SQLITE_SYNCHRONOUS: str = Field(
+        default_factory=lambda: os.getenv("OBELISK_SQLITE_SYNCHRONOUS", "NORMAL")
+    )
     # Interactive JSON query responses are capped: `SELECT *` on a 200 GB table must
     # never turn into millions of Python dicts. The cap is a *display* limit — exports
     # stream the full result to disk instead.

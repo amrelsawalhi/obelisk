@@ -17,6 +17,7 @@ which table at which version.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections import OrderedDict
 import json
 import logging
 import os
@@ -234,7 +235,13 @@ def record_lakehouse_commit(conn=None, *, interval: int = AUTO_COMPACT_COMMIT_IN
     own_conn = conn is None
     c = conn or lakehouse_connection()
     try:
-        c.execute(f"CALL ducklake_merge_adjacent_files('{SOURCE}');").fetchall()
+        from app.config import settings
+
+        max_files = max(1, int(settings.LAKEHOUSE_COMPACT_MAX_FILES))
+        c.execute(
+            f"CALL ducklake_merge_adjacent_files('{SOURCE}', "
+            f"max_compacted_files => {max_files});"
+        ).fetchall()
         return True
     except Exception as exc:
         logger.debug("Automatic DuckLake file compaction skipped: %s", exc)
@@ -262,27 +269,44 @@ def table_ingest_lock(schema: str, table: str):
 
 
 def _prepare_catalog_file(catalog: Path) -> None:
-    """Puts the DuckLake metadata file in WAL mode, once per process."""
+    """Puts the DuckLake metadata file in the configured SQLite journal mode."""
     key = str(catalog)
     if key in _prepared_catalogs:
         return
-    try:
-        con = sqlite3.connect(catalog, timeout=CATALOG_BUSY_TIMEOUT_MS / 1000)
+    from app.config import settings
+
+    requested = str(settings.SQLITE_JOURNAL_MODE or "WAL").strip().upper()
+    modes = [requested]
+    if requested == "WAL":
+        # A virtual filesystem may reject WAL's shared-memory mapping. DELETE still
+        # gives transactional recovery; it only removes concurrent reader/writer
+        # overlap, which is a better failure mode than refusing to boot.
+        modes.append("DELETE")
+    last_error: Exception | None = None
+    mode = None
+    for candidate in modes:
         try:
-            mode = con.execute("PRAGMA journal_mode=WAL;").fetchone()
-            con.execute(f"PRAGMA busy_timeout={CATALOG_BUSY_TIMEOUT_MS};")
-        finally:
-            con.close()
-    except Exception as exc:
+            con = sqlite3.connect(catalog, timeout=CATALOG_BUSY_TIMEOUT_MS / 1000)
+            try:
+                mode = con.execute(f"PRAGMA journal_mode={candidate};").fetchone()
+                con.execute(f"PRAGMA busy_timeout={CATALOG_BUSY_TIMEOUT_MS};")
+            finally:
+                con.close()
+            break
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error is not None and mode is None:
         # Do not add to _prepared_catalogs on transient lock error so the next attach retries.
-        logger.debug("Could not put the DuckLake catalog in WAL mode (will retry): %s", exc)
+        logger.debug("Could not prepare the DuckLake catalog (will retry): %s", last_error)
         return
     _prepared_catalogs.add(key)
-    if mode and str(mode[0]).lower() != "wal":
-        logger.info(
-            "DuckLake catalog %s is in %s mode (WAL unavailable here); concurrent writers "
-            "will serialise.",
+    if mode and str(mode[0]).lower() != requested.lower():
+        logger.warning(
+            "DuckLake catalog %s could not use journal_mode=%s and fell back to %s. "
+            "This filesystem does not support the requested SQLite concurrency mode.",
             catalog,
+            requested,
             mode[0],
         )
 
@@ -343,8 +367,11 @@ def lakehouse_connection():
     conn = duckdb.connect(":memory:")
     try:
         slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
-        cpu_cores = os.cpu_count() if "os" in globals() else 4
-        threads = int(settings.DUCKDB_THREADS) if settings.DUCKDB_THREADS else max(1, (cpu_cores or 4) // slots)
+        threads = (
+            int(settings.DUCKDB_THREADS)
+            if settings.DUCKDB_THREADS
+            else advisor.get_duckdb_threads(slots)
+        )
         for stmt in (
             f"SET memory_limit = '{advisor.get_duckdb_memory_limit(slots)}';",
             f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
@@ -597,8 +624,29 @@ class WarehouseScan:
     problems: tuple[str, ...]
 
 
-_FOOTER_CACHE: dict[tuple, tuple[tuple[dict, ...], int]] = {}
+_FOOTER_CACHE: OrderedDict[tuple, tuple[tuple[dict, ...], int]] = OrderedDict()
 _FOOTER_CACHE_LIMIT = 4096
+_FOOTER_CACHE_LOCK = threading.Lock()
+
+
+def _remember_footer(
+    key: tuple, result: tuple[tuple[dict, ...], int]
+) -> tuple[tuple[dict, ...], int]:
+    """Stores a footer with LRU eviction; returns the value a racing caller should use."""
+    with _FOOTER_CACHE_LOCK:
+        # Another catalog scan may have populated the same key while this one read the
+        # footer. Prefer the entry that is already there and refresh its recency.
+        existing = _FOOTER_CACHE.get(key)
+        if existing is not None:
+            _FOOTER_CACHE.move_to_end(key)
+            return existing
+        _FOOTER_CACHE[key] = result
+        _FOOTER_CACHE.move_to_end(key)
+        while len(_FOOTER_CACHE) > _FOOTER_CACHE_LIMIT:
+            # Evict one cold entry. Clearing all 4,096 made the next scan read every
+            # footer from disk, which was a latency cliff rather than a cache refresh.
+            _FOOTER_CACHE.popitem(last=False)
+        return result
 
 
 def read_footer(
@@ -606,9 +654,11 @@ def read_footer(
 ) -> tuple[tuple[dict, ...], int]:
     """Reads a Parquet footer: column schema and row count, without the data."""
     key = (info.path, info.size_bytes, info.modified_at.isoformat())
-    cached = _FOOTER_CACHE.get(key)
-    if cached is not None:
-        return cached
+    with _FOOTER_CACHE_LOCK:
+        cached = _FOOTER_CACHE.get(key)
+        if cached is not None:
+            _FOOTER_CACHE.move_to_end(key)
+            return cached
 
     import pyarrow.parquet as pq
 
@@ -625,10 +675,7 @@ def read_footer(
         for field in arrow_schema
     )
     result = (columns, int(metadata.num_rows))
-    if len(_FOOTER_CACHE) >= _FOOTER_CACHE_LIMIT:
-        _FOOTER_CACHE.clear()
-    _FOOTER_CACHE[key] = result
-    return result
+    return _remember_footer(key, result)
 
 
 def table_from_file(storage: WarehouseStorage, info: FileInfo) -> TableFile:

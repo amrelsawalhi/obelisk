@@ -264,11 +264,12 @@ export const api = {
   // Deleting unread bytes is irreversible, so the caller states it rather than
   // inheriting a default it never read about.
   maintainLakehouse: async (
-    options: { keep_days?: number; delete_files?: boolean } = {},
+    options: { keep_days?: number; delete_files?: boolean; max_files?: number } = {},
   ): Promise<LakehouseMaintenanceResult> => {
     const res = await apiClient.post<LakehouseMaintenanceResult>('/catalog/lakehouse/maintain', {
       keep_days: options.keep_days ?? 7,
       delete_files: options.delete_files ?? true,
+      ...(options.max_files !== undefined ? { max_files: options.max_files } : {}),
     });
     return res.data;
   },

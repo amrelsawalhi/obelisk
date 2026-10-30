@@ -1587,7 +1587,9 @@ def _lakehouse_diagnostics_sync() -> Dict[str, Any]:
         "obelisk_db_journal_mode": _sqlite_journal_mode(Path(settings.sqlite_db_path)),
         "duckdb_tmp_bytes": _directory_bytes(settings.duckdb_temp_path),
         "duckdb_tmp_limit": advisor.get_duckdb_temp_limit(
-            settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT
+            settings.duckdb_temp_path.as_posix(),
+            settings.DUCKDB_TEMP_SIZE_LIMIT,
+            settings.DUCKDB_MAX_CONCURRENT_HEAVY,
         ),
         "duckdb_memory_limit_per_slot": advisor.get_duckdb_memory_limit(
             settings.DUCKDB_MAX_CONCURRENT_HEAVY
@@ -1620,40 +1622,59 @@ class LakehouseMaintainRequest(BaseModel):
             "reclaim, turn it off to only compact and expire."
         ),
     )
+    max_files: int = Field(
+        default_factory=lambda: max(1, int(settings.LAKEHOUSE_COMPACT_MAX_FILES)),
+        ge=1,
+        le=10_000,
+        description=(
+            "Maximum Parquet files rewritten by this compaction pass. A full 1 TB "
+            "rewrite should be a scheduled off-peak job, not a blocking API request."
+        ),
+    )
 
 
-def _maintain_lakehouse_sync(keep_days: int, delete_files: bool) -> Dict[str, Any]:
+def _maintain_lakehouse_sync(
+    keep_days: int, delete_files: bool, max_files: int
+) -> Dict[str, Any]:
     """Compacts, expires and reclaims, and reports what each step did.
 
     The order matters. Load tables go first: a killed run's leftovers reference bytes that
     nothing will ever read, and expiring snapshots before dropping them would keep those
     bytes alive for another retention window. The empty-directory sweep goes last, because
     it is what the previous steps leave behind.
+
+    Compaction takes a heavy slot: it reads and rewrites Parquet like a large query, and
+    used to run beside ingests and queries without appearing in the resource budget.
     """
-    conn = lakehouse_connection()
+    duckdb_engine.begin_heavy(kind="maintenance")
     try:
-        before = _catalog_counts(conn)
-        orphans = drop_load_tables(conn)
+        conn = lakehouse_connection()
+        try:
+            before = _catalog_counts(conn)
+            orphans = drop_load_tables(conn)
 
-        merged = conn.execute(
-            f"CALL ducklake_merge_adjacent_files('{SOURCE}');"
-        ).fetchall()
-
-        older_than = datetime.now(timezone.utc) - timedelta(days=keep_days)
-        expired = conn.execute(
-            f"CALL ducklake_expire_snapshots('{SOURCE}', "
-            f"older_than => TIMESTAMPTZ '{older_than.isoformat()}');"
-        ).fetchall()
-
-        removed: List[Any] = []
-        if delete_files:
-            removed = conn.execute(
-                f"CALL ducklake_cleanup_old_files('{SOURCE}', cleanup_all => true);"
+            merged = conn.execute(
+                f"CALL ducklake_merge_adjacent_files('{SOURCE}', "
+                f"max_compacted_files => {max(1, int(max_files))});"
             ).fetchall()
 
-        after = _catalog_counts(conn)
+            older_than = datetime.now(timezone.utc) - timedelta(days=keep_days)
+            expired = conn.execute(
+                f"CALL ducklake_expire_snapshots('{SOURCE}', "
+                f"older_than => TIMESTAMPTZ '{older_than.isoformat()}');"
+            ).fetchall()
+
+            removed: List[Any] = []
+            if delete_files:
+                removed = conn.execute(
+                    f"CALL ducklake_cleanup_old_files('{SOURCE}', cleanup_all => true);"
+                ).fetchall()
+
+            after = _catalog_counts(conn)
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        duckdb_engine.end_heavy()
 
     # 4. Sweep the directories those drops and expiries emptied. The connection is closed
     #    first: a directory with a file handle still open on it cannot be removed here.
@@ -1668,6 +1689,7 @@ def _maintain_lakehouse_sync(keep_days: int, delete_files: bool) -> Dict[str, An
         "empty_directories_removed": pruned,
         "delete_files": delete_files,
         "keep_days": keep_days,
+        "max_files": max_files,
         "before": before,
         "after": after,
     }
@@ -1687,6 +1709,6 @@ async def maintain_lakehouse(req: LakehouseMaintainRequest) -> Dict[str, Any]:
     reports the snapshot and file counts before and after rather than just \"done\".
     """
     return await asyncio.to_thread(
-        _maintain_lakehouse_sync, req.keep_days, req.delete_files
+        _maintain_lakehouse_sync, req.keep_days, req.delete_files, req.max_files
     )
 

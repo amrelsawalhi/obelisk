@@ -29,8 +29,8 @@ async def test_diagnostics_reports_what_the_lakehouse_costs():
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["lakehouse_root"], "the tab shows where the bytes live"
-    assert body["duckdb_tmp_limit"] == "50GB" or body["duckdb_tmp_limit"]
-    assert body["duckdb_memory_limit_per_slot"].endswith("GB")
+    assert body["duckdb_tmp_limit"].endswith("MiB")
+    assert body["duckdb_memory_limit_per_slot"].endswith("MiB")
     assert body["snapshot_count"] >= 1, "a lakehouse that was written to has a snapshot"
     assert isinstance(body["current_snapshot_id"], int), (
         "the tab pins a snapshot id, not just a count"
@@ -91,6 +91,7 @@ async def test_maintenance_drops_an_orphaned_load_table_and_reports_the_differen
         assert res.status_code == 200, res.text
         body = res.json()
         assert body["status"] == "ok"
+        assert body["max_files"] == settings.LAKEHOUSE_COMPACT_MAX_FILES
         assert body["orphaned_load_tables_dropped"] >= 1
         assert body["snapshots_expired"] >= 0
         assert body["files_removed"] == 0, "nothing is deleted while delete_files is off"

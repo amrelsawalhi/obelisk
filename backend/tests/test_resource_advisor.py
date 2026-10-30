@@ -42,19 +42,32 @@ def test_resource_advisor_recommendations():
 def test_duckdb_memory_limit_recommendation():
     """Checks dynamic DuckDB limit string calculation."""
     limit_str = advisor.get_duckdb_memory_limit()
-    assert limit_str.endswith("GB")
-    gb_val = int(limit_str.replace("GB", ""))
-    assert gb_val >= 1
+    assert limit_str.endswith("MiB")
+    mib_val = int(limit_str.removesuffix("MiB"))
+    assert mib_val >= 1
+
 
 def test_duckdb_memory_limit_is_shared_between_concurrent_slots():
     """Four heavy queries must not each claim the memory meant for the whole host."""
     single_slot = advisor.get_duckdb_memory_limit(1)
     four_slots = advisor.get_duckdb_memory_limit(4)
-    assert single_slot.endswith("GB")
-    assert four_slots.endswith("GB")
-    assert int(four_slots.replace("GB", "")) <= int(single_slot.replace("GB", ""))
+    assert single_slot.endswith("MiB")
+    assert four_slots.endswith("MiB")
+    assert int(four_slots.removesuffix("MiB")) <= int(single_slot.removesuffix("MiB"))
     # A nonsensical slot count is clamped to 1 rather than dividing by zero.
     assert advisor.get_duckdb_memory_limit(0) == single_slot
+
+
+def test_the_memory_budget_cannot_be_multiplied_past_the_host():
+    """The sum of every slot must stay inside the 50% DuckDB share, even on a small host."""
+    specs = advisor.get_host_specs()
+    safe_mib = int(specs["max_safe_allocation_bytes"]) // (1024 ** 2)
+    for slots in (1, 2, 4, 8):
+        per_slot = advisor.get_duckdb_memory_limit_mb(slots)
+        assert per_slot >= 1
+        assert per_slot * slots <= safe_mib // 2 + slots, (
+            "rounding may leave a few MiB unused, but may never over-allocate"
+        )
 
 
 def test_the_spill_budget_never_promises_more_than_the_disk_has():
@@ -64,21 +77,21 @@ def test_the_spill_budget_never_promises_more_than_the_disk_has():
     """
     budget = advisor.get_duckdb_temp_limit(".", "50GB")
 
-    assert budget.endswith("MB")
-    assert int(budget.replace("MB", "")) >= 1024, "a spill budget under 1 GB is useless"
+    assert budget.endswith("MiB")
+    assert int(budget.removesuffix("MiB")) >= 1024, "a spill budget under 1 GiB is useless"
 
 
 def test_a_low_configured_ceiling_still_wins():
     """The setting is a ceiling, not a floor: a small limit is honoured on a large disk."""
-    assert advisor.get_duckdb_temp_limit(".", "1MB") == "1MB"
+    assert advisor.get_duckdb_temp_limit(".", "1MB") == "1MiB"
 
 
 def test_an_unparseable_limit_falls_back_to_the_default_ceiling():
     """A typo must not remove the cap entirely."""
     budget = advisor.get_duckdb_temp_limit(".", "fifty gigabytes")
 
-    assert budget.endswith("MB")
-    assert int(budget.replace("MB", "")) >= 1024
+    assert budget.endswith("MiB")
+    assert int(budget.removesuffix("MiB")) >= 1024
 
 def test_vault_encryption_and_decryption():
     """Verifies AES-128 Fernet encryption and decryption."""

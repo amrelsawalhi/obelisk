@@ -19,6 +19,7 @@ import logging
 from pathlib import Path
 import re
 import threading
+import time
 import uuid
 from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Sequence
 
@@ -56,6 +57,69 @@ MAX_API_RESPONSE_BYTES = 64 * 1024 * 1024  # 64 MiB ceiling per HTTP response
 
 _OBJECT_ID_HEX_RE = re.compile(r"^[0-9a-fA-F]{24}$")
 
+# One process-wide cap shared by every ingestion entry point (sync API, batch API,
+# pipeline steps, job manager, SDK). The cap used to exist only on the async job path,
+# so other callers could consume every heavy slot before queries reached one.
+_INGEST_GATE_LOCK = threading.Lock()
+_INGEST_GATE: Optional[threading.BoundedSemaphore] = None
+_INGEST_GATE_LIMIT: Optional[int] = None
+
+# Table row counts come from DuckLake metadata, which is cheap but still two queries per
+# call. A very short TTL removes repeated lookups during one job without serving stale
+# counts across a load; ingestion explicitly invalidates its target after commit.
+_ROW_COUNT_CACHE_LOCK = threading.Lock()
+_ROW_COUNT_CACHE: dict[str, tuple[float, int]] = {}
+_ROW_COUNT_CACHE_TTL_SECONDS = 2.0
+
+
+def _invalidate_row_count_cache(target: Optional[str] = None) -> None:
+    with _ROW_COUNT_CACHE_LOCK:
+        if target is None:
+            _ROW_COUNT_CACHE.clear()
+        else:
+            _ROW_COUNT_CACHE.pop(target, None)
+
+
+def _discard_temp_file(path: Path) -> None:
+    """Deletes a temp file, waiting out Windows' open-handle window.
+
+    DuckDB may still hold a read_json_auto handle when the loading statement returns.
+    On POSIX the unlink succeeds anyway; on Windows it raises WinError 32 until the
+    handle is released. Retry in a daemon thread so a failed cleanup cannot leak one
+    file per API ingest or block the request for the duration of a query.
+    """
+    try:
+        path.unlink(missing_ok=True)
+        return
+    except OSError:
+        pass
+
+    def _retry() -> None:
+        for _ in range(300):
+            time.sleep(0.1)
+            try:
+                path.unlink(missing_ok=True)
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                continue
+        logger.warning("Could not remove temporary API response file %s", path)
+
+    threading.Thread(target=_retry, name="obelisk-temp-cleanup", daemon=True).start()
+
+
+def _ingest_gate() -> threading.BoundedSemaphore:
+    """The process-wide ingestion semaphore, rebuilt if the setting changes."""
+    global _INGEST_GATE, _INGEST_GATE_LIMIT
+    limit = max(1, int(settings.INGEST_MAX_CONCURRENT))
+    with _INGEST_GATE_LOCK:
+        if _INGEST_GATE is None or _INGEST_GATE_LIMIT != limit:
+            _INGEST_GATE = threading.BoundedSemaphore(limit)
+            _INGEST_GATE_LIMIT = limit
+        return _INGEST_GATE
+
+
 
 def _parse_iso_datetime(raw: str) -> Optional[datetime]:
     text = raw.strip()
@@ -66,6 +130,41 @@ def _parse_iso_datetime(raw: str) -> Optional[datetime]:
         return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def _looks_decimal(text: str) -> bool:
+    """True for plain numeric text, without asking Decimal to parse a timestamp."""
+    if not text:
+        return False
+    # Cheap C-level rejects before looping: an ISO date or clock contains one of these.
+    if ":" in text or "T" in text or "t" in text:
+        return False
+    index = 1 if text[0] in "+-" else 0
+    if index == len(text):
+        return False
+    seen_digit = False
+    seen_dot = False
+    seen_exp = False
+    exp_digit = False
+    for pos, char in enumerate(text[index:], start=index):
+        if "0" <= char <= "9":
+            seen_digit = True
+            if seen_exp:
+                exp_digit = True
+        elif char == "." and not seen_dot and not seen_exp:
+            seen_dot = True
+        elif char in "eE" and not seen_exp and seen_digit:
+            seen_exp = True
+        elif char in "+-" and seen_exp and text[pos - 1] in "eE":
+            continue
+        else:
+            return False
+    return seen_digit and (not seen_exp or exp_digit)
+
+
+def _looks_timestamp(text: str) -> bool:
+    """Cheap shape check for ISO-like timestamps before calling datetime parsing."""
+    return len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-"
 
 
 def _watermark_is_newer(value: Any, reference: Any) -> bool:
@@ -82,6 +181,42 @@ def _watermark_is_newer(value: Any, reference: Any) -> bool:
         if d_val.is_nan() or d_ref.is_nan():
             return False
         return d_val > d_ref
+
+    # The common path is strings. Decide their shape first: attempting Decimal() on
+    # every ISO-8601 timestamp raised and caught an exception per row in the old path.
+    if isinstance(value, str) and isinstance(reference, str):
+        v_text, r_text = value.strip(), reference.strip()
+        # Timestamp first: ISO strings are the common incremental watermark, and trying
+        # Decimal on them was the exception-per-row path this optimization removes.
+        if _looks_timestamp(v_text) and _looks_timestamp(r_text):
+            # Same-length timestamps with the same UTC offset are chronologically ordered
+            # by lexical comparison. This is the normal shape of a watermark pair (both
+            # sides come from the same timestamp column), and it avoids datetime parsing
+            # for every row while preserving the exact offset-aware path below.
+            v_tz = v_text[-6:] if len(v_text) >= 6 and v_text[-6] in "+-" else v_text[-1:]
+            r_tz = r_text[-6:] if len(r_text) >= 6 and r_text[-6] in "+-" else r_text[-1:]
+            if len(v_text) == len(r_text) and v_tz == r_tz:
+                return v_text > r_text
+            ts_val, ts_ref = _parse_iso_datetime(v_text), _parse_iso_datetime(r_text)
+            if ts_val is not None and ts_ref is not None:
+                u_val = (
+                    ts_val.astimezone(timezone.utc)
+                    if ts_val.tzinfo
+                    else ts_val.replace(tzinfo=timezone.utc)
+                )
+                u_ref = (
+                    ts_ref.astimezone(timezone.utc)
+                    if ts_ref.tzinfo
+                    else ts_ref.replace(tzinfo=timezone.utc)
+                )
+                return u_val > u_ref
+        if _looks_decimal(v_text) and _looks_decimal(r_text):
+            d_val, d_ref = Decimal(v_text), Decimal(r_text)
+            if d_val.is_nan() or d_ref.is_nan():
+                return False
+            return d_val > d_ref
+        return v_text > r_text
+
     try:
         if not isinstance(value, bool) and not isinstance(reference, bool):
             d_val = Decimal(str(value).strip())
@@ -156,7 +291,14 @@ def _arrow_batch(columns: Iterable[str], rows: Sequence[Sequence[Any]]) -> pa.Ta
         return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
 
+_CELL_PASSTHROUGH_TYPES = (type(None), str, int, float, bool, Decimal, datetime, date)
+
+
 def _normalize_cell(value: Any) -> Any:
+    # Most cells are already Arrow-native. Exact type checks are cheaper than the
+    # attribute probes below and keep 60-80% of cursor staging out of this function.
+    if type(value) in _CELL_PASSTHROUGH_TYPES:
+        return value
     if isinstance(value, (dict, list)):
         return json.dumps(value, default=str)
     # Oracle hands back a LOB *locator*, not the value. Without reading it the Arrow
@@ -182,7 +324,11 @@ def _normalize_cell(value: Any) -> Any:
 
 def _cells(row: Sequence[Any]) -> tuple:
     """One driver row with Arrow-friendly values: BSON/JSON objects become text or Decimal."""
-    return tuple(_normalize_cell(value) for value in row)
+    normalize = _normalize_cell
+    passthrough = _CELL_PASSTHROUGH_TYPES
+    return tuple(
+        value if type(value) in passthrough else normalize(value) for value in row
+    )
 
 
 def _bt(value: object) -> str:
@@ -371,10 +517,22 @@ class IngestEngine:
     @staticmethod
     def _row_count(conn, target: str) -> int:
         """Rows in the table: from the catalog when it knows, otherwise counted."""
+        import time
+
+        now = time.monotonic()
+        with _ROW_COUNT_CACHE_LOCK:
+            cached = _ROW_COUNT_CACHE.get(target)
+            if cached is not None and now - cached[0] < _ROW_COUNT_CACHE_TTL_SECONDS:
+                return cached[1]
         known = IngestEngine._catalog_row_count(conn, target)
         if known is not None:
+            with _ROW_COUNT_CACHE_LOCK:
+                _ROW_COUNT_CACHE[target] = (now, known)
             return known
-        return int(conn.execute(f"SELECT count(*) FROM {target}").fetchall()[0][0])
+        counted = int(conn.execute(f"SELECT count(*) FROM {target}").fetchall()[0][0])
+        with _ROW_COUNT_CACHE_LOCK:
+            _ROW_COUNT_CACHE[target] = (now, counted)
+        return counted
 
     @staticmethod
     def _columns(conn, table: str) -> list[str]:
@@ -896,7 +1054,7 @@ class IngestEngine:
             primary_key = validate_column(primary_key, what="primary key")
         self._require_primary_key(write_strategy, primary_key)
 
-        with table_ingest_lock(schema, table_stem), duckdb_engine.heavy_slot():
+        with _ingest_gate(), table_ingest_lock(schema, table_stem), duckdb_engine.heavy_slot(kind="ingest"):
             conn = duckdb_engine.get_connection()
             if on_connection is not None:
                 on_connection(conn)
@@ -1015,6 +1173,7 @@ class IngestEngine:
                     total = self._row_count(conn, target) if exists else 0
                 else:
                     record_lakehouse_commit(conn)
+                    _invalidate_row_count_cache(target)
                     total = self._row_count(conn, target)
             finally:
                 abandoned = load_table
@@ -1132,6 +1291,7 @@ class IngestEngine:
                 f"CREATE OR REPLACE TABLE {target} AS "
                 f"SELECT {projection} FROM {source_ref} {where}{order_clause}{limit_clause};"
             )
+            _invalidate_row_count_cache(target)
             written = self._row_count(c, target)
         else:
             schema_policy = kwargs.get("schema_policy", "evolve")
@@ -1141,6 +1301,7 @@ class IngestEngine:
                 f"INSERT INTO {target} BY NAME SELECT {projection} FROM {source_ref} "
                 f"{where}{order_clause}{limit_clause};"
             )
+            _invalidate_row_count_cache(target)
             written = max(0, self._row_count(c, target) - before)
         if on_batch is not None:
             on_batch(written)
@@ -1457,16 +1618,24 @@ class IngestEngine:
         if options.get("headers"):
             headers.update(options["headers"])
 
-        content_type = ""
         is_ndjson = str(options.get("format", "")).lower() in ("ndjson", "jsonl")
-        if is_ndjson and sink is not None:
+        payload = None
+        data_key = options.get("data_key")
+        # A top-level JSON array or NDJSON stream can be handed straight to DuckDB.
+        # Parsing it into Python dicts multiplied memory by ~5x and then rebuilt Arrow.
+        # When the response is wrapped under data_key, the Python extractor remains the
+        # correct path because the caller asked for a specific nested list.
+        if sink is not None and (is_ndjson or not data_key):
             import tempfile
+
             settings.duckdb_temp_path.mkdir(parents=True, exist_ok=True)
+            suffix = ".ndjson" if is_ndjson else ".json"
             with tempfile.NamedTemporaryFile(
-                mode="wb", suffix=".ndjson", dir=settings.duckdb_temp_path, delete=False
+                mode="wb", suffix=suffix, dir=settings.duckdb_temp_path, delete=False
             ) as tmp_f:
                 tmp_path = Path(tmp_f.name)
                 total_bytes = 0
+                byte_limit = MAX_API_RESPONSE_BYTES * 8 if is_ndjson else MAX_API_RESPONSE_BYTES
                 try:
                     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
                         with client.stream("GET", full_url, headers=headers) as response:
@@ -1477,52 +1646,88 @@ class IngestEngine:
                                         "Ingestion cancelled: stopped before the table was committed."
                                     )
                                 total_bytes += len(chunk)
-                                if total_bytes > MAX_API_RESPONSE_BYTES * 8:
+                                if total_bytes > byte_limit:
                                     raise MemoryError(
-                                        f"NDJSON stream from {full_url} exceeded {(MAX_API_RESPONSE_BYTES * 8) // (1024 ** 2)} MiB safety limit."
+                                        f"API response from {full_url} exceeded "
+                                        f"{byte_limit // (1024 ** 2)} MiB safety limit."
                                     )
                                 tmp_f.write(chunk)
                     tmp_f.flush()
                     if total_bytes == 0:
                         return 0
-                    where = ""
-                    if mode == "incremental" and watermark_column and watermark_value is not None:
-                        where = f"WHERE {sql_ident(watermark_column)} > {_literal(watermark_value)}"
-                    limit_clause = f" LIMIT {int(limit)}" if limit and limit > 0 else ""
-                    src_expr = f"read_json_auto({sql_string(tmp_path.as_posix())}, format='newline_delimited')"
-                    return self._transfer_from(
-                        conn,
-                        source_ref=src_expr,
-                        target=sink,
-                        mode="snapshot" if create else "incremental",
-                        exists=not create,
-                        where=where,
-                        order_clause=_order_by(watermark_column, limit, sql_ident),
-                        limit_clause=limit_clause,
-                        on_batch=on_batch,
-                        schema_policy=schema_policy,
-                    )
+
+                    first = b""
+                    with open(tmp_path, "rb") as probe:
+                        while True:
+                            char = probe.read(1)
+                            if not char:
+                                break
+                            if not char.isspace():
+                                first = char
+                                break
+                    can_stream_native = is_ndjson or first == b"["
+                    if can_stream_native:
+                        where = ""
+                        if mode == "incremental" and watermark_column and watermark_value is not None:
+                            where = f"WHERE {sql_ident(watermark_column)} > {_literal(watermark_value)}"
+                        limit_clause = f" LIMIT {int(limit)}" if limit and limit > 0 else ""
+                        format_arg = (
+                            "format='newline_delimited'"
+                            if is_ndjson
+                            else "format='array'"
+                        )
+                        src_expr = (
+                            f"read_json_auto({sql_string(tmp_path.as_posix())}, "
+                            f"{format_arg})"
+                        )
+                        # Keep the historical column order (alphabetical, as the Python
+                        # extractor produced) while letting DuckDB own parsing and I/O.
+                        discovered = conn.execute(
+                            f"DESCRIBE SELECT * FROM {src_expr}"
+                        ).fetchall()
+                        ordered = sorted(str(row[0]) for row in discovered)
+                        if ordered:
+                            projection = ", ".join(quote_ident(name) for name in ordered)
+                            src_expr = f"(SELECT {projection} FROM {src_expr})"
+                        return self._transfer_from(
+                            conn,
+                            source_ref=src_expr,
+                            target=sink,
+                            mode="snapshot" if create else "incremental",
+                            exists=not create,
+                            where=where,
+                            order_clause=_order_by(watermark_column, limit, sql_ident),
+                            limit_clause=limit_clause,
+                            on_batch=on_batch,
+                            schema_policy=schema_policy,
+                        )
+
+                    # A top-level object without data_key may still contain a heuristic
+                    # records list. Reuse the bounded temp file rather than downloading
+                    # the response a second time.
+                    payload = json.loads(tmp_path.read_text(encoding="utf-8", errors="replace"))
                 finally:
-                    tmp_path.unlink(missing_ok=True)
+                    _discard_temp_file(tmp_path)
 
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-            with client.stream("GET", full_url, headers=headers) as response:
-                response.raise_for_status()
-                buf = bytearray()
-                for chunk in response.iter_bytes(chunk_size=65536):
-                    if should_cancel is not None and should_cancel():
-                        raise IngestCancelled(
-                            "Ingestion cancelled: stopped before the table was committed."
-                        )
-                    buf.extend(chunk)
-                    if len(buf) > MAX_API_RESPONSE_BYTES:
-                        raise MemoryError(
-                            f"API response from {full_url} exceeded {MAX_API_RESPONSE_BYTES // (1024 ** 2)} MiB safety limit."
-                        )
-                payload = json.loads(buf.decode("utf-8", errors="replace"))
-                del buf
+        if payload is None:
+            with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+                with client.stream("GET", full_url, headers=headers) as response:
+                    response.raise_for_status()
+                    buf = bytearray()
+                    for chunk in response.iter_bytes(chunk_size=65536):
+                        if should_cancel is not None and should_cancel():
+                            raise IngestCancelled(
+                                "Ingestion cancelled: stopped before the table was committed."
+                            )
+                        buf.extend(chunk)
+                        if len(buf) > MAX_API_RESPONSE_BYTES:
+                            raise MemoryError(
+                                f"API response from {full_url} exceeded {MAX_API_RESPONSE_BYTES // (1024 ** 2)} MiB safety limit."
+                            )
+                    payload = json.loads(buf.decode("utf-8", errors="replace"))
+                    del buf
 
-        records = Introspector._extract_api_records(payload, options.get("data_key"))
+        records = Introspector._extract_api_records(payload, data_key)
 
         if mode == "incremental" and watermark_column and watermark_value is not None:
             records = [

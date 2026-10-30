@@ -20,6 +20,7 @@ import json
 import uuid
 import shutil
 import sqlite3
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Union
@@ -60,6 +61,7 @@ __all__ = [
 ]
 
 _IMPLICIT_DUCKDB_CONN = None
+_IMPLICIT_DUCKDB_CONN_LOCK = threading.RLock()
 
 
 class EagerReadTooLarge(RuntimeError):
@@ -150,11 +152,17 @@ def _guard_eager_read(
 
 
 def _implicit_connection():
-    """Returns the shared SDK connection, creating it on first use."""
+    """Returns the shared SDK connection, creating it on first use.
+
+    Creation is locked because two notebook threads racing here used to build two
+    connections while only one was retained. The connection already carries the same
+    per-slot DuckDB budget as the rest of the engine.
+    """
     global _IMPLICIT_DUCKDB_CONN
-    if _IMPLICIT_DUCKDB_CONN is None:
-        _IMPLICIT_DUCKDB_CONN = duckdb_engine.get_connection()
-    return _IMPLICIT_DUCKDB_CONN
+    with _IMPLICIT_DUCKDB_CONN_LOCK:
+        if _IMPLICIT_DUCKDB_CONN is None:
+            _IMPLICIT_DUCKDB_CONN = duckdb_engine.get_connection()
+        return _IMPLICIT_DUCKDB_CONN
 
 
 class TableWrapper:
@@ -242,13 +250,25 @@ class TableWrapper:
         return arrow_obj.to_pandas(split_blocks=True, self_destruct=True)
 
     def to_duckdb(self, conn=None):
-        """Returns a DuckDB relation referencing the dataset."""
-        c = conn or _implicit_connection()
-        if self._readable_file:
-            return c.from_parquet(self._readable_file.resolve().as_posix())
-        for attachment in _attachments_for_sql(self.full_identifier):
-            duckdb_engine.attach(c, attachment)
-        return c.query(f"SELECT * FROM {self.full_identifier}")
+        """Returns a DuckDB relation referencing the dataset.
+
+        The implicit connection is shared, so relation creation is serialized. A caller
+        that needs concurrent execution should pass its own connection.
+        """
+        if conn is not None:
+            c = conn
+            if self._readable_file:
+                return c.from_parquet(self._readable_file.resolve().as_posix())
+            for attachment in _attachments_for_sql(self.full_identifier):
+                duckdb_engine.attach(c, attachment)
+            return c.query(f"SELECT * FROM {self.full_identifier}")
+        with _IMPLICIT_DUCKDB_CONN_LOCK:
+            c = _implicit_connection()
+            if self._readable_file:
+                return c.from_parquet(self._readable_file.resolve().as_posix())
+            for attachment in _attachments_for_sql(self.full_identifier):
+                duckdb_engine.attach(c, attachment)
+            return c.query(f"SELECT * FROM {self.full_identifier}")
 
     def iter_batches(
         self, batch_size: int = 100_000, columns: Optional[list[str]] = None
@@ -538,7 +558,7 @@ def _refuse_oversized(table: pa.Table, limit: int, reader: str) -> pa.Table:
 def query(sql: str) -> pl.DataFrame:
     """Executes SQL query using DuckDB in-process engine and returns a Polars DataFrame."""
     conn = duckdb_engine.get_connection()
-    duckdb_engine.begin_heavy()
+    duckdb_engine.begin_heavy(kind="sdk")
     try:
         storage_path = duckdb_engine._ensure_storage()
         for attachment in _attachments_for_sql(sql):
@@ -562,10 +582,11 @@ def lazy_query(sql: str) -> pl.LazyFrame:
         raise ValueError("lazy_query() needs a SQL statement.")
     conn = _implicit_connection()
     storage_path = duckdb_engine._ensure_storage()
-    for attachment in _attachments_for_sql(sql):
-        duckdb_engine.attach(conn, attachment)
-    exec_sql = duckdb_engine._prepare_sql_and_views(conn, sql, storage_path)
-    rel = conn.sql(exec_sql)
+    with _IMPLICIT_DUCKDB_CONN_LOCK:
+        for attachment in _attachments_for_sql(sql):
+            duckdb_engine.attach(conn, attachment)
+        exec_sql = duckdb_engine._prepare_sql_and_views(conn, sql, storage_path)
+        rel = conn.sql(exec_sql)
     if rel is None:
         return pl.LazyFrame()
     return rel.pl(lazy=True)
@@ -574,7 +595,7 @@ def lazy_query(sql: str) -> pl.LazyFrame:
 def query_arrow(sql: str) -> pa.Table:
     """Executes SQL query using DuckDB in-process engine and returns a PyArrow Table."""
     conn = duckdb_engine.get_connection()
-    duckdb_engine.begin_heavy()
+    duckdb_engine.begin_heavy(kind="sdk")
     try:
         storage_path = duckdb_engine._ensure_storage()
         for attachment in _attachments_for_sql(sql):
@@ -596,7 +617,7 @@ def iter_batches(sql: str, batch_size: int = 100_000):
     """Streams federated SQL results as PyArrow RecordBatches in O(batch_size) RAM."""
     step = max(1, int(batch_size))
     conn = duckdb_engine.get_connection()
-    duckdb_engine.begin_heavy()
+    duckdb_engine.begin_heavy(kind="sdk")
     try:
         storage_path = duckdb_engine._ensure_storage()
         for attachment in _attachments_for_sql(sql):
@@ -657,7 +678,7 @@ def save(df: Any, target: str) -> Dict[str, Any]:
     # Lock order matches ingestion: the table first, then a heavy slot. Taking them the
     # other way round deadlocks against an ingest that holds the table and waits for a
     # slot this notebook would be holding.
-    with table_ingest_lock(schema_name, stem), duckdb_engine.heavy_slot():
+    with table_ingest_lock(schema_name, stem), duckdb_engine.heavy_slot(kind="sdk"):
         conn = duckdb_engine.get_connection()
         try:
             conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SOURCE}.{quote_ident(schema_name)};")
@@ -717,7 +738,7 @@ def materialize_sql(
     address = f"{SOURCE}.{quote_ident(schema_name)}.{quote_ident(stem)}"
     advisor.assert_disk_headroom(settings.duckdb_storage_path)
 
-    with table_ingest_lock(schema_name, stem), duckdb_engine.heavy_slot():
+    with table_ingest_lock(schema_name, stem), duckdb_engine.heavy_slot(kind="sdk"):
         conn = duckdb_engine.get_connection()
         if on_connection is not None:
             on_connection(conn)

@@ -9,11 +9,13 @@ obelisk:
       type: duckdb
       path: "{{ env_var('DBT_DUCKDB_PATH', 'dbt.duckdb') }}"
       schema: main
-      threads: 1
+      threads: "{{ env_var('DBT_DUCKDB_THREADS', '1') | int }}"
       settings:
-        memory_limit: "{{ env_var('DBT_DUCKDB_MEMORY_LIMIT', '4GB') }}"
-        max_temp_directory_size: "{{ env_var('DBT_DUCKDB_MAX_TEMP_SIZE', '25GB') }}"
+        memory_limit: "{{ env_var('DBT_DUCKDB_MEMORY_LIMIT', '4GiB') }}"
+        max_temp_directory_size: "{{ env_var('DBT_DUCKDB_MAX_TEMP_SIZE', '25GiB') }}"
         preserve_insertion_order: false
+        # Do not declare temp_directory here. dbt-duckdb re-applies these settings on
+        # every cursor, and DuckDB refuses to switch temp_directory after first use.
       extensions:
         - ducklake
       attach:

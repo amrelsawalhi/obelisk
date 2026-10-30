@@ -14,6 +14,10 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
+# Set DuckDB's temp_directory once, before models run. Putting it in profile settings
+# makes dbt-duckdb reapply it per cursor, which DuckDB refuses after first use.
+on-run-start: "{{ configure_duckdb_temp() }}"
+
 # Folders under models/ are plain folders. `+schema` names the schema a folder's
 # models are written to — dbt's own configuration, with no layer or mapping behind it.
 # Obelisk reads the same names to know which warehouse folder to stage from and into.

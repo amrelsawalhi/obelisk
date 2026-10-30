@@ -2,6 +2,7 @@ import os
 import re
 import time
 import asyncio
+import functools
 import logging
 import threading
 from pathlib import Path
@@ -20,6 +21,26 @@ from app.core.resource_advisor import advisor
 from app.core.storage import warehouse_storage
 
 logger = logging.getLogger(__name__)
+
+# The safety-path expression is constant, but it used to be compiled for every query.
+_UNSAFE_PATH_RE = re.compile(
+    r"\b(?:read_csv|read_csv_auto|read_json|read_text|read_blob|copy\s+.*?to)\s*\(\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+
+
+@functools.lru_cache(maxsize=8)
+def _compiled_rewrite_pattern(
+    items: tuple[tuple[str, str], ...]
+) -> re.Pattern:
+    """Compile one catalog-name mapping once; the catalog changes far less than queries."""
+    ordered = sorted((name for name, _ in items), key=len, reverse=True)
+    return re.compile(
+        r"(?<![A-Za-z0-9_.])("
+        + "|".join(re.escape(name) for name in ordered)
+        + r")(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    )
 
 
 class DuckDBEngine:
@@ -42,83 +63,233 @@ class DuckDBEngine:
         self._active_heavy_queries = 0
         self._waiting_heavy_queries = 0
         self._total_queries_executed = 0
+        self._lease_local = threading.local()
+
+    def _push_lease(self, lease_id: Optional[str], slots: int) -> None:
+        stack = getattr(self._lease_local, "stack", None)
+        if stack is None:
+            stack = []
+            self._lease_local.stack = stack
+        stack.append((lease_id, slots))
+
+    def _pop_lease(self) -> Optional[tuple[Optional[str], int]]:
+        stack = getattr(self._lease_local, "stack", None)
+        if not stack:
+            return None
+        return stack.pop()
 
     from contextlib import contextmanager
 
     @contextmanager
-    def heavy_slot(self):
+    def heavy_slot(
+        self,
+        slots: int = 1,
+        *,
+        kind: str = "query",
+        memory_limit_mb: int | None = None,
+        temp_limit_mb: int | None = None,
+        temp_path: str | None = None,
+        detail: str | None = None,
+    ):
         """The shared heavy-work budget, for callers outside this class.
 
-        Every connection that can hold a large amount of memory - an ingest, an SDK
-        export, a dbt subprocess - takes one of these. The per-connection limit is
-        derived from the same slot count, so ``slots x memory_limit`` is the whole
-        budget rather than a limit that only queries happen to respect.
+        Every heavy job reserves one or more permits. Reservations are also written to
+        the cross-process lease directory so scripts and notebooks started in their own
+        Python process are visible to the backend telemetry.
         """
-        self.begin_heavy()
+        reserved = self.begin_heavy(
+            slots,
+            kind=kind,
+            memory_limit_mb=memory_limit_mb,
+            temp_limit_mb=temp_limit_mb,
+            temp_path=temp_path,
+            detail=detail,
+        )
         try:
-            yield
+            yield reserved
         finally:
-            self.end_heavy()
+            self.end_heavy(reserved)
 
-    def begin_heavy(self) -> None:
-        """Takes a heavy slot and counts it as active (for callers that cannot ``with``)."""
+    def begin_heavy(
+        self,
+        slots: int = 1,
+        *,
+        kind: str = "query",
+        memory_limit_mb: int | None = None,
+        temp_limit_mb: int | None = None,
+        temp_path: str | None = None,
+        detail: str | None = None,
+    ) -> int:
+        """Takes ``slots`` heavy permits and returns how many were actually acquired."""
+        count = max(1, min(int(slots), self._max_heavy_slots))
         with self._telemetry_lock:
             self._waiting_heavy_queries += 1
-        self._heavy_semaphore.acquire()
+        acquired = 0
+        try:
+            for _ in range(count):
+                self._heavy_semaphore.acquire()
+                acquired += 1
+        except BaseException:
+            for _ in range(acquired):
+                self._heavy_semaphore.release()
+            with self._telemetry_lock:
+                self._waiting_heavy_queries = max(0, self._waiting_heavy_queries - 1)
+            raise
+        lease_id = None
+        try:
+            from app.core.resource_leases import register_resource_lease
+
+            lease_id = register_resource_lease(
+                kind=kind,
+                slots=acquired,
+                memory_limit_mb=memory_limit_mb,
+                temp_limit_mb=temp_limit_mb,
+                temp_path=temp_path,
+                detail=detail,
+            )
+        except Exception:
+            lease_id = None
+        self._push_lease(lease_id, acquired)
         with self._telemetry_lock:
             self._waiting_heavy_queries = max(0, self._waiting_heavy_queries - 1)
-            self._active_heavy_queries += 1
+            self._active_heavy_queries += acquired
             self._total_queries_executed += 1
+        return acquired
 
-    def end_heavy(self) -> None:
-        """Releases a slot taken by :meth:`begin_heavy`."""
+    def end_heavy(self, slots: int = 1) -> None:
+        """Releases permits taken by :meth:`begin_heavy`."""
+        popped = self._pop_lease()
+        if popped is not None:
+            lease_id, reserved = popped
+            count = reserved
+        else:
+            lease_id, count = None, max(1, min(int(slots), self._max_heavy_slots))
+        try:
+            from app.core.resource_leases import release_resource_lease
+
+            release_resource_lease(lease_id)
+        except Exception:
+            pass
         with self._telemetry_lock:
-            self._active_heavy_queries = max(0, self._active_heavy_queries - 1)
-        self._heavy_semaphore.release()
+            self._active_heavy_queries = max(0, self._active_heavy_queries - count)
+        for _ in range(count):
+            self._heavy_semaphore.release()
 
     @contextmanager
-    def _acquire_heavy_slot(self):
-        with self.heavy_slot():
+    def _acquire_heavy_slot(self, slots: int = 1, *, kind: str = "query"):
+        with self.heavy_slot(slots, kind=kind):
             yield
 
     def get_telemetry(self) -> Dict[str, Any]:
         """Live DuckDB engine concurrency, spill directory usage, and lakehouse headroom."""
         from app.core.catalog import get_active_load_tables
+        from app.core.resource_leases import leases_by_kind, list_resource_leases
 
         slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
-        cpu_cores = os.cpu_count() or 4
         threads = (
             int(settings.DUCKDB_THREADS)
             if settings.DUCKDB_THREADS
-            else max(1, cpu_cores // slots)
+            else advisor.get_duckdb_threads(slots)
         )
         temp_path = settings.duckdb_temp_path
-        temp_bytes = 0
-        if temp_path.is_dir():
-            for entry in temp_path.rglob("*"):
-                try:
-                    if entry.is_file():
-                        temp_bytes += entry.stat().st_size
-                except OSError:
-                    continue
-        disk = advisor.get_disk_info(settings.duckdb_storage_path)
+        leases = list_resource_leases()
+        leased_slots = sum(max(1, int(item.get("slots") or 1)) for item in leases)
+        active_by_kind = leases_by_kind(leases)
+
         with self._telemetry_lock:
-            active_q = self._active_heavy_queries
+            local_active = self._active_heavy_queries
             waiting_q = self._waiting_heavy_queries
             total_q = self._total_queries_executed
+        active_q = max(local_active, leased_slots)
+        if local_active > leased_slots:
+            active_by_kind["unknown"] = active_by_kind.get("unknown", 0) + (
+                local_active - leased_slots
+            )
+
+        spill_roots: list[Path] = []
+        try:
+            base_root = temp_path.resolve()
+        except Exception:
+            base_root = temp_path
+        if base_root.is_dir():
+            spill_roots.append(base_root)
+        for lease in leases:
+            raw = str(lease.get("temp_path") or "").strip()
+            if not raw:
+                continue
+            try:
+                candidate = Path(raw).resolve()
+            except Exception:
+                continue
+            if candidate not in spill_roots:
+                spill_roots.append(candidate)
+
+        temp_bytes = 0
+        seen_files: set[str] = set()
+        for root in spill_roots:
+            if not root.is_dir():
+                continue
+            for entry in root.rglob("*"):
+                try:
+                    if not entry.is_file():
+                        continue
+                    name = entry.name
+                    if any(part.startswith("dbt_run_") for part in entry.parts):
+                        continue
+                    if name.startswith("dbt_scratch_") and ".duckdb" in name:
+                        continue
+                    key = str(entry)
+                    if key in seen_files:
+                        continue
+                    seen_files.add(key)
+                    temp_bytes += entry.stat().st_size
+                except OSError:
+                    continue
+        per_slot_temp_mb = advisor.get_duckdb_temp_limit_mb(
+            temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots
+        )
+        per_slot_memory_mb = advisor.get_duckdb_memory_limit_mb(slots)
+        active_temp_limit_mb = sum(
+            int(item.get("temp_limit_mb") or 0)
+            or per_slot_temp_mb * max(1, int(item.get("slots") or 1))
+            for item in leases
+        ) if leases else per_slot_temp_mb * max(1, active_q)
+        active_memory_limit_mb = sum(
+            int(item.get("memory_limit_mb") or 0)
+            or per_slot_memory_mb * max(1, int(item.get("slots") or 1))
+            for item in leases
+        ) if leases else per_slot_memory_mb * max(1, active_q)
+        reservations = [
+            {
+                "kind": str(item.get("kind") or "unknown"),
+                "slots": max(1, int(item.get("slots") or 1)),
+                "memory_limit_mb": item.get("memory_limit_mb"),
+                "temp_limit_mb": item.get("temp_limit_mb"),
+                "temp_path": item.get("temp_path"),
+                "detail": item.get("detail"),
+                "pid": item.get("pid"),
+                "started_at": item.get("started_at"),
+            }
+            for item in leases
+        ]
+        disk = advisor.get_disk_info(settings.duckdb_storage_path)
         return {
             "active_heavy_queries": active_q,
             "waiting_heavy_queries": waiting_q,
             "max_concurrent_heavy": slots,
             "total_queries_executed": total_q,
+            "active_by_kind": active_by_kind,
+            "active_reservations": reservations,
             "memory_limit_per_slot": advisor.get_duckdb_memory_limit(slots),
+            "active_memory_limit_mb": active_memory_limit_mb,
             "threads_per_slot": threads,
             "temp_directory": temp_path.as_posix(),
             "temp_spill_bytes": temp_bytes,
-            "temp_spill_mb": round(temp_bytes / (1024 * 1024), 2),
-            "temp_spill_limit": advisor.get_duckdb_temp_limit(
-                temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots
-            ),
+            "temp_spill_mb": round(temp_bytes / (1024 ** 2), 2),
+            "temp_spill_limit": f"{per_slot_temp_mb}MiB",
+            "temp_spill_limit_mb": per_slot_temp_mb,
+            "active_temp_limit_mb": active_temp_limit_mb,
+            "temp_spill_scope": "active leases + shared temp directory",
             "lakehouse_free_gb": disk.get("free_gb", 0.0),
             "lakehouse_percent_used": disk.get("percent_used", 0.0),
             "active_load_tables": len(get_active_load_tables()),
@@ -143,11 +314,10 @@ class DuckDBEngine:
     def _apply_session_budget(self, conn: duckdb.DuckDBPyConnection) -> None:
         """One place that decides how much of the machine a connection may use."""
         slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
-        cpu_cores = os.cpu_count() or 4
         threads = (
             int(settings.DUCKDB_THREADS)
             if settings.DUCKDB_THREADS
-            else max(1, cpu_cores // slots)
+            else advisor.get_duckdb_threads(slots)
         )
         statements = [
             f"SET memory_limit = '{advisor.get_duckdb_memory_limit(slots)}';",
@@ -327,14 +497,18 @@ class DuckDBEngine:
         if not mapping:
             return sql
 
-        ordered = sorted(mapping, key=len, reverse=True)
-        pattern = re.compile(
-            r"(?<![A-Za-z0-9_.])(" + "|".join(re.escape(name) for name in ordered) + r")(?![A-Za-z0-9_])",
-            re.IGNORECASE,
+        items = tuple(
+            sorted(
+                ((str(name), str(value)) for name, value in mapping.items()),
+                key=lambda item: len(item[0]),
+                reverse=True,
+            )
         )
+        pattern = _compiled_rewrite_pattern(items)
+        lookup = dict(items)
 
         def replace(match: re.Match) -> str:
-            return mapping.get(match.group(1).lower(), match.group(1))
+            return lookup.get(match.group(1).lower(), match.group(1))
 
         out: List[str] = []
         index = 0
@@ -407,10 +581,7 @@ class DuckDBEngine:
     @staticmethod
     def _assert_safe_query_paths(sql: str) -> None:
         """Blocks arbitrary file reading/writing outside allowed workspace roots."""
-        pattern = re.compile(
-            r"\b(?:read_csv|read_csv_auto|read_json|read_text|read_blob|copy\s+.*?to)\s*\(\s*['\"]([^'\"]+)['\"]",
-            re.IGNORECASE,
-        )
+        pattern = _UNSAFE_PATH_RE
         lakehouse_root = settings.lakehouse_root_path.resolve()
         temp_root = settings.duckdb_temp_path.resolve()
         git_root = settings.git_repo_path.resolve()
@@ -482,7 +653,7 @@ class DuckDBEngine:
         self._assert_safe_query_paths(sql)
         start_time = time.time()
         storage_path = self._ensure_storage()
-        with self._acquire_heavy_slot():
+        with self._acquire_heavy_slot(kind="query"):
             conn = self.get_connection()
             if on_connection is not None:
                 on_connection(conn)
@@ -539,7 +710,7 @@ class DuckDBEngine:
         storage_path = self._ensure_storage()
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         advisor.assert_disk_headroom(dest_path.parent.as_posix())
-        with self._acquire_heavy_slot():
+        with self._acquire_heavy_slot(kind="export"):
             conn = self.get_connection()
             try:
                 for attachment in attachments or postgres_attachments or []:

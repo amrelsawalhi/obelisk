@@ -420,7 +420,7 @@ class DbtRunner:
         from app.engines.duckdb_engine import duckdb_engine
 
         conn = duckdb_engine.get_connection()
-        duckdb_engine.begin_heavy()
+        duckdb_engine.begin_heavy(kind="warehouse_sync")
         synced_info = []
         skipped_tables = 0
 
@@ -603,6 +603,8 @@ class DbtRunner:
         """
         if scratch_target is not None:
             shutil.rmtree(scratch_target, ignore_errors=True)
+        spill_dir = scratch_db.with_name(f"{scratch_db.stem}_spill")
+        shutil.rmtree(spill_dir, ignore_errors=True)
         for leftover in (scratch_db, scratch_db.with_name(scratch_db.name + ".wal")):
             try:
                 leftover.unlink(missing_ok=True)
@@ -659,13 +661,24 @@ class DbtRunner:
         # The lakehouse output opens DBT_DUCKDB_PATH; this run's own file means a second
         # dbt process is not locked out by the first one holding the shared scratch file.
         env["DBT_DUCKDB_PATH"] = scratch_db.as_posix()
+        spill_dir = scratch_db.with_name(f"{scratch_db.stem}_spill")
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        env["DBT_DUCKDB_TEMP_DIR"] = spill_dir.as_posix()
 
         from app.engines.duckdb_engine import duckdb_engine
 
-        # A dbt run is a whole DuckDB process holding the same per-slot budget as an
-        # in-process connection, so it takes one. Otherwise the host runs
-        # ``slots + 1`` processes that each believe they own an equal share of it.
-        duckdb_engine.begin_heavy()
+        # DuckDB/DuckLake dbt runs are batch transforms: serial model execution, with
+        # the whole heavy pool reserved so one shared temp directory has full headroom.
+        dbt_target = str((env_vars or {}).get("DBT_TARGET") or self.default_target())
+        _threads, budget_slots, memory_mb, temp_mb = self._dbt_budget_values(dbt_target)
+        reserved_slots = duckdb_engine.begin_heavy(
+            budget_slots,
+            kind="dbt",
+            memory_limit_mb=memory_mb,
+            temp_limit_mb=temp_mb,
+            temp_path=spill_dir.as_posix(),
+            detail=f"dbt {command}",
+        )
 
         start_time = time.time()
         try:
@@ -706,7 +719,7 @@ class DbtRunner:
             if isolates_artifacts:
                 self._publish_dbt_artifacts(scratch_target, self.dbt_project_dir / "target")
             self._discard_scratch(scratch_target if isolates_artifacts else None, scratch_db)
-            duckdb_engine.end_heavy()
+            duckdb_engine.end_heavy(reserved_slots)
 
         duration = round(time.time() - start_time, 2)
         success = exit_code == 0
@@ -1199,6 +1212,58 @@ class DbtRunner:
             "warehouse": describe_warehouse_postgres(),
         }
 
+    def _dbt_model_threads(self, target: str = "") -> int:
+        """Model threads for one dbt process.
+
+        DuckDB/DuckLake DDL is not safe under concurrent model execution: parallel
+        CREATE OR REPLACE operations can conflict on schema/table renames. The lakehouse
+        target therefore runs one model at a time. Other adapters may use the normal
+        CPU-derived concurrency, capped by the heavy-slot count.
+        """
+        from app.core.resource_advisor import advisor
+
+        adapter = self._target_adapter((target or self.default_target()).lower())
+        if adapter == "duckdb":
+            return 1
+        total_slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
+        requested = (
+            int(settings.DUCKDB_THREADS)
+            if settings.DUCKDB_THREADS
+            else advisor.get_duckdb_threads(total_slots)
+        )
+        return max(1, min(total_slots, requested))
+
+    def _dbt_budget_slots(self, target: str = "") -> int:
+        """Heavy permits a dbt process reserves for its database-wide budget.
+
+        A lakehouse dbt run is a batch transform with serial model execution but one
+        shared DuckDB temp directory across the whole project. It reserves the entire
+        heavy pool for the run, which both prevents concurrent DuckLake writer
+        conflicts and gives the process the full safe memory/spill ceiling.
+        """
+        adapter = self._target_adapter((target or self.default_target()).lower())
+        if adapter == "duckdb":
+            return max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
+        return self._dbt_model_threads(target)
+
+    def _dbt_budget_values(self, target: str = "") -> tuple[int, int, int, int]:
+        """Return ``(model_threads, budget_slots, memory_mb, temp_mb)`` for one dbt process."""
+        from app.core.resource_advisor import advisor
+
+        total_slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
+        threads = self._dbt_model_threads(target)
+        budget_slots = self._dbt_budget_slots(target)
+        memory_mb = advisor.get_duckdb_memory_limit_mb(total_slots) * budget_slots
+        temp_mb = (
+            advisor.get_duckdb_temp_limit_mb(
+                settings.duckdb_temp_path.as_posix(),
+                settings.DUCKDB_TEMP_SIZE_LIMIT,
+                total_slots,
+            )
+            * budget_slots
+        )
+        return threads, budget_slots, memory_mb, temp_mb
+
     def _get_target_env(
         self, target: str = "", connection_id: Optional[str] = None
     ) -> Dict[str, str]:
@@ -1251,18 +1316,19 @@ class DbtRunner:
             # The lake's data path is where its Parquet goes; the profile passes it on
             # attach so a fresh install lands in the same directory as ingestion does.
             env["DBT_LAKEHOUSE_DATA_PATH"] = settings.duckdb_storage_path
-            # In dbt, DuckDB runs on a dedicated database instance (dbt.duckdb) where
-            # both memory_limit and max_temp_directory_size govern the whole process.
-            # Sizing with concurrent_slots=1 ensures multi-million-row mart transforms
-            # (which aggregate 37M rows with quantiles and window functions across 2 threads)
-            # have sufficient memory (at least 4GB) and spill headroom rather than starving on 1/slots.
-            dbt_mem = advisor.get_duckdb_memory_limit(concurrent_slots=1)
-            env["DBT_DUCKDB_MEMORY_LIMIT"] = dbt_mem if (int(dbt_mem.rstrip("GB")) >= 4) else "4GB"
-            env["DBT_DUCKDB_MAX_TEMP_SIZE"] = advisor.get_duckdb_temp_limit(
-                settings.duckdb_temp_path.as_posix(),
-                settings.DUCKDB_TEMP_SIZE_LIMIT,
-                concurrent_slots=1,
+            # In dbt, DuckDB runs in a separate process, so its limits must be consistent
+            # with the heavy permits it reserves. dbt's model threads each run a query,
+            # so a three-thread dbt process reserves three slot shares; its database-wide
+            # memory and spill settings are sized for that whole reservation.
+            dbt_threads, budget_slots, dbt_mem_mb, dbt_temp_mb = (
+                self._dbt_budget_values(clean_target)
             )
+            env["DBT_DUCKDB_MEMORY_LIMIT"] = f"{dbt_mem_mb}MiB"
+            env["DBT_DUCKDB_THREADS"] = str(dbt_threads)
+            env["DBT_DUCKDB_MAX_TEMP_SIZE"] = f"{dbt_temp_mb}MiB"
+            env["DBT_DUCKDB_TEMP_DIR"] = (
+                settings.duckdb_temp_path / "dbt_spill"
+            ).as_posix()
 
         return env
 
@@ -1409,13 +1475,23 @@ class DbtRunner:
             env.update(env_vars)
         # This run's own DuckDB file: the shared one locked out every other dbt process.
         env["DBT_DUCKDB_PATH"] = scratch_db.as_posix()
+        spill_dir = scratch_db.with_name(f"{scratch_db.stem}_spill")
+        spill_dir.mkdir(parents=True, exist_ok=True)
+        env["DBT_DUCKDB_TEMP_DIR"] = spill_dir.as_posix()
 
         from app.engines.duckdb_engine import duckdb_engine
 
-        # A dbt run is a whole DuckDB process holding the same per-slot budget as an
-        # in-process connection, so it takes one. Otherwise the host runs
-        # ``slots + 1`` processes that each believe they own an equal share of it.
-        duckdb_engine.begin_heavy()
+        # DuckDB/DuckLake dbt runs are batch transforms: serial model execution, with
+        # the whole heavy pool reserved so one shared temp directory has full headroom.
+        _threads, budget_slots, memory_mb, temp_mb = self._dbt_budget_values(clean_target)
+        reserved_slots = duckdb_engine.begin_heavy(
+            budget_slots,
+            kind="dbt",
+            memory_limit_mb=memory_mb,
+            temp_limit_mb=temp_mb,
+            temp_path=spill_dir.as_posix(),
+            detail=f"dbt {command} {selector or ''}".strip(),
+        )
 
         start_time = time.time()
         try:
@@ -1433,7 +1509,7 @@ class DbtRunner:
             if owns_target:
                 self._publish_dbt_artifacts(scratch_target, self.dbt_project_dir / "target")
             self._discard_scratch(scratch_target if owns_target else None, scratch_db)
-            duckdb_engine.end_heavy()
+            duckdb_engine.end_heavy(reserved_slots)
         duration_sec = round(time.time() - start_time, 2)
         duration_ms = int(duration_sec * 1000)
 

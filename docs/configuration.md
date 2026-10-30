@@ -24,17 +24,35 @@ the canonical list; this page explains what each one does and how the installs d
 | `MARIMO_SESSION_TTL_SECONDS` | `600` | How long a notebook kernel stays alive after its browser tab disconnects (`0` = never expire). |
 | `OBELISK_SERVICE_BIND_HOST` | `127.0.0.1` | Network interface to bind managed Docker database and service containers. |
 | `OBELISK_NET` | `obelisk_net` | Docker network used for companion services. |
-| `DUCKDB_THREADS` | auto | DuckDB worker threads limit. |
-| `DUCKDB_TEMP_SIZE_LIMIT` | `50GB` | Maximum disk spill headroom allocated for out-of-core DuckDB operations. |
+| `DUCKDB_THREADS` | auto | DuckDB worker threads limit. Auto divides logical CPUs by the heavy-slot count. |
+| `DUCKDB_TEMP_SIZE_LIMIT` | `50GB` | Maximum disk spill headroom for out-of-core DuckDB operations, divided across heavy slots and bounded by free disk. Prefer binary units in overrides (`50GiB`). |
 | `DUCKDB_MAX_QUERY_ROWS` | `10000` | Display limit for interactive JSON query studio responses. Full results stream to disk for exports. |
-| `DUCKDB_MAX_CONCURRENT_HEAVY` | `4` | Maximum concurrent heavy DuckDB queries permitted before queuing on the slot semaphore. |
-| `OBELISK_INGEST_MAX_CONCURRENT` | `2` | Maximum concurrent table ingestion jobs. |
+| `DUCKDB_MAX_CONCURRENT_HEAVY` | `4` | Heavy-work permits per process. The topbar aggregates live cross-process leases, so a notebook or pipeline subprocess adds its reservations to the displayed total; the semaphore itself is not a cross-process lock. |
+| `OBELISK_INGEST_MAX_CONCURRENT` | `2` | Maximum concurrent table ingests across every entry point: sync API, batch, pipelines, job manager and SDK. |
+| `OBELISK_LAKEHOUSE_COMPACT_MAX_FILES` | `50` | Upper bound on files rewritten by one automatic or API-triggered compaction pass. |
+| `OBELISK_SQLITE_JOURNAL_MODE` | `WAL` | Control-plane SQLite journal mode. Keep `WAL` on local ext4/XFS. Use `DELETE` only on a filesystem that rejects WAL's shared-memory mapping. |
+| `OBELISK_SQLITE_SYNCHRONOUS` | `NORMAL` | SQLite synchronous mode. `OFF` is an explicit durability tradeoff for virtual filesystems that reject `fsync`. |
 | `OBELISK_ALLOW_COMMUNITY_EXTENSIONS` | `true` | Allows unsigned community extensions (such as the Mongo scanner) in DuckDB. |
 | `OBELISK_SDK_EAGER_WARN_BYTES` | `2147483648` (2 GiB) | SDK eager reader (`to_polars`, `to_arrow`) memory warning threshold. |
 | `OBELISK_SDK_EAGER_REFUSE_BYTES` | `0` (dynamic) | SDK eager reader memory refusal ceiling (`0` derives safe ceiling from host RAM). |
 | `OBELISK_SDK_QUERY_ROW_LIMIT` | `1000000` | Maximum rows `obelisk.query()` materializes before raising and pointing to `iter_batches()`. |
 | `DOCKER_HOST` | unset | Custom Docker daemon socket path. |
 | `SPARK_REMOTE_URL` | unset | Remote Spark Connect cluster URL (e.g., `sc://...`). |
+
+### Engine telemetry and spill
+
+The topbar's engine panel reads live reservations, not just counters in the API process.
+Every heavy job publishes a small lease under
+`<lakehouse>/.obelisk/resource_leases/`, so pipeline scripts, notebooks, SDK calls and
+extra API workers are included. Lease files from dead processes are swept on the next
+telemetry poll.
+
+Each dbt run gets a private spill directory beside its scratch database
+(`data/duckdb_tmp/dbt_scratch_*_spill/`). dbt sets DuckDB's `temp_directory` once in an
+`on-run-start` hook rather than through profile `settings`, because dbt-duckdb reapplies
+profile settings on every cursor and DuckDB refuses a second `temp_directory` change.
+The panel shows the *active* combined temp budget (for a lakehouse dbt run, the whole
+reserved batch pool) and separately shows the per-slot interactive cap.
 
 ## Ports
 

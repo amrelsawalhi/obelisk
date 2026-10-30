@@ -11,6 +11,17 @@ export interface HostSpecs {
   max_safe_allocation_gb: number;
 }
 
+export interface TelemetryReservation {
+  kind: string;
+  slots: number;
+  memory_limit_mb?: number | null;
+  temp_limit_mb?: number | null;
+  temp_path?: string | null;
+  detail?: string | null;
+  pid?: number | null;
+  started_at?: string | null;
+}
+
 export interface TelemetryData {
   cpu_percent: number;
   cpu_count: number;
@@ -24,10 +35,16 @@ export interface TelemetryData {
   active_heavy_queries?: number;
   waiting_heavy_queries?: number;
   max_concurrent_heavy?: number;
+  active_by_kind?: Record<string, number>;
+  active_reservations?: TelemetryReservation[];
   memory_limit_per_slot?: string;
+  active_memory_limit_mb?: number;
   threads_per_slot?: number;
   temp_spill_mb?: number;
   temp_spill_limit?: string;
+  temp_spill_limit_mb?: number;
+  active_temp_limit_mb?: number;
+  temp_spill_scope?: string;
   lakehouse_free_gb?: number;
   lakehouse_percent_used?: number;
   active_load_tables?: number;
@@ -952,6 +969,7 @@ export interface LakehouseMaintenanceResult {
   empty_directories_removed: number;
   delete_files: boolean;
   keep_days: number;
+  max_files: number;
   before: LakehouseCatalogCounts;
   after: LakehouseCatalogCounts;
 }

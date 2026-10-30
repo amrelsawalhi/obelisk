@@ -30,6 +30,13 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
   const [isTelemetryOpen, setIsTelemetryOpen] = useState(false);
   const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
 
+  const fmtMib = (value?: number | null) => {
+    const mib = Number(value ?? 0);
+    if (!Number.isFinite(mib) || mib <= 0) return '0 MiB';
+    if (mib >= 1024) return `${(mib / 1024).toFixed(1)} GiB`;
+    return `${mib.toFixed(mib < 10 ? 1 : 0)} MiB`;
+  };
+
   const popoverRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
 
@@ -160,7 +167,7 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
 
           {/* Popover Flyout */}
           {isTelemetryOpen && (
-            <div className="absolute right-0 mt-2 w-72 rounded-xl bg-white border border-slate-200 shadow-xl p-4 z-50 text-xs space-y-3.5 animate-in fade-in-50 zoom-in-95 duration-100">
+            <div className="absolute right-0 mt-2 w-80 rounded-xl bg-white border border-slate-200 shadow-xl p-4 z-50 text-xs space-y-3.5 animate-in fade-in-50 zoom-in-95 duration-100">
               {/* Popover Header */}
               <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
                 <div className="flex items-center gap-1.5">
@@ -234,10 +241,40 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, onOpenCommand, onNavi
                           : ''}
                       </span>
                     </div>
+                    {Object.keys(telemetry.active_by_kind ?? {}).length > 0 && (
+                      <div className="flex items-start justify-between gap-2 text-[10px] text-slate-500">
+                        <span>Reserved by</span>
+                        <span className="text-right font-mono text-slate-700">
+                          {Object.entries(telemetry.active_by_kind ?? {})
+                            .filter(([, slots]) => slots > 0)
+                            .map(([kind, slots]) => `${kind} × ${slots}`)
+                            .join(', ')}
+                        </span>
+                      </div>
+                    )}
                     <div className="flex items-center justify-between">
-                      <span className="font-medium text-slate-700">Temp Spill Usage</span>
+                      <span className="font-medium text-slate-700">DuckDB Memory Budget</span>
                       <span className="font-mono text-slate-800">
-                        {telemetry.temp_spill_mb ?? 0} MB / {telemetry.temp_spill_limit ?? '50GB'}
+                        {fmtMib(telemetry.active_memory_limit_mb)}
+                      </span>
+                    </div>
+                    <div
+                      className="flex items-center justify-between gap-2"
+                      title={telemetry.temp_spill_scope}
+                    >
+                      <span className="font-medium text-slate-700">Temp / Spill Usage</span>
+                      <span className="font-mono text-right text-slate-800">
+                        {fmtMib(telemetry.temp_spill_mb)} /{' '}
+                        {fmtMib(
+                          telemetry.active_temp_limit_mb ??
+                            telemetry.temp_spill_limit_mb,
+                        )}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] text-slate-400">
+                      <span>Interactive per-slot cap</span>
+                      <span className="font-mono">
+                        {fmtMib(telemetry.temp_spill_limit_mb)}
                       </span>
                     </div>
                     <div className="flex items-center justify-between">

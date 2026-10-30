@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowDownToLine,
@@ -7,6 +7,7 @@ import {
   Database,
   Folder,
   Layers,
+  Maximize2,
   Plus,
   RefreshCw,
   ScrollText,
@@ -28,6 +29,9 @@ import type {
 } from '../../lib/types';
 import { statusStyle, stepTypeLabel } from './PipelineCanvas';
 import type { StepRuntime } from './PipelineCanvas';
+import { deriveStepOutputs, stepSlug as slug, type ParentStepOutput } from '../../lib/pipelineOutputs';
+
+const PipelineSqlEditorModal = lazy(() => import('./PipelineSqlEditorModal'));
 
 const TYPE_OPTIONS: StepType[] = [
   'ingest',
@@ -50,6 +54,8 @@ interface PipelineInspectorProps {
   pipelines?: PipelineSummary[];
   /** Names of the direct parents, used to suggest the tokens this step may read. */
   parents?: string[];
+  /** Direct parents with their declared outputs, for the expanded SQL editor. */
+  parentOutputs?: ParentStepOutput[];
   /** Edges touching this step, so they can be re-conditioned or removed here. */
   connections?: Array<{
     direction: 'in' | 'out';
@@ -84,8 +90,6 @@ const inputClass =
   'w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs focus:border-sky-500 focus:ring-1 focus:ring-sky-500 focus:outline-hidden transition-all';
 
 const token = (name: string, output: string) => `{{steps.${name}.${output}}}`;
-
-const slug = (value: string) => value.replace(/[^A-Za-z0-9_]+/g, '_');
 
 /** Shows a captured output; sensitive ones stay masked until asked for. */
 const OutputValue: React.FC<{ name: string; output: { type: string; value: unknown }; sensitive: boolean }> = ({
@@ -155,6 +159,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
   targets,
   pipelines,
   parents,
+  parentOutputs,
   connections,
   onEditEdge,
   onRemoveEdge,
@@ -169,11 +174,12 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
   const [copiedToken, setCopiedToken] = useState<string | null>(null);
   const [catalogNodes, setCatalogNodes] = useState<CatalogNode[]>([]);
   const [tableSearch, setTableSearch] = useState("");
+  const [sqlEditorOpen, setSqlEditorOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
     api.getCatalogTree().then((nodes) => {
-      if (active) setCatalogNodes(nodes.filter((n) => n.type !== "lakehouse"));
+      if (active) setCatalogNodes(nodes);
     }).catch(() => {});
     return () => { active = false; };
   }, []);
@@ -188,6 +194,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
       }
     }
     for (const node of catalogNodes) {
+      if (node.type === "lakehouse" || node.id === "lakehouse") continue;
       if (!seen.has(node.id)) {
         seen.add(node.id);
         list.push({ id: node.id, name: node.name, source_type: node.type });
@@ -427,20 +434,7 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
     enabled: pipeline.is_enabled,
   }));
 
-  const available = [
-    ...Object.entries(declared).map(([name, spec]) => ({
-      name,
-      type: spec?.type === "table" ? "table" : "scalar",
-      derived: false,
-    })),
-    ...(isRawSql ? [{ name: "rows", type: "scalar", derived: true }] : []),
-    ...(isIngest ? [
-      { name: "table", type: "table", derived: true },
-      { name: "rows", type: "scalar", derived: true },
-    ] : []),
-    ...(materialize ? [{ name: "table", type: "table", derived: true }] : []),
-    ...(isDbt ? [{ name: "dbt_summary", type: "scalar", derived: true }] : []),
-  ];
+  const available = deriveStepOutputs(step);
 
   const addOutput = () => {
     const name = slug(newOutput.trim());
@@ -1083,12 +1077,24 @@ export const PipelineInspector: React.FC<PipelineInspectorProps> = ({
                     ))}
                   </select>
                 ) : isRawSql ? (
-                  <textarea
-                    ref={targetRef}
-                    className={`${inputClass} h-32 font-mono`}
-                    value={step.target}
-                    onChange={(event) => onChange({ target: event.target.value })}
-                  />
+                  <div className="space-y-1">
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => setSqlEditorOpen(true)}
+                        className="flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600 transition-colors hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700"
+                      >
+                        <Maximize2 className="h-3 w-3" />
+                        Expand editor
+                      </button>
+                    </div>
+                    <textarea
+                      ref={targetRef}
+                      className={`${inputClass} h-32 font-mono`}
+                      value={step.target}
+                      onChange={(event) => onChange({ target: event.target.value })}
+                    />
+                  </div>
                 ) : targetOptions.length && step.step_type !== "webhook" ? (
                   <select
                     className={inputClass}
@@ -1518,6 +1524,25 @@ with open(os.environ["OBELISK_OUTPUT_FILE"], "w") as fh:
           </>
         )}
       </div>
+      {isRawSql && sqlEditorOpen && (
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/40 text-xs text-white">
+              Loading SQL editor…
+            </div>
+          }
+        >
+          <PipelineSqlEditorModal
+            open={sqlEditorOpen}
+            stepName={step.name}
+            initialSql={step.target}
+            parentOutputs={parentOutputs ?? []}
+            catalogNodes={catalogNodes}
+            onApply={(sql) => onChange({ target: sql })}
+            onClose={() => setSqlEditorOpen(false)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 };

@@ -4,18 +4,19 @@ import re
 import psutil
 from typing import Dict, Any, List
 
-# Multipliers to megabytes, so a configured "50GB" and a computed byte count can be compared.
-_SIZE_UNITS_MB = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
+# Multipliers to mebibytes. ResourceAdvisor emits MiB/GiB because DuckDB parses those as
+# binary units; a bare "GB" is 10^9 bytes and silently shrinks the budget by ~6.9%.
+_SIZE_UNITS_MIB = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
 
 
-def _parse_size_to_mb(value: object) -> int | None:
-    """'50GB' / '512MB' / '2T' -> megabytes. ``None`` when the text is not a size."""
+def _parse_size_to_mib(value: object) -> int | None:
+    """'50GB' / '512MB' / '2T' -> mebibytes. ``None`` when the text is not a size."""
     text = str(value or "").strip().upper().replace(" ", "")
     match = re.match(r"^([0-9]+(?:\.[0-9]+)?)([KMGT]?)I?B?(?:YTES?)?$", text)
     if not match:
         return None
     number = float(match.group(1))
-    return int(number * _SIZE_UNITS_MB[match.group(2)])
+    return int(number * _SIZE_UNITS_MIB[match.group(2)])
 
 
 def _existing_path(path: object) -> str:
@@ -44,18 +45,23 @@ class ResourceAdvisor:
         cpu_count = psutil.cpu_count(logical=True) or 1
         cpu_percent = psutil.cpu_percent(interval=None)
 
-        total_ram_gb = vm.total / (1024 ** 3)
-        available_ram_gb = vm.available / (1024 ** 3)
+        total_ram_gib = vm.total / (1024 ** 3)
+        available_ram_gib = vm.available / (1024 ** 3)
 
         return {
             "total_ram_bytes": vm.total,
-            "total_ram_gb": round(total_ram_gb, 2),
-            "available_ram_gb": round(available_ram_gb, 2),
+            # The historical key names are kept for API clients, but these values are
+            # binary GiB. New code should use the explicit *_gib spellings.
+            "total_ram_gb": round(total_ram_gib, 2),
+            "total_ram_gib": round(total_ram_gib, 2),
+            "available_ram_gb": round(available_ram_gib, 2),
+            "available_ram_gib": round(available_ram_gib, 2),
             "ram_percent_used": vm.percent,
             "cpu_count": cpu_count,
             "cpu_percent": cpu_percent,
             "max_safe_allocation_bytes": int(vm.total * 0.85),
-            "max_safe_allocation_gb": round(total_ram_gb * 0.85, 2),
+            "max_safe_allocation_gb": round(total_ram_gib * 0.85, 2),
+            "max_safe_allocation_gib": round(total_ram_gib * 0.85, 2),
         }
 
     def get_disk_info(self, path: str = ".") -> Dict[str, Any]:
@@ -162,16 +168,32 @@ class ResourceAdvisor:
             "remaining_safe_gb": remaining_safe_gb,
         }
 
-    def get_duckdb_memory_limit(self, concurrent_slots: int = 4) -> str:
-        """Returns safe per-connection memory limit for DuckDB initialization."""
+    def get_duckdb_memory_limit_mb(self, concurrent_slots: int = 4) -> int:
+        """Safe per-connection DuckDB memory in MiB.
+
+        The 50% DuckDB share is divided across the heavy slots and rounded down. There
+        is deliberately no 1 GB floor and no fixed 12 GB ceiling: either one can promise
+        more memory than the host has (on a small host) or leave a large host mostly
+        unused. The invariant is simply ``slots * per_slot <= 50% of safe RAM``.
+        """
         specs = self.get_host_specs()
         active = self.get_active_container_allocations()
-        remaining_safe_gb = max(
-            2.0, specs["max_safe_allocation_gb"] - active["total_allocated_gb"]
+        remaining_safe_mib = max(
+            1,
+            (int(specs["max_safe_allocation_bytes"]) - int(active["total_allocated_bytes"]))
+            // (1024 ** 2),
         )
         slots = max(1, int(concurrent_slots))
-        per_slot_gb = max(1, min(12, int((remaining_safe_gb * 0.50) / slots)))
-        return f"{per_slot_gb}GB"
+        return max(1, (remaining_safe_mib * 50 // 100) // slots)
+
+    def get_duckdb_memory_limit(self, concurrent_slots: int = 4) -> str:
+        """Returns an explicit binary-unit per-connection memory limit for DuckDB."""
+        return f"{self.get_duckdb_memory_limit_mb(concurrent_slots)}MiB"
+
+    def get_duckdb_threads(self, concurrent_slots: int = 4) -> int:
+        """Worker threads per heavy connection, so concurrent work cannot oversubscribe CPUs."""
+        cpu_cores = os.cpu_count() or 4
+        return max(1, int(cpu_cores) // max(1, int(concurrent_slots)))
 
     def get_duckdb_temp_limit_mb(
         self, path: str, configured: str = "50GB", concurrent_slots: int = 1
@@ -183,22 +205,22 @@ class ResourceAdvisor:
         same time. Without the division four connections could each spill 50% of free
         disk, i.e. twice the volume.
         """
-        wanted = _parse_size_to_mb(configured) or 50 * 1024
+        wanted = _parse_size_to_mib(configured) or 50 * 1024
         slots = max(1, int(concurrent_slots))
         try:
             free_bytes = int(psutil.disk_usage(_existing_path(path)).free)
         except Exception:
-            allowed_mb = wanted
+            allowed_mib = wanted
         else:
-            allowed_mb = max(1024, free_bytes // (1024 * 1024) // 2)
-        total_mb = min(wanted, allowed_mb)
-        return max(1, total_mb // slots)
+            allowed_mib = max(1, free_bytes // (1024 ** 2) // 2)
+        total_mib = min(wanted, allowed_mib)
+        return max(1, total_mib // slots)
 
     def get_duckdb_temp_limit(
         self, path: str, configured: str = "50GB", concurrent_slots: int = 1
     ) -> str:
         """How much one DuckDB connection may spill, given what is actually free."""
-        return f"{self.get_duckdb_temp_limit_mb(path, configured, concurrent_slots)}MB"
+        return f"{self.get_duckdb_temp_limit_mb(path, configured, concurrent_slots)}MiB"
 
     def get_spark_memory_limit(self) -> str:
         """Returns safe memory limit string for PySpark driver initialization (e.g. '2g', '4g')."""

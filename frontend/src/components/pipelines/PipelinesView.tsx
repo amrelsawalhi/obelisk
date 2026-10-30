@@ -36,6 +36,7 @@ import type {
 import { ConfirmDialog, type ConfirmRequest } from '../common/ConfirmDialog';
 import { EDGE_COLOURS, PipelineCanvas, type StepRuntime } from './PipelineCanvas';
 import { arrangeGraph } from '../../lib/graphLayout';
+import { deriveStepOutputs, type ParentStepOutput } from '../../lib/pipelineOutputs';
 import { PipelineInspector } from './PipelineInspector';
 import { PipelineRail } from './PipelineRail';
 import { PipelineRunsTable, fmtDuration } from './PipelineRunsTable';
@@ -385,6 +386,20 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
       const name = names.get(edge.from_key);
       if (!name) continue;
       map[edge.to_key] = [...(map[edge.to_key] ?? []), name];
+    }
+    return map;
+  }, [draft.steps, draft.edges]);
+
+  const parentOutputsByStep = useMemo(() => {
+    const stepsByKey = new Map(draft.steps.map((step) => [step.key, step]));
+    const map: Record<string, ParentStepOutput[]> = {};
+    for (const edge of draft.edges) {
+      const parent = stepsByKey.get(edge.from_key);
+      if (!parent) continue;
+      map[edge.to_key] = [
+        ...(map[edge.to_key] ?? []),
+        { stepName: parent.name, outputs: deriveStepOutputs(parent) },
+      ];
     }
     return map;
   }, [draft.steps, draft.edges]);
@@ -1334,6 +1349,9 @@ export const PipelinesView: React.FC<PipelinesViewProps> = () => {
                     targets={targets}
                     pipelines={pipelines.filter((item) => item.id !== detail.id)}
                     parents={selectedStepKey ? parentsByStep[selectedStepKey] ?? [] : []}
+                    parentOutputs={
+                      selectedStepKey ? parentOutputsByStep[selectedStepKey] ?? [] : []
+                    }
                     connections={connections}
                     onEditEdge={(from, to) => setEdgeDialog({ from, to, existing: true })}
                     onRemoveEdge={removeEdge}

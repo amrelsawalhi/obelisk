@@ -22,12 +22,52 @@ Nothing here knows about dbt, the catalog or the API.
 """
 from __future__ import annotations
 
+import errno
+import logging
 import os
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Iterable, Protocol
+
+
+logger = logging.getLogger(__name__)
+
+_FSYNC_UNSUPPORTED = {errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS}
+_FSYNC_WARNING_LOCK = threading.Lock()
+_FSYNC_WARNING_EMITTED = False
+
+
+def _is_unsupported_fsync_error(exc: OSError) -> bool:
+    """Whether a filesystem says it cannot fsync this file (rather than failing I/O)."""
+    return getattr(exc, "errno", None) in _FSYNC_UNSUPPORTED
+
+
+def _fsync_best_effort(handle: BinaryIO) -> None:
+    """fsync when the filesystem supports it; warn once when it explicitly does not.
+
+    Atomic rename still guarantees readers never see a partial file. On a virtual
+    filesystem without fsync passthrough, refusing the write would make the whole
+    platform unusable; silently ignoring every other OSError would hide real disk
+    failures. Only the explicit "operation not supported" family is tolerated.
+    """
+    global _FSYNC_WARNING_EMITTED
+    try:
+        os.fsync(handle.fileno())
+    except OSError as exc:
+        if not _is_unsupported_fsync_error(exc):
+            raise
+        with _FSYNC_WARNING_LOCK:
+            if not _FSYNC_WARNING_EMITTED:
+                logger.warning(
+                    "This filesystem does not support fsync (%s). Atomic writes still "
+                    "prevent partial files, but power-loss durability depends on the "
+                    "underlying storage. Use a local POSIX filesystem for production data.",
+                    exc,
+                )
+                _FSYNC_WARNING_EMITTED = True
 
 
 class InvalidPath(ValueError):
@@ -173,7 +213,7 @@ class LocalWarehouse:
             with temporary.open("wb") as handle:
                 handle.write(data)
                 handle.flush()
-                os.fsync(handle.fileno())
+                _fsync_best_effort(handle)
             os.replace(temporary, target)
         finally:
             if temporary.exists():
