@@ -82,6 +82,87 @@ DEFAULT_ADMIN_PASSWORD = "obelisk2026"
 
 _ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
 
+# ------------------------------------------------------------------ slot sizing
+# ``DUCKDB_MAX_CONCURRENT_HEAVY=auto`` derives the heavy pool from the machine instead
+# of shipping one number to every host. The anchor is threads-per-slot, not a fixed
+# slot count: a 96-core server should run 24 concurrent 4-thread queries rather than 8
+# twelve-thread ones. CPUs bound the count from above; the memory pool bounds it from
+# below (a slot that cannot hold a join is not a slot); and the floor keeps small
+# workstations at the historical default of four.
+MIN_AUTO_HEAVY_SLOTS = 4
+MAX_AUTO_HEAVY_SLOTS = 32
+MIN_MEMORY_MIB_PER_SLOT = 4096
+DEFAULT_MIN_THREADS_PER_SLOT = 4
+MAX_LIGHT_SLOTS = 8
+
+
+def derive_heavy_slots(
+    cpu_count: int,
+    pool_mib: int,
+    *,
+    min_threads_per_slot: int = DEFAULT_MIN_THREADS_PER_SLOT,
+    min_memory_mib_per_slot: int = MIN_MEMORY_MIB_PER_SLOT,
+    hard_cap: int = MAX_AUTO_HEAVY_SLOTS,
+) -> int:
+    """Heavy slots a ``(cpus, memory pool)`` host gets when the operator says auto.
+
+    Pure on purpose: the test suite forbids monkeypatching, so the formula is
+    exercised by passing host shapes directly instead of faking ``os.cpu_count``.
+    """
+    cpu_slots = int(cpu_count) // max(1, int(min_threads_per_slot))
+    memory_slots = int(pool_mib) // max(1, int(min_memory_mib_per_slot))
+    return max(MIN_AUTO_HEAVY_SLOTS, min(cpu_slots, memory_slots, int(hard_cap)))
+
+
+def derive_light_slots(heavy_slots: int) -> int:
+    """Cheap-query permits for a pool of ``heavy_slots``.
+
+    Half the heavy pool, capped: ``(N + N/2)`` connections times the per-slot memory
+    keeps the worst case at 63.75% of RAM, inside the 85% safe allocation.
+    """
+    return max(1, min(MAX_LIGHT_SLOTS, int(heavy_slots) // 2))
+
+
+def _explicit_threads() -> int:
+    try:
+        return max(0, int(os.getenv("DUCKDB_THREADS", "0") or 0))
+    except ValueError:
+        return 0
+
+
+def _resolve_heavy_slots() -> int:
+    """Resolve ``DUCKDB_MAX_CONCURRENT_HEAVY``; ``auto`` follows the machine."""
+    raw = os.getenv("DUCKDB_MAX_CONCURRENT_HEAVY", "auto").strip().lower()
+    if raw not in ("", "auto"):
+        return max(1, int(raw))
+    try:
+        import psutil  # deferred: keeps app.config importable on its own
+
+        total_mib = int(psutil.virtual_memory().total) // (1024 ** 2)
+    except Exception:
+        total_mib = 8 * 1024
+    # The same arithmetic ResourceAdvisor uses: 50% of the 85% safe allocation.
+    pool_mib = max(1, total_mib * 85 // 100 * 50 // 100)
+    try:
+        configured_threads = int(os.getenv("DUCKDB_MIN_THREADS_PER_SLOT", "4") or 4)
+    except ValueError:
+        configured_threads = DEFAULT_MIN_THREADS_PER_SLOT
+    anchor = max(
+        DEFAULT_MIN_THREADS_PER_SLOT,
+        configured_threads,
+        _explicit_threads(),
+    )
+    return derive_heavy_slots(os.cpu_count() or 4, pool_mib, min_threads_per_slot=anchor)
+
+
+def _resolve_light_slots() -> int:
+    """Resolve ``DUCKDB_MAX_CONCURRENT_LIGHT``; ``auto`` follows the heavy pool."""
+    raw = os.getenv("DUCKDB_MAX_CONCURRENT_LIGHT", "auto").strip().lower()
+    if raw not in ("", "auto"):
+        return max(1, int(raw))
+    return derive_light_slots(_resolve_heavy_slots())
+
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -239,8 +320,17 @@ class Settings(BaseSettings):
         ).lower()
         in ("1", "true", "yes", "on")
     )
+    # Spill ceiling. "0" (the default) means "no config cap": the limit follows the
+    # free space on the spill filesystem, so a host with terabytes free is not held to
+    # a 50 GB number written for a laptop. An explicit size also imposes a hard cap
+    # (shared volumes, multi-tenant hosts).
     DUCKDB_TEMP_SIZE_LIMIT: str = Field(
-        default_factory=lambda: os.getenv("DUCKDB_TEMP_SIZE_LIMIT", "50GB")
+        default_factory=lambda: os.getenv("DUCKDB_TEMP_SIZE_LIMIT", "0")
+    )
+    # Share of the spill filesystem's *current* free space the process may claim,
+    # divided across the connections that may spill at once.
+    DUCKDB_TEMP_SPILL_FREE_DISK_PCT: int = Field(
+        default_factory=lambda: int(os.getenv("DUCKDB_TEMP_SPILL_FREE_DISK_PCT", "50"))
     )
     # Upper bound on files rewritten by one automatic or API-triggered compaction run.
     # A scheduled maintenance job can drain a larger backlog off-peak.
@@ -264,8 +354,30 @@ class Settings(BaseSettings):
     )
     # How many DuckDB connections may be doing heavy work at once. The per-slot memory
     # limit is derived from this so concurrent queries cannot together exceed the host.
-    DUCKDB_MAX_CONCURRENT_HEAVY: int = Field(
-        default_factory=lambda: int(os.getenv("DUCKDB_MAX_CONCURRENT_HEAVY", "4"))
+    # "auto" resolves it from the machine (see derive_heavy_slots above); an explicit
+    # integer still wins. Every other budget reads this resolved value, so threads,
+    # memory, spill and the light pool all scale with it.
+    DUCKDB_MAX_CONCURRENT_HEAVY: int = Field(default_factory=_resolve_heavy_slots)
+    # Threads a heavy slot needs before another slot is added, when resolving "auto".
+    # Raise it for fewer, fatter slots (batch-heavy hosts); lower it for more
+    # concurrent interactive users.
+    DUCKDB_MIN_THREADS_PER_SLOT: int = Field(
+        default_factory=lambda: max(
+            1, int(os.getenv("DUCKDB_MIN_THREADS_PER_SLOT", "4") or 4)
+        )
+    )
+    # Cheap, row-capped queries (catalog previews, point lookups, metadata) get their
+    # own small pool so one is never queued behind a multi-second scan or a dbt build.
+    # "auto" resolves to half the heavy pool, capped at 8.
+    DUCKDB_MAX_CONCURRENT_LIGHT: int = Field(default_factory=_resolve_light_slots)
+    # What a lakehouse dbt run reserves of the heavy pool. "auto" = half of it: models
+    # run serially, so the run never needed the whole pool, and reserving it turned
+    # every dashboard query into a timeout for the length of the build. An integer up
+    # to the pool size restores a manual choice (writer exclusion is enforced
+    # separately by the engine's writer lock either way).
+    DBT_RESERVED_SLOTS: str = Field(
+        default_factory=lambda: os.getenv("OBELISK_DBT_RESERVED_SLOTS", "auto").strip()
+        or "auto"
     )
     # How many ingests may run at once. Each one holds a DuckDB connection and a heavy
     # slot for its whole run, so this must stay below DUCKDB_MAX_CONCURRENT_HEAVY or the

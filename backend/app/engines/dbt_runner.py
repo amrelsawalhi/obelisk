@@ -1236,15 +1236,28 @@ class DbtRunner:
     def _dbt_budget_slots(self, target: str = "") -> int:
         """Heavy permits a dbt process reserves for its database-wide budget.
 
-        A lakehouse dbt run is a batch transform with serial model execution but one
-        shared DuckDB temp directory across the whole project. It reserves the entire
-        heavy pool for the run, which both prevents concurrent DuckLake writer
-        conflicts and gives the process the full safe memory/spill ceiling.
+        A lakehouse dbt run executes models serially (``threads=1``), so it never
+        needed the whole pool — and reserving it turned every dashboard query and
+        ingest into a 30-second timeout for the length of the build. Half the pool
+        gives the run a comfortable memory/spill ceiling while the other half keeps
+        interactive queries moving. Writer-vs-writer exclusion is enforced separately
+        by the engine's writer lock, so this number is about resources, not safety.
+
+        ``OBELISK_DBT_RESERVED_SLOTS`` overrides it: ``auto`` (default) = half the
+        pool, an integer up to the pool size restores a manual choice (``N`` is the
+        legacy "own the whole pool" behaviour).
         """
+        total_slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
         adapter = self._target_adapter((target or self.default_target()).lower())
-        if adapter == "duckdb":
-            return max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
-        return self._dbt_model_threads(target)
+        if adapter != "duckdb":
+            return self._dbt_model_threads(target)
+        raw = str(getattr(settings, "DBT_RESERVED_SLOTS", "auto") or "auto").strip().lower()
+        if raw not in ("", "auto"):
+            try:
+                return max(1, min(total_slots, int(raw)))
+            except ValueError:
+                pass
+        return max(1, total_slots // 2)
 
     def _dbt_budget_values(self, target: str = "") -> tuple[int, int, int, int]:
         """Return ``(model_threads, budget_slots, memory_mb, temp_mb)`` for one dbt process."""
@@ -1259,6 +1272,7 @@ class DbtRunner:
                 settings.duckdb_temp_path.as_posix(),
                 settings.DUCKDB_TEMP_SIZE_LIMIT,
                 total_slots,
+                settings.DUCKDB_TEMP_SPILL_FREE_DISK_PCT,
             )
             * budget_slots
         )

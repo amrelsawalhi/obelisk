@@ -43,10 +43,14 @@ services:
       # published on the host, and /notebooks/* is behind forward_auth in the Caddyfile,
       # so this is not an exposure.
       - MARIMO_HOST=${MARIMO_HOST:-0.0.0.0}
-      # The resource budget the whole platform is sized against.
-      - DUCKDB_MAX_CONCURRENT_HEAVY=${DUCKDB_MAX_CONCURRENT_HEAVY:-4}
+      # The resource budget the whole platform is sized against. "auto" derives the
+      # heavy pool from this container's CPUs and memory; an integer still wins.
+      - DUCKDB_MAX_CONCURRENT_HEAVY=${DUCKDB_MAX_CONCURRENT_HEAVY:-auto}
       - OBELISK_INGEST_MAX_CONCURRENT=${OBELISK_INGEST_MAX_CONCURRENT:-2}
-      - DUCKDB_TEMP_SIZE_LIMIT=${DUCKDB_TEMP_SIZE_LIMIT:-50GB}
+      # "0" means no config cap: the spill ceiling follows the free space on the temp
+      # volume, divided across slots. Set an explicit size for a hard cap.
+      - DUCKDB_TEMP_SIZE_LIMIT=${DUCKDB_TEMP_SIZE_LIMIT:-0}
+      - DUCKDB_TEMP_SPILL_FREE_DISK_PCT=${DUCKDB_TEMP_SPILL_FREE_DISK_PCT:-50}
       - OBELISK_NET=obelisk_net
     networks:
       - obelisk_net

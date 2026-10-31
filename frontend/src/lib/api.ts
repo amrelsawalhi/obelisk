@@ -297,6 +297,12 @@ export const api = {
     const res = await apiClient.post<import('./types').ConnectionTestResult>('/catalog/connections/test', req);
     return res.data;
   },
+  // The shipped REST connector recipes. They are data: a preset fills the connection
+  // form, and ingestion validates the resulting options the same way.
+  getApiPresets: async (): Promise<import('./types').ApiIngestPreset[]> => {
+    const res = await apiClient.get<import('./types').ApiIngestPreset[]>('/catalog/api-presets');
+    return res.data;
+  },
 
   // Ingestion
   triggerIngest: async (req: IngestTriggerRequest): Promise<IngestTriggerResponse> => {

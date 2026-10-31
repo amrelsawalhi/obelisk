@@ -43,6 +43,82 @@ def _compiled_rewrite_pattern(
     )
 
 
+# --------------------------------------------------------------- light queries
+# A "light" query cannot allocate memory proportional to the table and reads at most a
+# handful of row groups: a projection/filter with a small pushed-down LIMIT, or a
+# metadata statement. Those are what a dashboard issues constantly, so they must not
+# queue behind an analytical scan or a dbt build. Anything ambiguous stays heavy.
+MAX_LIGHT_LIMIT = 1000
+_METADATA_LEADERS = ("EXPLAIN", "DESCRIBE", "SHOW", "SUMMARIZE", "PRAGMA")
+_HEAVY_KEYWORDS = re.compile(
+    r"\b(JOIN|UNION|INTERSECT|EXCEPT|GROUP\s+BY|ORDER\s+BY|DISTINCT|QUALIFY|WINDOW"
+    r"|WITH|HAVING)\b"
+)
+_WINDOW_CALL = re.compile(r"\bOVER\s*\(")
+_AGGREGATE_CALL = re.compile(
+    r"\b(COUNT|SUM|AVG|MIN|MAX|MEDIAN|STDDEV|STDDEV_POP|STDDEV_SAMP|VAR_POP|VAR_SAMP"
+    r"|VARIANCE|CORR|COVAR_POP|COVAR_SAMP|APPROX_[A-Z_]+|LIST|ARRAY_AGG|STRING_AGG"
+    r"|BIT_AND|BIT_OR|BIT_XOR|PRODUCT|FIRST|LAST|ANY_VALUE|BOOL_AND|BOOL_OR)\s*\("
+)
+_SUBQUERY = re.compile(r"\(\s*SELECT\b")
+_LIMIT_TAIL = re.compile(r"\bLIMIT\s+(\d+)\s*$")
+_COMMENTS = re.compile(r"/\*.*?\*/|--[^\n]*", re.DOTALL)
+_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+
+
+def _sql_skeleton(sql: object) -> str:
+    """Comment- and string-free, upper-cased, whitespace-collapsed SQL.
+
+    A keyword inside a comment or a string literal must not change an admission
+    decision (``SELECT 'GROUP BY' AS joke FROM t LIMIT 1`` is still a light query),
+    so both are removed before the classifier looks at the text.
+    """
+    text = _COMMENTS.sub(" ", str(sql or ""))
+    text = _STRING_LITERAL.sub("''", text)
+    return re.sub(r"\s+", " ", text).strip().upper()
+
+
+def classify_light_query(sql: object, *, max_limit: int = MAX_LIGHT_LIMIT) -> bool:
+    """Whether ``sql`` is cheap enough for the light pool. Conservative by design.
+
+    Light requires *all* of: a single statement; either a metadata statement
+    (``EXPLAIN``/``DESCRIBE``/``SHOW``/``SUMMARIZE``/``PRAGMA``) or a ``SELECT`` with a
+    final ``LIMIT`` no larger than ``max_limit``; and none of the operators that
+    allocate memory proportional to the table — joins (explicit or comma), set
+    operations, grouping, ordering, distinct, windows, aggregates, CTEs or
+    subqueries. A misclassified light query only loses an optimisation; a
+    misclassified heavy query would defeat the point of the pool, so the answer is
+    ``False`` unless everything above is proven.
+    """
+    text = _sql_skeleton(sql)
+    if not text:
+        return False
+    if text.endswith(";"):
+        text = text[:-1].rstrip()
+    if ";" in text:
+        return False  # more than one statement
+    leader = text.split(" ", 1)[0]
+    if leader in _METADATA_LEADERS:
+        return True
+    if leader != "SELECT":
+        return False
+    match = _LIMIT_TAIL.search(text)
+    if match is None or int(match.group(1)) > max(1, int(max_limit)):
+        return False
+    if (
+        _HEAVY_KEYWORDS.search(text)
+        or _WINDOW_CALL.search(text)
+        or _AGGREGATE_CALL.search(text)
+        or _SUBQUERY.search(text)
+    ):
+        return False
+    # An implicit comma join (`FROM a, b`) is still a join.
+    from_clause = text.split(" FROM ", 1)
+    if len(from_clause) > 1 and "," in from_clause[1]:
+        return False
+    return True
+
+
 class DuckDBEngine:
     """
     In-process DuckDB analytical engine with:
@@ -55,24 +131,55 @@ class DuckDBEngine:
 
     COMMUNITY_EXTENSIONS: tuple[str, ...] = ("mongo",)
 
+    # Operations that write to the lakehouse. Two of them must never overlap: DuckLake
+    # DDL (CREATE OR REPLACE, compaction, merges) conflicts on schema/table renames.
+    # Readers are deliberately not in this set — they may run beside a writer, which is
+    # exactly what the old "dbt reserves the whole pool" rule forbade.
+    WRITER_KINDS: frozenset[str] = frozenset(
+        {"dbt", "ingest", "maintenance", "warehouse_sync"}
+    )
+    # Lease kinds that belong to the cheap-query pool. Telemetry subtracts these from
+    # the heavy accounting so a preview never looks like an analytical scan.
+    LIGHT_KINDS: frozenset[str] = frozenset({"query_light"})
+
     def __init__(self):
         self._ensure_storage()
         self._max_heavy_slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_HEAVY))
         self._heavy_semaphore = threading.BoundedSemaphore(self._max_heavy_slots)
+        # Cheap, row-capped queries get their own pool so a point lookup or catalog
+        # preview is never queued behind a multi-second scan or a dbt build. The
+        # ceiling is half the heavy pool, so (N + N/2) connections x (pool/N) memory
+        # keeps the worst case at 63.75% of RAM — inside the 85% safe allocation.
+        self._max_light_slots = max(1, int(settings.DUCKDB_MAX_CONCURRENT_LIGHT))
+        self._light_semaphore = threading.BoundedSemaphore(self._max_light_slots)
+        # Reentrant: a writer that nests another writer operation in the same thread
+        # (a dbt run publishing warehouse views, for example) must not deadlock itself.
+        self._writer_lock = threading.RLock()
         self._telemetry_lock = threading.Lock()
         self._active_heavy_queries = 0
         self._waiting_heavy_queries = 0
+        self._active_light_queries = 0
+        self._waiting_light_queries = 0
+        self._active_writers = 0
         self._total_queries_executed = 0
         self._lease_local = threading.local()
 
-    def _push_lease(self, lease_id: Optional[str], slots: int) -> None:
+    def _push_lease(
+        self,
+        lease_id: Optional[str],
+        slots: int,
+        semaphore: threading.BoundedSemaphore,
+        writer_locked: bool,
+    ) -> None:
         stack = getattr(self._lease_local, "stack", None)
         if stack is None:
             stack = []
             self._lease_local.stack = stack
-        stack.append((lease_id, slots))
+        stack.append((lease_id, slots, semaphore, writer_locked))
 
-    def _pop_lease(self) -> Optional[tuple[Optional[str], int]]:
+    def _pop_lease(
+        self,
+    ) -> Optional[tuple[Optional[str], int, threading.BoundedSemaphore, bool]]:
         stack = getattr(self._lease_local, "stack", None)
         if not stack:
             return None
@@ -90,12 +197,14 @@ class DuckDBEngine:
         temp_limit_mb: int | None = None,
         temp_path: str | None = None,
         detail: str | None = None,
+        light: bool = False,
     ):
         """The shared heavy-work budget, for callers outside this class.
 
         Every heavy job reserves one or more permits. Reservations are also written to
         the cross-process lease directory so scripts and notebooks started in their own
-        Python process are visible to the backend telemetry.
+        Python process are visible to the backend telemetry. ``light`` draws from the
+        cheap-query pool instead of the analytical one.
         """
         reserved = self.begin_heavy(
             slots,
@@ -104,6 +213,7 @@ class DuckDBEngine:
             temp_limit_mb=temp_limit_mb,
             temp_path=temp_path,
             detail=detail,
+            light=light,
         )
         try:
             yield reserved
@@ -119,21 +229,43 @@ class DuckDBEngine:
         temp_limit_mb: int | None = None,
         temp_path: str | None = None,
         detail: str | None = None,
+        light: bool = False,
     ) -> int:
-        """Takes ``slots`` heavy permits and returns how many were actually acquired."""
-        count = max(1, min(int(slots), self._max_heavy_slots))
+        """Takes ``slots`` permits and returns how many were actually acquired.
+
+        ``light`` reserves from the cheap-query pool instead of the analytical one.
+        Writer kinds additionally take the process-wide writer lock, so two lakehouse
+        writers never overlap — the guarantee the old "dbt reserves everything" rule
+        was buying, without banning readers.
+        """
+        semaphore = self._light_semaphore if light else self._heavy_semaphore
+        ceiling = self._max_light_slots if light else self._max_heavy_slots
+        count = max(1, min(int(slots), ceiling))
+        writer_locked = kind in self.WRITER_KINDS
+        if writer_locked:
+            # Before the permits, never after: a writer holding permits while waiting
+            # for the lock could starve the writer that holds it.
+            self._writer_lock.acquire()
         with self._telemetry_lock:
-            self._waiting_heavy_queries += 1
+            if light:
+                self._waiting_light_queries += 1
+            else:
+                self._waiting_heavy_queries += 1
         acquired = 0
         try:
             for _ in range(count):
-                self._heavy_semaphore.acquire()
+                semaphore.acquire()
                 acquired += 1
         except BaseException:
             for _ in range(acquired):
-                self._heavy_semaphore.release()
+                semaphore.release()
+            if writer_locked:
+                self._writer_lock.release()
             with self._telemetry_lock:
-                self._waiting_heavy_queries = max(0, self._waiting_heavy_queries - 1)
+                if light:
+                    self._waiting_light_queries = max(0, self._waiting_light_queries - 1)
+                else:
+                    self._waiting_heavy_queries = max(0, self._waiting_heavy_queries - 1)
             raise
         lease_id = None
         try:
@@ -149,21 +281,29 @@ class DuckDBEngine:
             )
         except Exception:
             lease_id = None
-        self._push_lease(lease_id, acquired)
+        self._push_lease(lease_id, acquired, semaphore, writer_locked)
         with self._telemetry_lock:
-            self._waiting_heavy_queries = max(0, self._waiting_heavy_queries - 1)
-            self._active_heavy_queries += acquired
+            if light:
+                self._waiting_light_queries = max(0, self._waiting_light_queries - 1)
+                self._active_light_queries += acquired
+            else:
+                self._waiting_heavy_queries = max(0, self._waiting_heavy_queries - 1)
+                self._active_heavy_queries += acquired
+            if writer_locked:
+                self._active_writers += 1
             self._total_queries_executed += 1
         return acquired
 
     def end_heavy(self, slots: int = 1) -> None:
         """Releases permits taken by :meth:`begin_heavy`."""
         popped = self._pop_lease()
+        writer_locked = False
         if popped is not None:
-            lease_id, reserved = popped
-            count = reserved
+            lease_id, count, semaphore, writer_locked = popped
         else:
-            lease_id, count = None, max(1, min(int(slots), self._max_heavy_slots))
+            lease_id = None
+            count = max(1, min(int(slots), self._max_heavy_slots))
+            semaphore = self._heavy_semaphore
         try:
             from app.core.resource_leases import release_resource_lease
 
@@ -171,13 +311,25 @@ class DuckDBEngine:
         except Exception:
             pass
         with self._telemetry_lock:
-            self._active_heavy_queries = max(0, self._active_heavy_queries - count)
+            if semaphore is self._light_semaphore:
+                self._active_light_queries = max(0, self._active_light_queries - count)
+            else:
+                self._active_heavy_queries = max(0, self._active_heavy_queries - count)
+            if writer_locked:
+                self._active_writers = max(0, self._active_writers - 1)
         for _ in range(count):
-            self._heavy_semaphore.release()
+            semaphore.release()
+        if writer_locked:
+            self._writer_lock.release()
 
     @contextmanager
     def _acquire_heavy_slot(self, slots: int = 1, *, kind: str = "query"):
         with self.heavy_slot(slots, kind=kind):
+            yield
+
+    @contextmanager
+    def _acquire_light_slot(self, slots: int = 1, *, kind: str = "query_light"):
+        with self.heavy_slot(slots, kind=kind, light=True):
             yield
 
     def get_telemetry(self) -> Dict[str, Any]:
@@ -193,14 +345,29 @@ class DuckDBEngine:
         )
         temp_path = settings.duckdb_temp_path
         leases = list_resource_leases()
-        leased_slots = sum(max(1, int(item.get("slots") or 1)) for item in leases)
-        active_by_kind = leases_by_kind(leases)
+        heavy_leases = [
+            item
+            for item in leases
+            if str(item.get("kind") or "") not in self.LIGHT_KINDS
+        ]
+        light_leases = [
+            item for item in leases if str(item.get("kind") or "") in self.LIGHT_KINDS
+        ]
+        leased_slots = sum(max(1, int(item.get("slots") or 1)) for item in heavy_leases)
+        light_leased_slots = sum(
+            max(1, int(item.get("slots") or 1)) for item in light_leases
+        )
+        active_by_kind = leases_by_kind(heavy_leases)
 
         with self._telemetry_lock:
             local_active = self._active_heavy_queries
             waiting_q = self._waiting_heavy_queries
+            local_light = self._active_light_queries
+            waiting_light = self._waiting_light_queries
+            active_writers = self._active_writers
             total_q = self._total_queries_executed
         active_q = max(local_active, leased_slots)
+        active_light = max(local_light, light_leased_slots)
         if local_active > leased_slots:
             active_by_kind["unknown"] = active_by_kind.get("unknown", 0) + (
                 local_active - leased_slots
@@ -246,7 +413,10 @@ class DuckDBEngine:
                 except OSError:
                     continue
         per_slot_temp_mb = advisor.get_duckdb_temp_limit_mb(
-            temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots
+            temp_path.as_posix(),
+            settings.DUCKDB_TEMP_SIZE_LIMIT,
+            slots,
+            settings.DUCKDB_TEMP_SPILL_FREE_DISK_PCT,
         )
         per_slot_memory_mb = advisor.get_duckdb_memory_limit_mb(slots)
         active_temp_limit_mb = sum(
@@ -277,6 +447,12 @@ class DuckDBEngine:
             "active_heavy_queries": active_q,
             "waiting_heavy_queries": waiting_q,
             "max_concurrent_heavy": slots,
+            # Cheap-query pool: previews and point lookups run here, so they are
+            # visible without being counted against the analytical slots.
+            "active_light_queries": active_light,
+            "waiting_light_queries": waiting_light,
+            "max_concurrent_light": self._max_light_slots,
+            "active_writers": active_writers,
             "total_queries_executed": total_q,
             "active_by_kind": active_by_kind,
             "active_reservations": reservations,
@@ -323,7 +499,7 @@ class DuckDBEngine:
             f"SET memory_limit = '{advisor.get_duckdb_memory_limit(slots)}';",
             f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
             "SET max_temp_directory_size = '"
-            f"{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots)}';",
+            f"{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots, settings.DUCKDB_TEMP_SPILL_FREE_DISK_PCT)}';",
             f"SET threads = {threads};",
             "SET preserve_insertion_order = false;",
             f"SET storage_directory = '{self._ensure_storage()}';",
@@ -648,12 +824,22 @@ class DuckDBEngine:
         postgres_attachments: Optional[List[Dict[str, Any]]] = None,
         max_rows: Optional[int] = None,
         on_connection: Optional[Any] = None,
+        light: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Executes a SQL query against DuckDB in a thread-safe synchronous runner."""
+        """Executes a SQL query against DuckDB in a thread-safe synchronous runner.
+
+        ``light`` selects the cheap-query pool explicitly. When it is ``None`` the
+        statement is classified (:func:`classify_light_query`): a point lookup or a
+        metadata statement must not queue behind a multi-second analytical scan or a
+        dbt build, while anything that can allocate memory proportional to the table
+        stays on the heavy pool.
+        """
         self._assert_safe_query_paths(sql)
         start_time = time.time()
         storage_path = self._ensure_storage()
-        with self._acquire_heavy_slot(kind="query"):
+        use_light = classify_light_query(sql) if light is None else bool(light)
+        slot = self._acquire_light_slot if use_light else self._acquire_heavy_slot
+        with slot(kind="query_light" if use_light else "query"):
             conn = self.get_connection()
             if on_connection is not None:
                 on_connection(conn)

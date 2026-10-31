@@ -26,6 +26,15 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [dataKey, setDataKey] = useState('');
+  // REST ingestion options. Paging lives in dedicated fields because it is the one
+  // setting every paginated source needs; everything else (auth, retry, budget, POST
+  // body) stays in the JSON escape hatch, which is exactly what the backend parses.
+  const [apiPresets, setApiPresets] = useState<import('../../lib/types').ApiIngestPreset[]>([]);
+  const [presetId, setPresetId] = useState('');
+  const [paginationType, setPaginationType] = useState('none');
+  const [pageSize, setPageSize] = useState(100);
+  const [nextKey, setNextKey] = useState('');
+  const [apiAdvanced, setApiAdvanced] = useState('');
   // The operator's own decision, not something inferred at write time: a Postgres source
   // defaults to read-only because it is read live, and everything else defaults to
   // writable. Sending it explicitly is what makes the choice survive the form.
@@ -46,6 +55,20 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
       setPassword('');
       const opts = initialConnection.options as Record<string, any> | undefined;
       setDataKey(opts?.data_key || '');
+      const pagination = (opts?.pagination as Record<string, any>) || {};
+      setPaginationType(typeof pagination.type === 'string' ? pagination.type : 'none');
+      setPageSize(Number(pagination.page_size) || 100);
+      setNextKey(typeof pagination.next_key === 'string' ? pagination.next_key : '');
+      if (opts) {
+        const rest: Record<string, any> = { ...opts };
+        delete rest.data_key;
+        delete rest.pagination;
+        delete rest.endpoint;
+        setApiAdvanced(Object.keys(rest).length ? JSON.stringify(rest, null, 2) : '');
+      } else {
+        setApiAdvanced('');
+      }
+      setPresetId('');
       setReadOnly(initialConnection.read_only ?? initialConnection.source_type === 'postgres');
     } else {
       setName('');
@@ -56,10 +79,27 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
       setUsername('');
       setPassword('');
       setDataKey('');
+      setPaginationType('none');
+      setPageSize(100);
+      setNextKey('');
+      setApiAdvanced('');
+      setPresetId('');
       setReadOnly(true);
     }
     setError(null);
   }, [initialConnection, isOpen]);
+
+  // Presets are fetched the first time the REST source is chosen; a failure leaves the
+  // list empty rather than blocking the form (manual configuration always works). This
+  // must stay above the `!isOpen` early return: a hook below it would change the hook
+  // count between the closed and open renders.
+  useEffect(() => {
+    if (!isOpen || sourceType !== 'api' || apiPresets.length) return;
+    api
+      .getApiPresets()
+      .then(setApiPresets)
+      .catch(() => setApiPresets([]));
+  }, [isOpen, sourceType, apiPresets.length]);
 
   if (!isOpen) return null;
 
@@ -81,10 +121,14 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
     setError(null);
 
     try {
-      const options: Record<string, any> = {};
-      if (sourceType === 'postgres') options.sslmode = 'disable';
-      if (sourceType === 'mongodb') options.auth_source = 'admin';
-      if (sourceType === 'api' && dataKey.trim()) options.data_key = dataKey.trim();
+      let options: Record<string, any>;
+      try {
+        options = buildOptions();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Invalid advanced options JSON');
+        setSubmitting(false);
+        return;
+      }
 
       if (initialConnection) {
         await api.updateConnection(initialConnection.id, {
@@ -132,10 +176,17 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
     setTestResult(null);
     setError(null);
     try {
-      const options: Record<string, any> = {};
-      if (sourceType === 'postgres') options.sslmode = 'disable';
-      if (sourceType === 'mongodb') options.auth_source = 'admin';
-      if (sourceType === 'api' && dataKey.trim()) options.data_key = dataKey.trim();
+      let options: Record<string, any>;
+      try {
+        options = buildOptions();
+      } catch (err) {
+        setTestResult({
+          status: 'error',
+          message: err instanceof Error ? err.message : 'Invalid advanced options JSON',
+        });
+        setTesting(false);
+        return;
+      }
 
       const res = await api.testConnectionParams({
         name: name.trim() || 'test_probe',
@@ -172,6 +223,72 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
     } finally {
       setTesting(false);
     }
+  };
+
+  /**
+   * The options block this connection will store.
+   *
+   * Throws on invalid advanced JSON instead of silently sending an empty block: the
+   * backend would otherwise ingest one unpaginated page and the operator would blame
+   * the source.
+   */
+  const buildOptions = (): Record<string, any> => {
+    const options: Record<string, any> = {};
+    if (sourceType === 'postgres') options.sslmode = 'disable';
+    if (sourceType === 'mongodb') options.auth_source = 'admin';
+    if (sourceType !== 'api') return options;
+
+    let advanced: Record<string, any> = {};
+    if (apiAdvanced.trim()) {
+      try {
+        const parsed = JSON.parse(apiAdvanced);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error('it must be a JSON object');
+        }
+        advanced = parsed as Record<string, any>;
+      } catch (err) {
+        throw new Error(
+          `Advanced options are not valid JSON: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+    Object.assign(options, advanced);
+    if (database.trim()) options.endpoint = database.trim();
+    if (dataKey.trim()) options.data_key = dataKey.trim();
+    if (paginationType !== 'none') {
+      options.pagination = {
+        ...((advanced.pagination as Record<string, any>) || {}),
+        type: paginationType,
+        page_size: Number(pageSize) || 100,
+        ...(paginationType === 'cursor' && nextKey.trim()
+          ? { next_key: nextKey.trim() }
+          : {}),
+      };
+    }
+    return options;
+  };
+
+  /** Fills the form from one recipe: paging into the fields, the rest into the JSON. */
+  const applyPreset = (id: string) => {
+    setPresetId(id);
+    if (!id) return;
+    const preset = apiPresets.find((item) => item.id === id);
+    if (!preset) return;
+    const incoming: Record<string, any> = { ...(preset.options as Record<string, any>) };
+    const pagination = (incoming.pagination as Record<string, any>) || {};
+    delete incoming.pagination;
+    if (typeof incoming.data_key === 'string') {
+      setDataKey(incoming.data_key);
+      delete incoming.data_key;
+    }
+    if (typeof incoming.endpoint === 'string') {
+      setDatabase(incoming.endpoint);
+      delete incoming.endpoint;
+    }
+    setPaginationType(typeof pagination.type === 'string' ? pagination.type : 'none');
+    setPageSize(Number(pagination.page_size) || 100);
+    setNextKey(typeof pagination.next_key === 'string' ? pagination.next_key : '');
+    setApiAdvanced(Object.keys(incoming).length ? JSON.stringify(incoming, null, 2) : '');
   };
 
   const isEditing = !!initialConnection;
@@ -305,6 +422,95 @@ export const AddConnectionModal: React.FC<AddConnectionModalProps> = ({
               className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-2 outline-hidden focus:border-sky-500 font-mono text-slate-800"
             />
           </div>
+
+          {/* REST ingestion: paging in fields, everything else in the JSON escape hatch */}
+          {sourceType === 'api' && (
+            <div className="space-y-3 rounded-lg border border-slate-200 bg-slate-50/70 p-3">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Connector preset
+                </label>
+                <select
+                  value={presetId}
+                  onChange={(e) => applyPreset(e.target.value)}
+                  className="w-full text-xs bg-white border border-slate-300 rounded-lg px-3 py-2 outline-hidden focus:border-sky-500 text-slate-800"
+                >
+                  <option value="">None — configure manually</option>
+                  {apiPresets.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.name}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-[11px] text-slate-500">
+                  {apiPresets.find((item) => item.id === presetId)?.description ||
+                    'A preset only fills these options; nothing is hidden or hardcoded.'}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Pagination
+                  </label>
+                  <select
+                    value={paginationType}
+                    onChange={(e) => setPaginationType(e.target.value)}
+                    className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2 py-2 outline-hidden focus:border-sky-500 text-slate-800"
+                  >
+                    <option value="none">Single request</option>
+                    <option value="offset">Offset</option>
+                    <option value="page">Page number</option>
+                    <option value="cursor">Cursor</option>
+                    <option value="link">Link header</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Page size
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={pageSize}
+                    onChange={(e) => setPageSize(Number(e.target.value))}
+                    className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2 py-2 outline-hidden focus:border-sky-500 font-mono text-slate-800"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Next cursor key
+                  </label>
+                  <input
+                    type="text"
+                    value={nextKey}
+                    disabled={paginationType !== 'cursor'}
+                    placeholder="next_cursor"
+                    onChange={(e) => setNextKey(e.target.value)}
+                    className="w-full text-xs bg-white border border-slate-300 rounded-lg px-2 py-2 outline-hidden focus:border-sky-500 font-mono text-slate-800 disabled:bg-slate-100 disabled:text-slate-400"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Advanced options (JSON)
+                </label>
+                <textarea
+                  value={apiAdvanced}
+                  onChange={(e) => setApiAdvanced(e.target.value)}
+                  rows={4}
+                  spellCheck={false}
+                  placeholder={'{"auth": {"type": "bearer"}, "retry": {"max_attempts": 4}, "data_key": "results"}'}
+                  className="w-full text-[11px] bg-white border border-slate-300 rounded-lg px-3 py-2 outline-hidden focus:border-sky-500 font-mono text-slate-800"
+                />
+                <p className="mt-1 text-[11px] text-slate-500">
+                  Authentication, retries, budgets and POST bodies live here. See{' '}
+                  <span className="font-mono text-slate-700">docs/api-ingestion.md</span>.
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* Username & Password/Token */}
           <div className="grid grid-cols-2 gap-2">

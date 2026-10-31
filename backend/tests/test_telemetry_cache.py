@@ -30,6 +30,12 @@ TELEMETRY_KEYS = {
     "active_heavy_queries",
     "waiting_heavy_queries",
     "max_concurrent_heavy",
+    # The cheap-query pool: previews and point lookups are visible here rather than
+    # being counted against the analytical slots.
+    "active_light_queries",
+    "waiting_light_queries",
+    "max_concurrent_light",
+    "active_writers",
     "active_by_kind",
     "active_reservations",
     "total_queries_executed",

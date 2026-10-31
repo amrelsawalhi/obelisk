@@ -16,8 +16,9 @@ from app.config import settings
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 logger = logging.getLogger(__name__)
 
-_SQLITE_JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
-_SQLITE_SYNCHRONOUS_MODES = {"OFF", "NORMAL", "FULL", "EXTRA"}
+# The allowed journal/synchronous modes live in app.core.sqlite_pragmas, shared with
+# the DuckLake catalog so the two SQLite files always honour the same settings.
+
 
 
 def run_migrations() -> None:
@@ -71,21 +72,14 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
 
     WAL is the right default for a local disk. Some virtual filesystems reject WAL's
     shared-memory mapping or fsync; interpolating an unvalidated env value into a
-    PRAGMA is not acceptable, so only the documented modes are allowed. On failure the
-    error names the two settings that let an operator choose a supported mode.
+    PRAGMA is not acceptable, so only the documented modes are allowed. Validation
+    lives in :mod:`app.core.sqlite_pragmas`, shared with the DuckLake catalog, so the
+    two SQLite files can never honour different modes. On failure the error names the
+    two settings that let an operator choose a supported mode.
     """
-    journal_mode = str(settings.SQLITE_JOURNAL_MODE or "WAL").strip().upper()
-    synchronous = str(settings.SQLITE_SYNCHRONOUS or "NORMAL").strip().upper()
-    if journal_mode not in _SQLITE_JOURNAL_MODES:
-        raise RuntimeError(
-            f"OBELISK_SQLITE_JOURNAL_MODE={journal_mode!r} is invalid; expected one of "
-            f"{sorted(_SQLITE_JOURNAL_MODES)}."
-        )
-    if synchronous not in _SQLITE_SYNCHRONOUS_MODES:
-        raise RuntimeError(
-            f"OBELISK_SQLITE_SYNCHRONOUS={synchronous!r} is invalid; expected one of "
-            f"{sorted(_SQLITE_SYNCHRONOUS_MODES)}."
-        )
+    from app.core.sqlite_pragmas import pragma_values
+
+    journal_mode, synchronous = pragma_values()
     cursor = dbapi_connection.cursor()
     try:
         try:
@@ -184,12 +178,19 @@ async def _migrate_assets_unique_constraint(conn) -> None:
 
 
 async def init_db() -> None:
-    """Initializes the brain database and enforces WAL mode.
+    """Initializes the brain database.
 
     Schema changes are owned by Alembic (audit M16): ``create_all`` is gone, so a
     fresh install and an upgraded one follow the same path — ``upgrade head``.
     Migrations run synchronously in a worker thread against the same SQLite file
     the async engine uses, because Alembic's API is blocking.
+
+    The journal and synchronous modes are deliberately not forced here. Every
+    connection gets the operator's validated choice from the ``connect`` listener
+    above. An unconditional ``PRAGMA journal_mode=WAL`` at this point used to
+    override ``OBELISK_SQLITE_JOURNAL_MODE=DELETE`` and turn a supported
+    configuration on a virtual/network filesystem into
+    ``sqlite3.OperationalError: disk I/O error`` at the first commit.
     """
     if settings.is_sqlite:
         path_str = settings.sqlite_db_path
@@ -198,11 +199,6 @@ async def init_db() -> None:
     await asyncio.to_thread(run_migrations)
 
     async with engine.begin() as conn:
-        # Explicitly verify PRAGMA in async session
-        await conn.run_sync(lambda sync_conn: sync_conn.execute(
-            # ensures WAL pragma is executed
-            __import__("sqlalchemy").text("PRAGMA journal_mode=WAL;")
-        ))
         # Workstream 3.1: legacy databases key assets on `name` alone, which
         # collides across tiers. Runs after migrations so databases created by
         # the baseline (already correct) short-circuit.

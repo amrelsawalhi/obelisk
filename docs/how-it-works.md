@@ -172,8 +172,8 @@ and stopped by the application lifespan.
 
 Stated plainly, because a document that only lists strengths is not useful.
 
-- **SQLite is the brain.** One writer, WAL mode, fine for a single host; not a cluster.
+- **SQLite is the brain.** One writer, WAL by default on local disks, fine for a single host; not a cluster. On a filesystem that rejects WAL's shared-memory mapping or `fsync` (some 9p/NFS/SMB mounts) set `OBELISK_SQLITE_JOURNAL_MODE=DELETE` and `OBELISK_SQLITE_SYNCHRONOUS=OFF`; both SQLite files — the control plane and the DuckLake catalog — honour that choice.
 - **Incremental upsert rewrites the target table partition.** Efficient for tens of gigabytes; partitioned splits are planned for multi-terabyte tables.
-- **Single-node scale ceiling.** Sized and validated for up to 1 TB out-of-core on a single workstation or server.
+- **Single-node scale ceiling.** Measured end to end to **3 GiB of active lakehouse** (26.9M fact rows + 8.3M wide rows) on a 2 vCPU / 5 GiB host; larger sizes are extrapolations from the fitted scaling models, not measurements. A 1 TB lakehouse is a **batch** target, not an interactive one: expect to need roughly a 256–512 GiB RAM host with several TiB of NVMe, and leave `DUCKDB_TEMP_SIZE_LIMIT` on `0` (the ceiling then follows free disk) or raise it explicitly to `1024GiB`+ if you pin it. Anything above 3 GiB is a projection until someone runs the harness again on that class of hardware.
 - **Scripts and notebooks run unsandboxed** as the backend's operating-system user.
 - **CI is parked** while the platform is in development; the local suite is the gate.

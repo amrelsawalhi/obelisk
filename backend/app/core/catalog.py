@@ -269,13 +269,22 @@ def table_ingest_lock(schema: str, table: str):
 
 
 def _prepare_catalog_file(catalog: Path) -> None:
-    """Puts the DuckLake metadata file in the configured SQLite journal mode."""
+    """Puts the DuckLake metadata file in the configured SQLite durability modes.
+
+    ``journal_mode`` is a property of the *file*, so setting it here persists for
+    every later connection — including ducklake's own. ``synchronous`` is per
+    connection: it is applied here for the catalog reads and writes this process
+    performs, which is what makes commits succeed on a filesystem whose ``fsync``
+    is unsupported (``OFF``) instead of raising ``disk I/O error``. Both values come
+    from the same validator the control-plane database uses, so the two SQLite files
+    cannot end up in different modes.
+    """
     key = str(catalog)
     if key in _prepared_catalogs:
         return
-    from app.config import settings
+    from app.core.sqlite_pragmas import pragma_values
 
-    requested = str(settings.SQLITE_JOURNAL_MODE or "WAL").strip().upper()
+    requested, synchronous = pragma_values()
     modes = [requested]
     if requested == "WAL":
         # A virtual filesystem may reject WAL's shared-memory mapping. DELETE still
@@ -289,6 +298,7 @@ def _prepare_catalog_file(catalog: Path) -> None:
             con = sqlite3.connect(catalog, timeout=CATALOG_BUSY_TIMEOUT_MS / 1000)
             try:
                 mode = con.execute(f"PRAGMA journal_mode={candidate};").fetchone()
+                con.execute(f"PRAGMA synchronous={synchronous};")
                 con.execute(f"PRAGMA busy_timeout={CATALOG_BUSY_TIMEOUT_MS};")
             finally:
                 con.close()
@@ -375,7 +385,7 @@ def lakehouse_connection():
         for stmt in (
             f"SET memory_limit = '{advisor.get_duckdb_memory_limit(slots)}';",
             f"SET temp_directory = '{settings.duckdb_temp_path.as_posix()}';",
-            f"SET max_temp_directory_size = '{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots)}';",
+            f"SET max_temp_directory_size = '{advisor.get_duckdb_temp_limit(settings.duckdb_temp_path.as_posix(), settings.DUCKDB_TEMP_SIZE_LIMIT, slots, settings.DUCKDB_TEMP_SPILL_FREE_DISK_PCT)}';",
             f"SET threads = {threads};",
             "SET preserve_insertion_order = false;",
         ):

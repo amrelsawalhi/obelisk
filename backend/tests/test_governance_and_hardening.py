@@ -68,7 +68,10 @@ def test_dbt_receives_the_same_share_as_other_heavy_work():
     dbt_threads = dbt_runner._dbt_model_threads("lakehouse")
     budget_slots = dbt_runner._dbt_budget_slots("lakehouse")
     assert dbt_threads == 1, "DuckLake model DDL must run serially"
-    assert budget_slots == slots, "a lakehouse dbt run owns the batch slot pool"
+    assert budget_slots == max(1, slots // 2), (
+        "a lakehouse dbt run reserves half the pool: models run serially, so it never "
+        "needed all of it, and the other half keeps interactive queries moving"
+    )
     assert env["DBT_DUCKDB_MEMORY_LIMIT"] == (
         f"{advisor.get_duckdb_memory_limit_mb(slots) * budget_slots}MiB"
     )

@@ -1,0 +1,124 @@
+{
+  "_comment": "Connector recipes for REST ingestion. A preset only fills the options form — it is data, not code, and it is validated by tests.test_api_presets against the real option schema.",
+  "presets": [
+    {
+      "id": "github-rest",
+      "name": "GitHub REST",
+      "description": "Repositories, issues and events. GitHub paginates with a Link header and caps pages at 100 rows.",
+      "docs": "https://docs.github.com/en/rest",
+      "options": {
+        "auth": { "type": "bearer" },
+        "headers": { "Accept": "application/vnd.github+json" },
+        "pagination": { "type": "link", "page_size": 100 }
+      }
+    },
+    {
+      "id": "shopify-admin",
+      "name": "Shopify Admin",
+      "description": "Orders, products and customers from the Admin REST API, via its Link-header paging.",
+      "docs": "https://shopify.dev/docs/api/admin-rest",
+      "options": {
+        "auth": { "type": "header", "header": "X-Shopify-Access-Token" },
+        "pagination": { "type": "link", "page_size": 250 }
+      }
+    },
+    {
+      "id": "hubspot-crm",
+      "name": "HubSpot CRM",
+      "description": "Contacts, companies and deals. HubSpot returns rows under results and pages with an after cursor.",
+      "docs": "https://developers.hubspot.com/docs/api/crm/understanding-the-crm",
+      "options": {
+        "auth": { "type": "bearer" },
+        "data_key": "results",
+        "pagination": {
+          "type": "cursor",
+          "cursor_param": "after",
+          "next_key": "paging.next.after",
+          "page_size": 100
+        }
+      }
+    },
+    {
+      "id": "notion-database",
+      "name": "Notion database query",
+      "description": "Rows of one Notion database, read with its start_cursor paging.",
+      "docs": "https://developers.notion.com/reference/post-database-query",
+      "options": {
+        "method": "POST",
+        "auth": { "type": "bearer", "header": "Authorization" },
+        "data_key": "results",
+        "pagination": {
+          "type": "cursor",
+          "cursor_param": "start_cursor",
+          "next_key": "next_cursor"
+        }
+      }
+    },
+    {
+      "id": "linear-graphql",
+      "name": "Linear (GraphQL)",
+      "description": "GraphQL resources with pageInfo cursors, sent as a POST body template.",
+      "docs": "https://developers.linear.app/docs/graphql/working-with-the-graphql-api",
+      "options": {
+        "method": "POST",
+        "auth": { "type": "bearer" },
+        "body": {
+          "query": "query($cursor: String) { issues(first: 100, after: $cursor) { nodes { id title createdAt } pageInfo { endCursor } } }",
+          "variables": { "cursor": "{cursor}" }
+        },
+        "data_key": "data.issues.nodes",
+        "pagination": {
+          "type": "cursor",
+          "cursor_param": "cursor",
+          "next_key": "data.issues.pageInfo.endCursor"
+        }
+      }
+    },
+    {
+      "id": "generic-offset",
+      "name": "Generic offset pagination",
+      "description": "Endpoints that take ?offset=&limit= and answer a JSON array.",
+      "docs": null,
+      "options": {
+        "auth": { "type": "bearer" },
+        "pagination": {
+          "type": "offset",
+          "page_param": "offset",
+          "size_param": "limit",
+          "page_size": 100
+        }
+      }
+    },
+    {
+      "id": "generic-page",
+      "name": "Generic page-number pagination",
+      "description": "Endpoints that take ?page=&per_page= starting at page 1.",
+      "docs": null,
+      "options": {
+        "auth": { "type": "bearer" },
+        "pagination": {
+          "type": "page",
+          "page_param": "page",
+          "size_param": "per_page",
+          "page_size": 100,
+          "start": 1
+        }
+      }
+    },
+    {
+      "id": "generic-cursor",
+      "name": "Generic cursor pagination",
+      "description": "Endpoints whose response carries a next_cursor, with rows under items.",
+      "docs": null,
+      "options": {
+        "auth": { "type": "bearer" },
+        "data_key": "items",
+        "pagination": {
+          "type": "cursor",
+          "cursor_param": "cursor",
+          "next_key": "next_cursor"
+        }
+      }
+    }
+  ]
+}

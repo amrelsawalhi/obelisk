@@ -610,8 +610,31 @@ class Introspector:
             conn.close()
 
     @staticmethod
+    def _dig(payload: Any, dotted: str) -> Any:
+        """Follow ``a.b.c`` into a JSON object; missing segments answer ``None``."""
+        current = payload
+        for part in str(dotted).split("."):
+            if isinstance(current, dict):
+                current = current.get(part)
+            elif isinstance(current, list) and part.isdigit():
+                index = int(part)
+                current = current[index] if 0 <= index < len(current) else None
+            else:
+                return None
+        return current
+
+    @staticmethod
     def _extract_api_records(data: Any, data_key: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Helper to extract list of records from arbitrary JSON payload."""
+        """Helper to extract list of records from arbitrary JSON payload.
+
+        ``data_key`` may be a dotted path (``data.items``): paginated and GraphQL APIs
+        nest their rows one or two levels down, and a top-level-only lookup made those
+        payloads unreadable.
+        """
+        if data_key and "." in str(data_key):
+            nested = Introspector._dig(data, str(data_key))
+            if isinstance(nested, list):
+                return [r for r in nested if isinstance(r, dict)]
         if isinstance(data, list):
             return [r for r in data if isinstance(r, dict)]
         elif isinstance(data, dict):
@@ -624,32 +647,53 @@ class Introspector:
         return []
 
     @staticmethod
+    def _api_records(
+        base_url: str,
+        endpoint: str,
+        token: Optional[str],
+        headers: Optional[Dict[str, str]],
+        data_key: Optional[str],
+        options: Optional[Dict[str, Any]] = None,
+        *,
+        max_pages: int = 1,
+        row_cap: int = 5_000,
+    ) -> List[Dict[str, Any]]:
+        """Reads records through the paginating client, bounded by pages and rows.
+
+        Preview and the schema probe take the same path as a real load, so what they
+        show is what an ingest would write: same auth, same paging, same retries.
+        """
+        from app.engines.api_source import ApiSource
+
+        merged = dict(options or {})
+        if headers:
+            merged["headers"] = {**(merged.get("headers") or {}), **headers}
+        source = ApiSource(base_url, endpoint, token=token, options=merged)
+        source.plan.max_pages = max(1, int(max_pages))
+        collected: List[Dict[str, Any]] = []
+        for page in source.pages():
+            collected.extend(page.records(data_key))
+            if len(collected) >= row_cap:
+                break
+        return collected[:row_cap]
+
+    @staticmethod
     def introspect_api(
         base_url: str,
         endpoint: str = "",
         token: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         data_key: Optional[str] = None,
+        options: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Introspects a REST API / ERP endpoint (SAP, Salesforce, Custom JSON API)."""
-        url = base_url.strip()
-        if not url.startswith(("http://", "https://")):
-            url = f"http://{url}"
-        if endpoint:
-            url = f"{url.rstrip('/')}/{endpoint.lstrip('/')}"
+        """Introspects a REST API / ERP endpoint (SAP, Salesforce, Custom JSON API).
 
-        req_headers = {"Accept": "application/json"}
-        if token:
-            req_headers["Authorization"] = f"Bearer {token}"
-        if headers:
-            req_headers.update(headers)
-
-        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
-            resp = client.get(url, headers=req_headers)
-            resp.raise_for_status()
-            data = resp.json()
-
-        records = Introspector._extract_api_records(data, data_key)
+        The schema probe reads one page through the same paging client ingestion uses,
+        so a paginated source is previewed with its real authentication and retries.
+        """
+        records = Introspector._api_records(
+            base_url, endpoint, token, headers, data_key, options, max_pages=1
+        )
         cols = []
         seen_cols = set()
         for r in records[:50]:
@@ -688,27 +732,24 @@ class Introspector:
         headers: Optional[Dict[str, str]] = None,
         data_key: Optional[str] = None,
         limit: int = 50,
+        options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Fetches records from REST API / ERP endpoint as table rows."""
+        """Fetches records from REST API / ERP endpoint as table rows.
+
+        Two pages are read at most: enough for a paginated source to prove it pages,
+        bounded so a preview never walks a whole dataset.
+        """
         start = time.perf_counter()
-        url = base_url.strip()
-        if not url.startswith(("http://", "https://")):
-            url = f"http://{url}"
-        if endpoint:
-            url = f"{url.rstrip('/')}/{endpoint.lstrip('/')}"
-
-        req_headers = {"Accept": "application/json"}
-        if token:
-            req_headers["Authorization"] = f"Bearer {token}"
-        if headers:
-            req_headers.update(headers)
-
-        with httpx.Client(timeout=10.0, follow_redirects=True) as client:
-            resp = client.get(url, headers=req_headers)
-            resp.raise_for_status()
-            data = resp.json()
-
-        records = Introspector._extract_api_records(data, data_key)
+        records = Introspector._api_records(
+            base_url,
+            endpoint,
+            token,
+            headers,
+            data_key,
+            options,
+            max_pages=2,
+            row_cap=max(1, int(limit)),
+        )
         slice_records = records[:limit]
         columns = []
         if slice_records:

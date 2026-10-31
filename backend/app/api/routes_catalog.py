@@ -289,6 +289,19 @@ def invalidate_catalog_cache():
     _catalog_tree_cache = None
     _catalog_tree_cache_time = 0.0
 
+
+@router.get("/api-presets")
+async def api_ingest_presets() -> List[Dict[str, Any]]:
+    """The shipped REST connector recipes, for the connection form's preset picker.
+
+    Each entry is a name plus an ``options`` block the form can drop straight onto the
+    connection; nothing here is executable, and the test suite validates every preset
+    against the same option schema ingestion uses.
+    """
+    from app.engines.api_source import load_presets
+
+    return load_presets()
+
 class CreateConnectionRequest(BaseModel):
     name: str
     source_type: str  # postgres, mongodb, mysql, oracle, api
@@ -1071,13 +1084,15 @@ async def _introspect_connection(conn: Connection) -> Optional[List[Dict[str, An
                 password=plaintext_pw,
             )
         if st in ("api", "rest", "rest_api", "erp"):
+            api_options = conn.options or {}
             return await asyncio.to_thread(
                 introspector.introspect_api,
                 base_url=conn.host,
-                endpoint=conn.database if conn.database else "",
+                endpoint=api_options.get("endpoint") or (conn.database if conn.database else ""),
                 token=plaintext_pw,
-                headers=(conn.options or {}).get("headers"),
-                data_key=(conn.options or {}).get("data_key"),
+                headers=api_options.get("headers"),
+                data_key=api_options.get("data_key"),
+                options=api_options,
             )
     except Exception:
         return None
@@ -1468,13 +1483,19 @@ async def get_table_preview(
             )
             return preview
         elif st in ("api", "rest", "rest_api", "erp"):
+            api_options = conn.options or {}
             preview = await asyncio.to_thread(
                 introspector.preview_api,
                 base_url=conn.host,
-                endpoint=table_name if table_name != "api_records" else "",
+                endpoint=(
+                    table_name
+                    if table_name != "api_records"
+                    else (api_options.get("endpoint") or "")
+                ),
                 token=plaintext_pw,
-                headers=(conn.options or {}).get("headers"),
-                data_key=(conn.options or {}).get("data_key"),
+                headers=api_options.get("headers"),
+                data_key=api_options.get("data_key"),
+                options=api_options,
             )
             return preview
         else:
@@ -1590,6 +1611,7 @@ def _lakehouse_diagnostics_sync() -> Dict[str, Any]:
             settings.duckdb_temp_path.as_posix(),
             settings.DUCKDB_TEMP_SIZE_LIMIT,
             settings.DUCKDB_MAX_CONCURRENT_HEAVY,
+            settings.DUCKDB_TEMP_SPILL_FREE_DISK_PCT,
         ),
         "duckdb_memory_limit_per_slot": advisor.get_duckdb_memory_limit(
             settings.DUCKDB_MAX_CONCURRENT_HEAVY

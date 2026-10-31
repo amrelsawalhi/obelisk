@@ -8,6 +8,10 @@ from typing import Dict, Any, List
 # binary units; a bare "GB" is 10^9 bytes and silently shrinks the budget by ~6.9%.
 _SIZE_UNITS_MIB = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
 
+# Used only when neither a configured cap nor the free-space probe is available, so
+# DuckDB is never handed an effectively unbounded temp directory by accident.
+_LEGACY_DEFAULT_TEMP_MIB = 50 * 1024
+
 
 def _parse_size_to_mib(value: object) -> int | None:
     """'50GB' / '512MB' / '2T' -> mebibytes. ``None`` when the text is not a size."""
@@ -168,13 +172,12 @@ class ResourceAdvisor:
             "remaining_safe_gb": remaining_safe_gb,
         }
 
-    def get_duckdb_memory_limit_mb(self, concurrent_slots: int = 4) -> int:
-        """Safe per-connection DuckDB memory in MiB.
+    def get_duckdb_pool_mib(self) -> int:
+        """The memory pool every heavy connection shares: 50% of the safe allocation.
 
-        The 50% DuckDB share is divided across the heavy slots and rounded down. There
-        is deliberately no 1 GB floor and no fixed 12 GB ceiling: either one can promise
-        more memory than the host has (on a small host) or leave a large host mostly
-        unused. The invariant is simply ``slots * per_slot <= 50% of safe RAM``.
+        Named separately from the per-slot limit because slot derivation needs the
+        pool itself (to decide how many slots the host can afford), while queries
+        need the share (pool / slots).
         """
         specs = self.get_host_specs()
         active = self.get_active_container_allocations()
@@ -183,8 +186,18 @@ class ResourceAdvisor:
             (int(specs["max_safe_allocation_bytes"]) - int(active["total_allocated_bytes"]))
             // (1024 ** 2),
         )
+        return max(1, remaining_safe_mib * 50 // 100)
+
+    def get_duckdb_memory_limit_mb(self, concurrent_slots: int = 4) -> int:
+        """Safe per-connection DuckDB memory in MiB.
+
+        The 50% DuckDB share is divided across the heavy slots and rounded down. There
+        is deliberately no 1 GB floor and no fixed 12 GB ceiling: either one can promise
+        more memory than the host has (on a small host) or leave a large host mostly
+        unused. The invariant is simply ``slots * per_slot <= 50% of safe RAM``.
+        """
         slots = max(1, int(concurrent_slots))
-        return max(1, (remaining_safe_mib * 50 // 100) // slots)
+        return max(1, self.get_duckdb_pool_mib() // slots)
 
     def get_duckdb_memory_limit(self, concurrent_slots: int = 4) -> str:
         """Returns an explicit binary-unit per-connection memory limit for DuckDB."""
@@ -196,31 +209,52 @@ class ResourceAdvisor:
         return max(1, int(cpu_cores) // max(1, int(concurrent_slots)))
 
     def get_duckdb_temp_limit_mb(
-        self, path: str, configured: str = "50GB", concurrent_slots: int = 1
+        self,
+        path: str,
+        configured: object = "",
+        concurrent_slots: int = 1,
+        free_disk_pct: int = 50,
     ) -> int:
         """Numeric spill limit for *one connection*.
 
-        The configured ceiling and the 50%-of-free-disk bound are budgets for the whole
-        process, so they are divided by the number of connections that may spill at the
-        same time. Without the division four connections could each spill 50% of free
-        disk, i.e. twice the volume.
+        The ceiling is dynamic. ``configured`` is an optional hard cap — ``""``,
+        ``"0"``, ``"auto"`` or an unparseable value all mean "no cap" — and the real
+        bound is the free space on the spill filesystem: at most ``free_disk_pct``
+        percent of what is actually available, divided across the connections that may
+        spill at once. A host with terabytes free therefore spills terabyte-scale sorts
+        instead of being held to a laptop default, while a small volume still cannot be
+        promised more than it has. Without the division four connections could each
+        spill half the disk, i.e. twice the volume.
         """
-        wanted = _parse_size_to_mib(configured) or 50 * 1024
-        slots = max(1, int(concurrent_slots))
+        wanted = _parse_size_to_mib(configured)
+        if wanted is not None and wanted <= 0:
+            wanted = None
+        pct = min(100, max(1, int(free_disk_pct)))
         try:
             free_bytes = int(psutil.disk_usage(_existing_path(path)).free)
         except Exception:
             allowed_mib = wanted
         else:
-            allowed_mib = max(1, free_bytes // (1024 ** 2) // 2)
-        total_mib = min(wanted, allowed_mib)
-        return max(1, total_mib // slots)
+            allowed_mib = max(1, free_bytes // (1024 ** 2) * pct // 100)
+        if allowed_mib is None:
+            # Neither a cap nor a readable disk: keep the historical default rather
+            # than handing DuckDB an effectively unbounded temp directory.
+            allowed_mib = _LEGACY_DEFAULT_TEMP_MIB
+        total_mib = allowed_mib if wanted is None else min(wanted, allowed_mib)
+        return max(1, total_mib // max(1, int(concurrent_slots)))
 
     def get_duckdb_temp_limit(
-        self, path: str, configured: str = "50GB", concurrent_slots: int = 1
+        self,
+        path: str,
+        configured: object = "",
+        concurrent_slots: int = 1,
+        free_disk_pct: int = 50,
     ) -> str:
         """How much one DuckDB connection may spill, given what is actually free."""
-        return f"{self.get_duckdb_temp_limit_mb(path, configured, concurrent_slots)}MiB"
+        return (
+            f"{self.get_duckdb_temp_limit_mb(path, configured, concurrent_slots, free_disk_pct)}"
+            "MiB"
+        )
 
     def get_spark_memory_limit(self) -> str:
         """Returns safe memory limit string for PySpark driver initialization (e.g. '2g', '4g')."""

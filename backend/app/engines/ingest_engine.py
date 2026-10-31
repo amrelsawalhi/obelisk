@@ -23,7 +23,6 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Sequence
 
-import httpx
 import oracledb
 import pyarrow as pa
 import pymysql
@@ -53,7 +52,8 @@ logger = logging.getLogger(__name__)
 BATCH_ROWS = 50_000
 STAGE_COMMIT_ROWS = 500_000
 STAGE_COMMIT_BYTES = 128 * 1024 * 1024  # 128 MiB ceiling per staged commit buffer
-MAX_API_RESPONSE_BYTES = 64 * 1024 * 1024  # 64 MiB ceiling per HTTP response
+# Per-page HTTP ceilings now live in app.engines.api_source (a page is bounded, and the
+# run is bounded separately by budget.max_bytes).
 
 _OBJECT_ID_HEX_RE = re.compile(r"^[0-9a-fA-F]{24}$")
 
@@ -1043,8 +1043,22 @@ class IngestEngine:
         should_cancel: Optional[Callable[[], bool]] = None,
         on_connection: Optional[Callable[[Any], None]] = None,
         schema_policy: str = "evolve",
+        endpoint: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Ingests one entity into the lakehouse."""
+        """Ingests one entity into the lakehouse.
+
+        ``endpoint`` is the request path for an API source when it differs from the
+        entity's name: an entity is a table name (single segment, validated), while API
+        paths nest (``/v1/customers``).
+        """
+        if endpoint:
+            connection_params = {
+                **connection_params,
+                "options": {
+                    **(connection_params.get("options") or {}),
+                    "endpoint": endpoint,
+                },
+            }
         schema, table_stem = self._address(target_folder, entity, target_name)
         target = self._target_sql(schema, table_stem)
 
@@ -1591,9 +1605,18 @@ class IngestEngine:
         limit, on_batch=None, sink=None, create=False, should_cancel=None,
         schema_policy: str = "evolve",
     ) -> int:
-        """REST endpoint staged with byte-bounded response streaming and chunked Arrow batches."""
-        from app.engines.introspector import Introspector
+        """A REST endpoint staged page by page through a paginating client.
 
+        One request used to *be* the ingest: a paginated API contributed its first page
+        and the rest was silently absent, while an incremental run downloaded everything
+        to filter a delta in Python. ``app.engines.api_source`` walks pages
+        (offset/page/cursor/Link), retries the failures real APIs throw, pushes the
+        watermark upstream and stops at a run budget; every page is written as it
+        arrives, so a thousand-page load never holds the dataset in memory.
+        """
+        from app.engines.api_source import ApiSource
+
+        options = connection_params.get("options") or {}
         base_url = (
             connection_params.get("host") or connection_params.get("url") or "http://localhost"
         ).strip()
@@ -1605,156 +1628,223 @@ class IngestEngine:
                 else f"http://{base_url}"
             )
 
-        endpoint = entity if entity != "api_records" else ""
-        full_url = (
-            f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}" if endpoint else base_url
+        endpoint_path = str(options.get("endpoint") or "").strip()
+        source = ApiSource(
+            base_url,
+            # The entity names the table; the path names the URL. They differ as soon as
+            # an API nests its resources (``/v1/customers``), which a target name cannot.
+            endpoint_path or (entity if entity != "api_records" else ""),
+            token=connection_params.get("password")
+            or options.get("token")
+            or options.get("api_key"),
+            options=options,
+            watermark_column=watermark_column if mode == "incremental" else None,
+            watermark_value=watermark_value if mode == "incremental" else None,
+            should_cancel=should_cancel,
+            logger=logger,
         )
 
-        options = connection_params.get("options") or {}
-        token = connection_params.get("password") or options.get("token") or options.get("api_key")
-        headers = {"Accept": "application/json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        if options.get("headers"):
-            headers.update(options["headers"])
-
         is_ndjson = str(options.get("format", "")).lower() in ("ndjson", "jsonl")
-        payload = None
         data_key = options.get("data_key")
-        # A top-level JSON array or NDJSON stream can be handed straight to DuckDB.
-        # Parsing it into Python dicts multiplied memory by ~5x and then rebuilt Arrow.
-        # When the response is wrapped under data_key, the Python extractor remains the
-        # correct path because the caller asked for a specific nested list.
-        if sink is not None and (is_ndjson or not data_key):
-            import tempfile
+        streaming = (
+            sink is not None
+            # NDJSON pages concatenate, and a single-request JSON array can be handed to
+            # DuckDB whole: both avoid turning rows into Python objects.
+            and (is_ndjson or (not data_key and source.is_single_request))
+        )
+        if streaming:
+            return self._stage_api_file_pages(
+                conn,
+                source=source,
+                sink=sink,
+                create=create,
+                mode=mode,
+                watermark_column=watermark_column,
+                watermark_value=watermark_value,
+                limit=limit,
+                on_batch=on_batch,
+                should_cancel=should_cancel,
+                schema_policy=schema_policy,
+            )
+        return self._stage_api_records(
+            conn,
+            source=source,
+            data_key=data_key,
+            sink=sink,
+            create=create,
+            mode=mode,
+            watermark_column=watermark_column,
+            watermark_value=watermark_value,
+            limit=limit,
+            on_batch=on_batch,
+            should_cancel=should_cancel,
+            schema_policy=schema_policy,
+        )
 
-            settings.duckdb_temp_path.mkdir(parents=True, exist_ok=True)
-            suffix = ".ndjson" if is_ndjson else ".json"
+
+
+    def _stage_api_file_pages(
+        self,
+        conn,
+        *,
+        source,
+        sink: str,
+        create: bool,
+        mode: str,
+        watermark_column: Optional[str],
+        watermark_value: Any,
+        limit: Optional[int],
+        on_batch: Optional[Callable[[int], None]],
+        should_cancel: Optional[Callable[[], bool]],
+        schema_policy: str,
+    ) -> int:
+        """Writes each page into the lake as it arrives, one transfer per page.
+
+        A page that is NDJSON or a top-level array is handed to DuckDB as a file, so its
+        rows never become Python objects. The first non-empty page creates the load
+        table and the rest append into it — the contract ``_stage_batches`` follows for
+        the cursor drivers, applied to pages instead of Arrow batches.
+        """
+        import tempfile
+
+        settings.duckdb_temp_path.mkdir(parents=True, exist_ok=True)
+        written_total = 0
+        created = False
+        for page in source.pages():
+            if should_cancel is not None and should_cancel():
+                raise IngestCancelled(
+                    "Ingestion cancelled: stopped before the table was committed."
+                )
+            if limit and written_total >= int(limit):
+                break
+            payload_bytes = page.body
+            suffix = ".ndjson" if page.is_ndjson else ".json"
+            format_arg = "format='newline_delimited'" if page.is_ndjson else "format='array'"
+            if not page.is_ndjson and not page.is_top_level_array:
+                # A wrapped object with no ``data_key``: the heuristic extractor names
+                # the records list, and they are handed over as NDJSON.
+                records = page.records(None)
+                payload_bytes = "\n".join(
+                    json.dumps(record, default=str) for record in records
+                ).encode("utf-8")
+                suffix, format_arg = ".ndjson", "format='newline_delimited'"
+            if not payload_bytes.strip():
+                continue
             with tempfile.NamedTemporaryFile(
                 mode="wb", suffix=suffix, dir=settings.duckdb_temp_path, delete=False
-            ) as tmp_f:
-                tmp_path = Path(tmp_f.name)
-                total_bytes = 0
-                byte_limit = MAX_API_RESPONSE_BYTES * 8 if is_ndjson else MAX_API_RESPONSE_BYTES
-                try:
-                    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-                        with client.stream("GET", full_url, headers=headers) as response:
-                            response.raise_for_status()
-                            for chunk in response.iter_bytes(chunk_size=65536):
-                                if should_cancel is not None and should_cancel():
-                                    raise IngestCancelled(
-                                        "Ingestion cancelled: stopped before the table was committed."
-                                    )
-                                total_bytes += len(chunk)
-                                if total_bytes > byte_limit:
-                                    raise MemoryError(
-                                        f"API response from {full_url} exceeded "
-                                        f"{byte_limit // (1024 ** 2)} MiB safety limit."
-                                    )
-                                tmp_f.write(chunk)
-                    tmp_f.flush()
-                    if total_bytes == 0:
-                        return 0
+            ) as handle:
+                handle.write(payload_bytes)
+                tmp_path = Path(handle.name)
+            try:
+                src_expr = f"read_json_auto({sql_string(tmp_path.as_posix())}, {format_arg})"
+                # Keep the historical column order (alphabetical, as the Python
+                # extractor produced) while letting DuckDB own parsing and I/O.
+                discovered = conn.execute(f"DESCRIBE SELECT * FROM {src_expr}").fetchall()
+                ordered = sorted(str(row[0]) for row in discovered)
+                if ordered:
+                    projection = ", ".join(quote_ident(name) for name in ordered)
+                    src_expr = f"(SELECT {projection} FROM {src_expr})"
+                where = ""
+                if mode == "incremental" and watermark_column and watermark_value is not None:
+                    where = f"WHERE {sql_ident(watermark_column)} > {_literal(watermark_value)}"
+                remaining = int(limit) - written_total if limit else 0
+                limit_clause = f" LIMIT {remaining}" if remaining > 0 else ""
+                page_create = create and not created
+                written = self._transfer_from(
+                    conn,
+                    source_ref=src_expr,
+                    target=sink,
+                    mode="snapshot" if page_create else "incremental",
+                    exists=not page_create,
+                    where=where,
+                    # Ordering is the API's business once pages are being walked: it
+                    # only chooses *which* rows a bounded single response returns.
+                    order_clause=(
+                        _order_by(watermark_column, limit, sql_ident)
+                        if source.is_single_request
+                        else ""
+                    ),
+                    limit_clause=limit_clause,
+                    on_batch=None,
+                    schema_policy=schema_policy,
+                )
+            finally:
+                _discard_temp_file(tmp_path)
+            if written:
+                created = created or page_create
+            written_total += written
+            if on_batch is not None:
+                on_batch(written_total)
+        return written_total
 
-                    first = b""
-                    with open(tmp_path, "rb") as probe:
-                        while True:
-                            char = probe.read(1)
-                            if not char:
-                                break
-                            if not char.isspace():
-                                first = char
-                                break
-                    can_stream_native = is_ndjson or first == b"["
-                    if can_stream_native:
-                        where = ""
-                        if mode == "incremental" and watermark_column and watermark_value is not None:
-                            where = f"WHERE {sql_ident(watermark_column)} > {_literal(watermark_value)}"
-                        limit_clause = f" LIMIT {int(limit)}" if limit and limit > 0 else ""
-                        format_arg = (
-                            "format='newline_delimited'"
-                            if is_ndjson
-                            else "format='array'"
-                        )
-                        src_expr = (
-                            f"read_json_auto({sql_string(tmp_path.as_posix())}, "
-                            f"{format_arg})"
-                        )
-                        # Keep the historical column order (alphabetical, as the Python
-                        # extractor produced) while letting DuckDB own parsing and I/O.
-                        discovered = conn.execute(
-                            f"DESCRIBE SELECT * FROM {src_expr}"
-                        ).fetchall()
-                        ordered = sorted(str(row[0]) for row in discovered)
-                        if ordered:
-                            projection = ", ".join(quote_ident(name) for name in ordered)
-                            src_expr = f"(SELECT {projection} FROM {src_expr})"
-                        return self._transfer_from(
-                            conn,
-                            source_ref=src_expr,
-                            target=sink,
-                            mode="snapshot" if create else "incremental",
-                            exists=not create,
-                            where=where,
-                            order_clause=_order_by(watermark_column, limit, sql_ident),
-                            limit_clause=limit_clause,
-                            on_batch=on_batch,
-                            schema_policy=schema_policy,
-                        )
+    def _stage_api_records(
+        self,
+        conn,
+        *,
+        source,
+        data_key: Optional[str],
+        sink: Optional[str],
+        create: bool,
+        mode: str,
+        watermark_column: Optional[str],
+        watermark_value: Any,
+        limit: Optional[int],
+        on_batch: Optional[Callable[[int], None]],
+        should_cancel: Optional[Callable[[], bool]],
+        schema_policy: str,
+    ) -> int:
+        """Extracts records from each page and streams them as Arrow batches.
 
-                    # A top-level object without data_key may still contain a heuristic
-                    # records list. Reuse the bounded temp file rather than downloading
-                    # the response a second time.
-                    payload = json.loads(tmp_path.read_text(encoding="utf-8", errors="replace"))
-                finally:
-                    _discard_temp_file(tmp_path)
+        This is the path for wrapped payloads (``data_key``) and for paginated JSON
+        responses. Paging is lazy: a page is fetched only when the previous one has been
+        turned into batches, so memory stays bounded by the page size rather than by the
+        dataset. The watermark is still applied locally as the correctness net, after it
+        has been pushed upstream.
+        """
 
-        if payload is None:
-            with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-                with client.stream("GET", full_url, headers=headers) as response:
-                    response.raise_for_status()
-                    buf = bytearray()
-                    for chunk in response.iter_bytes(chunk_size=65536):
-                        if should_cancel is not None and should_cancel():
-                            raise IngestCancelled(
-                                "Ingestion cancelled: stopped before the table was committed."
-                            )
-                        buf.extend(chunk)
-                        if len(buf) > MAX_API_RESPONSE_BYTES:
-                            raise MemoryError(
-                                f"API response from {full_url} exceeded {MAX_API_RESPONSE_BYTES // (1024 ** 2)} MiB safety limit."
-                            )
-                    payload = json.loads(buf.decode("utf-8", errors="replace"))
-                    del buf
+        def batches() -> Iterator[pa.Table]:
+            emitted = 0
+            for page in source.pages():
+                if should_cancel is not None and should_cancel():
+                    raise IngestCancelled(
+                        "Ingestion cancelled: stopped before the table was committed."
+                    )
+                if limit and emitted >= int(limit):
+                    return
+                records = page.records(data_key)
+                if mode == "incremental" and watermark_column and watermark_value is not None:
+                    records = [
+                        record
+                        for record in records
+                        if record.get(watermark_column) is not None
+                        and _watermark_is_newer(record[watermark_column], watermark_value)
+                    ]
+                if limit and len(records) > int(limit) - emitted:
+                    records = records[: int(limit) - emitted]
+                if not records:
+                    continue
+                columns = sorted({key for record in records for key in record})
+                for idx in range(0, len(records), BATCH_ROWS):
+                    chunk = records[idx : idx + BATCH_ROWS]
+                    rows = [
+                        tuple(_normalize_cell(record.get(col)) for col in columns)
+                        for record in chunk
+                    ]
+                    yield _arrow_batch(columns, rows)
+                emitted += len(records)
 
-        records = Introspector._extract_api_records(payload, data_key)
-
-        if mode == "incremental" and watermark_column and watermark_value is not None:
-            records = [
-                record
-                for record in records
-                if record.get(watermark_column) is not None
-                and _watermark_is_newer(record[watermark_column], watermark_value)
-            ]
-        if limit and limit > 0:
-            records = records[: int(limit)]
-        if not records:
-            return 0
-
-        columns: list[str] = sorted({key for record in records for key in record})
-
-        def _api_batches() -> Iterator[pa.Table]:
-            for idx in range(0, len(records), BATCH_ROWS):
-                sub = records[idx : idx + BATCH_ROWS]
-                rows = [
-                    tuple(_normalize_cell(record.get(col)) for col in columns)
-                    for record in sub
-                ]
-                yield _arrow_batch(columns, rows)
+        if sink is None:
+            # No sink means a preview/dry run: count what the pages carry, write nothing.
+            return sum(table.num_rows for table in batches())
 
         return self._stage_batches(
-            conn, _api_batches(), on_batch=on_batch, sink=sink, create=create,
-            should_cancel=should_cancel, schema_policy=schema_policy,
+            conn,
+            batches(),
+            sink=sink,
+            on_batch=on_batch,
+            create=create,
+            should_cancel=should_cancel,
+            schema_policy=schema_policy,
         )
 
 

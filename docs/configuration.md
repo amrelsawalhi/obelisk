@@ -25,13 +25,21 @@ the canonical list; this page explains what each one does and how the installs d
 | `OBELISK_SERVICE_BIND_HOST` | `127.0.0.1` | Network interface to bind managed Docker database and service containers. |
 | `OBELISK_NET` | `obelisk_net` | Docker network used for companion services. |
 | `DUCKDB_THREADS` | auto | DuckDB worker threads limit. Auto divides logical CPUs by the heavy-slot count. |
-| `DUCKDB_TEMP_SIZE_LIMIT` | `50GB` | Maximum disk spill headroom for out-of-core DuckDB operations, divided across heavy slots and bounded by free disk. Prefer binary units in overrides (`50GiB`). |
+| `DUCKDB_MAX_CONCURRENT_HEAVY` | `auto` | Heavy-work permits per process. `auto` derives the pool from the machine: `max(4, min(cpus / DUCKDB_MIN_THREADS_PER_SLOT, memory pool / 4 GiB, 32))` — 2–16 vCPUs stay at 4, 32 vCPUs → 8, 64 → 16, 96 → 24, 128+ → 32. An integer overrides it. The topbar aggregates live cross-process leases, so a notebook or pipeline subprocess adds its reservations to the displayed total; the semaphore itself is not a cross-process lock. |
+| `DUCKDB_MIN_THREADS_PER_SLOT` | `4` | Threads a heavy slot must have before `auto` adds another slot. Raise it for fewer, fatter slots (batch hosts); lower it for more concurrent interactive users. |
+| `DUCKDB_MAX_CONCURRENT_LIGHT` | `auto` | Permits for cheap queries — metadata statements, or a `SELECT` with a final `LIMIT` ≤ 1000 and no join, aggregation, grouping, ordering, distinct, window or subquery. `auto` = half the heavy pool, capped at 8. These keep running while analytical scans or a dbt build hold every heavy slot. |
+| `DUCKDB_TEMP_SIZE_LIMIT` | `0` | Hard cap on disk spill, divided across heavy slots. `0` means no config cap: the ceiling is `DUCKDB_TEMP_SPILL_FREE_DISK_PCT` of the spill volume's **current** free space, recomputed as each connection opens. Prefer binary units when pinning one (`512GiB`). |
+| `DUCKDB_TEMP_SPILL_FREE_DISK_PCT` | `50` | Share of the spill filesystem's free space the process may claim, divided across the slots that may spill. |
 | `DUCKDB_MAX_QUERY_ROWS` | `10000` | Display limit for interactive JSON query studio responses. Full results stream to disk for exports. |
-| `DUCKDB_MAX_CONCURRENT_HEAVY` | `4` | Heavy-work permits per process. The topbar aggregates live cross-process leases, so a notebook or pipeline subprocess adds its reservations to the displayed total; the semaphore itself is not a cross-process lock. |
+| `OBELISK_DBT_RESERVED_SLOTS` | `auto` | Heavy permits a lakehouse dbt run reserves. `auto` = half the pool: models run serially, so the run never needed all of it, and the other half keeps interactive queries moving. An integer up to the pool size restores a manual choice; the pool size itself is the old "own everything" behaviour. Two lakehouse writers never overlap either way — the engine serializes writer kinds separately. |
+
+REST/API connections take their paging, authentication and retry settings in the
+connection's `options` block; that schema (including the shipped connector presets) is
+documented in [REST / API ingestion](api-ingestion.md).
 | `OBELISK_INGEST_MAX_CONCURRENT` | `2` | Maximum concurrent table ingests across every entry point: sync API, batch, pipelines, job manager and SDK. |
 | `OBELISK_LAKEHOUSE_COMPACT_MAX_FILES` | `50` | Upper bound on files rewritten by one automatic or API-triggered compaction pass. |
-| `OBELISK_SQLITE_JOURNAL_MODE` | `WAL` | Control-plane SQLite journal mode. Keep `WAL` on local ext4/XFS. Use `DELETE` only on a filesystem that rejects WAL's shared-memory mapping. |
-| `OBELISK_SQLITE_SYNCHRONOUS` | `NORMAL` | SQLite synchronous mode. `OFF` is an explicit durability tradeoff for virtual filesystems that reject `fsync`. |
+| `OBELISK_SQLITE_JOURNAL_MODE` | `WAL` | Journal mode for **both** SQLite files (the control plane and the DuckLake metadata catalog), applied to every connection. Keep `WAL` on local ext4/XFS. Use `DELETE` only on a filesystem that rejects WAL's shared-memory mapping. |
+| `OBELISK_SQLITE_SYNCHRONOUS` | `NORMAL` | Synchronous mode for **both** SQLite files. `OFF` is an explicit durability tradeoff for virtual filesystems that reject `fsync`. |
 | `OBELISK_ALLOW_COMMUNITY_EXTENSIONS` | `true` | Allows unsigned community extensions (such as the Mongo scanner) in DuckDB. |
 | `OBELISK_SDK_EAGER_WARN_BYTES` | `2147483648` (2 GiB) | SDK eager reader (`to_polars`, `to_arrow`) memory warning threshold. |
 | `OBELISK_SDK_EAGER_REFUSE_BYTES` | `0` (dynamic) | SDK eager reader memory refusal ceiling (`0` derives safe ceiling from host RAM). |

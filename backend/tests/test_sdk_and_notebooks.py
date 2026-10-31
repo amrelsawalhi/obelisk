@@ -123,7 +123,13 @@ def test_the_eager_guard_refuses_a_table_above_the_limit(tmp_path):
 
 
 def test_the_eager_guard_warns_between_its_two_thresholds(tmp_path, caplog):
-    """Below the refusal but above the warning: the read happens, loudly."""
+    """Below the refusal but above the warning: the read happens, loudly.
+
+    ``app.main`` attaches a handler to the ``app`` logger and stops propagation so a
+    deployed process writes each line once (Alembic's fileConfig also owns the root).
+    caplog listens on the root, so the test re-enables propagation for its duration —
+    the assertion is about the record the guard emits, not about where it is printed.
+    """
     import logging
 
     from app.sdk.obelisk import _guard_eager_read
@@ -131,10 +137,16 @@ def test_the_eager_guard_warns_between_its_two_thresholds(tmp_path, caplog):
     moderate = tmp_path / "moderate.parquet"
     moderate.write_bytes(b"\0" * 2048)
 
-    with caplog.at_level(logging.WARNING, logger="app.sdk.obelisk"):
-        _guard_eager_read(
-            "marts.moderate", [moderate], "to_polars()", warn_bytes=1024, refuse_bytes=65536
-        )
+    app_logger = logging.getLogger("app")
+    previous = app_logger.propagate
+    app_logger.propagate = True
+    try:
+        with caplog.at_level(logging.WARNING, logger="app.sdk.obelisk"):
+            _guard_eager_read(
+                "marts.moderate", [moderate], "to_polars()", warn_bytes=1024, refuse_bytes=65536
+            )
+    finally:
+        app_logger.propagate = previous
 
     assert any("marts.moderate" in record.getMessage() for record in caplog.records)
 

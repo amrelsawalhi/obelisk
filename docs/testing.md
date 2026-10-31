@@ -35,54 +35,26 @@ python -m pytest tests -q
 On Windows the two skips are usually the Docker-container tests and the Spark path (no JVM);
 on a Linux host with Docker and a JDK they run.
 
-## Orchestrator harness
+## Orchestrator and API harnesses
 
-Builds real pipelines from the shipped sample assets -- Python scripts, a notebook, dbt, raw
-SQL and a webhook -- runs them against a live backend and prints a pass/fail report:
+The orchestrator and API are exercised by the suite itself
+(`tests/test_pipeline_orchestrator.py`, `tests/test_pipeline_api.py`,
+`tests/test_pipeline_outputs.py`): real pipelines, real child processes, real SQLite
+state, real Parquet. There is no separate `backend/scripts/verify_pipelines.py` — it was
+removed in `7f0126c` when the Scripts Studio replaced it, and this document used to
+point at it anyway.
 
-```bash
-python backend/scripts/verify_pipelines.py --base-url http://127.0.0.1:8000
-```
-
-## End-to-end harness
-
-Seeds real sources, drives the real ingest engine, runs a pipeline that uses every step type,
-forces every edge condition, and then reconciles the lakehouse against the sources. No
-expected number is hardcoded: the harness reads the sources and asks whether the warehouse
-agrees.
+## Diagnostics and maintenance scripts
 
 ```bash
-python backend/scripts/e2e/verify_e2e.py --scale small
-python backend/scripts/e2e/verify_e2e.py --scale medium --skip-seed
+python backend/scripts/find_blocking_calls.py              # AST sweep: nothing blocking on the event loop
+python backend/scripts/preflight_port.py --port 8000       # is the port free, and who holds it
+python backend/scripts/lakehouse_maintenance.py --merge    # compact adjacent files (see --help)
 ```
-
-| Flag | Meaning |
-| :--- | :--- |
-| `--scale small\|medium\|large` | Seed size, see below. Default `small`. |
-| `--skip-seed` | Reuse what the sources already contain. |
-| `--keep` | Leave the scratch pipelines behind for inspection (they are deleted otherwise). |
-
-| Scale | Orders | Customers | Events | Sessions |
-| :--- | ---: | ---: | ---: | ---: |
-| `small` | 20,000 | 2,000 | 50,000 | 10,000 |
-| `medium` | 200,000 | 10,000 | 500,000 | 100,000 |
-| `large` | 2,000,000 | 50,000 | 5,000,000 | 500,000 |
-
-It needs a running backend, the demo sources (`docker compose -f
-docker-compose.sources.yml up -d`) and two connections in the workspace vault: an
-attachable Postgres and a MongoDB. Credentials are read from the vault, never from the
-script.
-
-Every pipeline it creates is named `E2E scratch - ...`, and the harness only ever deletes
-pipelines inside that namespace, so a demo or a hand-built pipeline can never be removed by
-a test run.
 
 ## Demo pipelines
 
-```bash
-python backend/scripts/create_demo_pipelines.py          # create the set
-python backend/scripts/create_demo_pipelines.py --run    # create and run each once
-python backend/scripts/create_demo_pipelines.py --delete # remove them
-```
-
-Six pipelines covering every step type and every edge condition, idempotent by name.
+Demo pipelines are created from the **Scripts Studio** in the UI, or through
+`POST /api/scripts`. The standalone `create_demo_pipelines.py` generator was removed in
+`7f0126c` along with the `backend/scripts/e2e/` harness; both are gone from this
+checkout, and nothing in the suite depends on them.

@@ -35,6 +35,12 @@ export interface TelemetryData {
   active_heavy_queries?: number;
   waiting_heavy_queries?: number;
   max_concurrent_heavy?: number;
+  // Cheap-query pool: previews and point lookups, which keep running while the
+  // analytical slots and a dbt build are busy.
+  active_light_queries?: number;
+  waiting_light_queries?: number;
+  max_concurrent_light?: number;
+  active_writers?: number;
   active_by_kind?: Record<string, number>;
   active_reservations?: TelemetryReservation[];
   memory_limit_per_slot?: string;
@@ -235,6 +241,21 @@ export interface CatalogNode {
   database?: string;
   tables: CatalogTable[];
   directories?: LakehouseDirectory[];
+}
+
+/**
+ * A shipped REST connector recipe (GET /api/catalog/api-presets).
+ *
+ * Presets are data, not code: applying one fills the connection form, and ingestion
+ * validates the resulting options against the same schema it uses for a hand-written
+ * block (see docs/api-ingestion.md).
+ */
+export interface ApiIngestPreset {
+  id: string;
+  name: string;
+  description: string;
+  docs?: string | null;
+  options: Record<string, unknown>;
 }
 
 export interface Connection {
